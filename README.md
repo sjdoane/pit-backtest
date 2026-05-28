@@ -6,7 +6,7 @@ It is not a production trading system. The audience is a reviewer or recruiter w
 
 ## Status
 
-Pre-implementation. Research phases 1 and 2 are complete; all three phase 3 ADRs are accepted (0001 spec critique, 0002 M1 through M5 roadmap, 0003 architecture, this PR). Once this PR merges, pre-M1 methodology documents land Monday, and engine code begins Tuesday of week 1. The implementation is sliced into M1 through M5 over a ten-week timeline with a kill-early gate at end of week 2 on SPY reconciliation. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/decisions/`](docs/decisions/) for the current plan and locked architecture.
+Pre-M1 contracts landed. Research phases 1 and 2 are complete; all three phase 3 ADRs are accepted and merged (0001 spec critique, 0002 M1 through M5 roadmap, 0003 architecture). The Monday-of-week-1 pre-M1 deliverables are landed: four methodology documents under [`docs/methodology/`](docs/methodology/) (total-return reconstruction, dataset versioning, Pydantic/Polars/attrs boundary, determinism invariant) plus the `src/pit_backtest/` package scaffold with protocols stubbed and dependencies pinned. M1 engine code begins Tuesday of week 1. The implementation is sliced into M1 through M5 over a ten-week timeline with a kill-early gate at end of week 2 on SPY reconciliation. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/decisions/`](docs/decisions/) for the current plan and locked architecture.
 
 ## Why this exists
 
@@ -64,27 +64,35 @@ Documented gaps for v1: borrow rates (no v1 source; short tests are flagged as e
 ```
 docs/
   ROADMAP.md            phased milestones
-  METHODOLOGY.md        the quant methodology, with citations (pending)
-  TESTING.md            validation strategy, known-answer tests (pending)
+  METHODOLOGY.md        the quant methodology, with citations (M5)
+  TESTING.md            validation strategy, known-answer tests (M4)
+  methodology/          per-topic methodology contracts (Monday pre-M1)
+    total_return_reconstruction.md
+    dataset_versioning.md
+    pydantic_polars_boundary.md
+    determinism.md
   research/             topical research syntheses
     sources/            per-source detailed notes
   decisions/            numbered ADRs
-src/                    engine source (pending)
-tests/                  pytest tests (pending)
-scripts/figures/        the reproducible figure generators for the README (pending)
+src/pit_backtest/       engine source (protocols stubbed; M1 fills in)
+tests/                  pytest tests (scaffold only; M1 fills in)
+data/snapshots/         vendor snapshots (gitignored; manifest.toml committed)
+scripts/figures/        reproducible figure generators for the README (M5)
+pyproject.toml
 CHANGELOG.md
 LICENSE
 ```
 
 ## Running locally
 
-Not yet runnable. Engine implementation begins after ADRs 0002 and 0003 land. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+Not yet runnable. The package scaffold imports and the contract tests pass, but every engine path raises `NotImplementedError` until M1 lands the SEP adapter, the total-return reconstruction, the buy-and-hold demo, and the constant-weight monthly rebalance demo (target: end of week 2). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the schedule and [`docs/methodology/`](docs/methodology/) for the contracts M1 builds against.
 
 ## Suggested reading order for a reviewer
 
-1. [`docs/ROADMAP.md`](docs/ROADMAP.md)
+1. [`docs/ROADMAP.md`](docs/ROADMAP.md): the M1 through M5 plan with the kill-early gate.
 2. [`docs/research/0001-existing-backtesters.md`](docs/research/0001-existing-backtesters.md): what the existing field gets wrong.
 3. [`docs/research/0002-methodology.md`](docs/research/0002-methodology.md): what the canonical literature says.
-4. [`docs/decisions/0001-spec-critique.md`](docs/decisions/0001-spec-critique.md): the critique of the original spec, the skeptical-reviewer pass, the final decisions.
-5. `docs/decisions/0002-roadmap-review.md` (pending)
-6. `docs/decisions/0003-architecture.md` (pending)
+4. [`docs/decisions/0001-spec-critique.md`](docs/decisions/0001-spec-critique.md): the critique of the original spec, the skeptical-reviewer pass, the locked decisions on scope and stack.
+5. [`docs/decisions/0002-roadmap-review.md`](docs/decisions/0002-roadmap-review.md): the M1 through M5 acceptance criteria, with the ten-week timeline and kill gate.
+6. [`docs/decisions/0003-architecture.md`](docs/decisions/0003-architecture.md): the protocol hierarchy, the trust boundary list, the data model.
+7. [`docs/methodology/`](docs/methodology/): the four pre-M1 contracts (total-return reconstruction, dataset versioning, Pydantic/Polars/attrs boundary, determinism invariant). Read after the ADRs; these are the implementation contracts the engine code in M1 onward is held to.

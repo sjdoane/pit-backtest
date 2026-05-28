@@ -37,12 +37,12 @@ Locked in [`docs/decisions/0002-roadmap-review.md`](decisions/0002-roadmap-revie
 
 ### Week 1 (Monday): pre-M1 methodology and package scaffold
 
-Five deliverables ship as contracts before any engine logic lands:
-- [`docs/methodology/total_return_reconstruction.md`](methodology/total_return_reconstruction.md) (pending): SPDR-published SPY total return as the authoritative reference, same-day-at-close reinvestment convention, math documented.
-- [`docs/methodology/dataset_versioning.md`](methodology/dataset_versioning.md) (pending): Sharadar pull hash committed, SHA256 of parquet files, pull date recorded.
-- [`docs/methodology/pydantic_polars_boundary.md`](methodology/pydantic_polars_boundary.md) (pending): where Pydantic is allowed (adapter load, CLI, user-facing render targets) and where it is not (anything in the BarLoop hot path).
-- [`docs/methodology/determinism.md`](methodology/determinism.md) (pending): the determinism invariant and its requirements (pinned Polars, injected RNG, sorted outputs, per-process thread pool sized to 1 in Runner workers).
-- `src/pit_backtest/` package layout per the locked architecture, with protocols stubbed (`Protocol` and `...`); no implementation yet.
+Five deliverables ship as contracts before any engine logic lands. All five are landed in PR-stage (this PR):
+- [`docs/methodology/total_return_reconstruction.md`](methodology/total_return_reconstruction.md): SPDR-published SPY NAV TR as the authoritative reference, same-day-at-close reinvestment convention, math documented with toy three-day and SPY Q1 2024 worked examples, tolerance budget breakdown.
+- [`docs/methodology/dataset_versioning.md`](methodology/dataset_versioning.md): Sharadar SF1 ARQ + SEP + TICKERS + SP500 inventory; pull procedure with SHA256 manifest at `data/snapshots/manifest.toml`; restatement-handling rationale.
+- [`docs/methodology/pydantic_polars_boundary.md`](methodology/pydantic_polars_boundary.md): Pydantic restricted to three surfaces (adapter load, CLI/config, user-facing render targets); attrs `slots=True frozen=True` for every inner-loop type; performance-cost numbers for orientation.
+- [`docs/methodology/determinism.md`](methodology/determinism.md): the bit-identical-outputs invariant; five requirements (pinned Polars, injected RNG, sorted output frames, no `set` iteration in policy/signal, per-worker POLARS_MAX_THREADS=1); 11-item trust boundary list with mitigations per item; per-platform reproducibility caveat.
+- `src/pit_backtest/` package layout per the locked architecture, with protocols stubbed (`Protocol` body `...`; concrete classes raise `NotImplementedError("<milestone> deliverable")`); `pyproject.toml` with pinned dependencies; minimal `tests/test_scaffold.py` verifying imports, attrs immutability, FillPriceModel requirement, NoImpact flag enforcement, and render-path enforcement on raw SR.
 
 ### M1 (weeks 1-2): walk skeleton with engine self-validation
 
