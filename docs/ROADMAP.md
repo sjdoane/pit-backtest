@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: Research phase 1 complete. Phase 2 is next. Implementation milestones (M1..Mn) will be defined after the research phases conclude, the spec critique lands, and the core architecture is sketched and reviewed. See [`README.md`](../README.md) for context.
+Status: Research phases 1 and 2 complete. Phase 3 (spec critique and architecture ADRs) is next. Implementation milestones (M1..Mn) will be defined after phase 3 lands. See [`README.md`](../README.md) for context.
 
 ## Phases
 
@@ -14,11 +14,13 @@ Coverage: zipline (including zipline-reloaded), backtrader, vectorbt, bt, qstrad
 
 Key findings carried into phase 2 and the architecture ADR: the field collectively gets corporate actions and point-in-time index membership wrong; lookahead protection should be structural (Pipeline + min-period + clock injection) not by convention; execution realism must be required, not optional; sweep mode and event-driven mode should be separate, explicitly labeled paths.
 
-### Phase 2: methodology canon (pending)
+### Phase 2: methodology canon (complete)
 
-Goal: synthesize the literature on backtest validity and execution realism. Includes Lopez de Prado AFML chapters 11 through 15, Bailey and Lopez de Prado on the deflated Sharpe and the probability of backtest overfitting, Almgren and Chriss on optimal execution and market impact, the standard treatment of point-in-time data, and at least three practitioner postmortems on common backtester failure modes.
+Goal: synthesize the literature on backtest validity and execution realism. Includes Lopez de Prado AFML chapters 11 through 15, Bailey and Lopez de Prado on the deflated Sharpe and the probability of backtest overfitting, Almgren and Chriss on optimal execution and market impact, the standard treatment of point-in-time data, and seven practitioner postmortems.
 
-Deliverable: `docs/research/0002-methodology.md`.
+Deliverable: [`docs/research/0002-methodology.md`](research/0002-methodology.md) plus per-topic source analyses under [`docs/research/sources/methodology-*.md`](research/sources/).
+
+Key findings carried into phase 3 and the architecture ADR: the analytics layer must compute PSR, DSR, MinTRL, and a confidence-tier label by default (raw SR alone is a configuration error); the cost model defaults to SquareRootImpact with Almgren 2005 calibration (eta = 0.142, beta = 0.6, gamma = 0.314) and permanent impact must feed the price series; the data layer requires a dual-timestamp model (`period_end_dt` and `available_dt`), a typed Universe API, and persistent asset identifiers; CPCV returns a Sharpe distribution, not a scalar.
 
 ### Phase 3: spec critique and architecture (pending)
 
