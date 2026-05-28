@@ -1,0 +1,22 @@
+# Sharadar and SSGA snapshot manifest.
+# Schema and pull procedure documented in docs/methodology/dataset_versioning.md.
+# Every snapshot bundle must have an entry here before any test that reads it
+# can run. The adapter verifies file SHA256 against this manifest at load.
+
+# Initial state: no snapshots committed. The first M1 Sharadar pull will
+# append a [snapshots.sharadar_<YYYY-MM-DD>] block. The first M1 SSGA SPY
+# pull will append a [snapshots.spy_ssga_<YYYY-MM-DD>] block.
+
+# Example entries (commented out; not consumed by the loader):
+
+# [snapshots.sharadar_2026-05-28]
+# source = "sharadar"
+# pull_date = "2026-05-28"
+# sharadar_api_key_fingerprint = "fp_a9c..."
+# notes = "Initial M1 pull."
+#
+# [snapshots.sharadar_2026-05-28.files]
+# "sep.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
+# "sf1.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
+# "tickers.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
+# "sp500.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }

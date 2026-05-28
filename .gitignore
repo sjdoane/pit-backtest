@@ -130,8 +130,15 @@ $RECYCLE.BIN/
 ehthumbs.db
 
 # Project-specific: data and secrets
-data/
+# data/: exclude all contents except the tracked markers and the snapshot
+# manifest. The pattern uses path-globs (not the directory shorthand) so
+# git can traverse the directory and re-include specific files. Reference:
+# https://git-scm.com/docs/gitignore#_examples
+data/*
 !data/.gitkeep
+!data/snapshots
+data/snapshots/*
+!data/snapshots/manifest.toml
 cache/
 artifacts/
 runs/
