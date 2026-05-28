@@ -20,13 +20,14 @@ The v1 inventory is fixed by ADR 0001 decision 10. The sources, their roles, and
 
 | Source | Sharadar table | Role | Update cadence |
 |---|---|---|---|
-| Sharadar SEP | SEP | Daily adjusted-close, raw close (`closeunadj`), volume, dividends, splits, delisting flags | Daily; vendor updates with one-day lag |
+| Sharadar SEP | SEP | Daily OHLCV with raw close (`closeunadj`) plus a back-adjusted `close`; per-bar `lastupdated` for as-of joins | Daily; vendor updates with one-day lag |
+| Sharadar ACTIONS | ACTIONS | Corporate events: dividends (per-share cash), splits (ratio), spin-offs, transfers, mergers. The dividend rows are the source of truth for the M1 SPY TR reconstruction (per docs/methodology/total_return_reconstruction.md the engine uses `closeunadj` + ACTIONS dividends, not SEP's back-adjusted `close`). | Event-driven; vendor updates same-day for U.S. equities |
 | Sharadar SF1 ARQ | SF1 (filtered to `dimension == "ARQ"`) | Point-in-time fundamentals (revenue, earnings, book value, shares outstanding) as originally reported | Quarterly per filing; vendor updates within 24h of SEC submission |
 | Sharadar TICKERS | TICKERS | Identifier history: `permaticker`, ticker, CUSIP, first/last price dates, delisting metadata | Daily |
 | Sharadar SP500 | SP500 | S&P 500 membership event log: add/drop events with effective dates | Event-driven; vendor updates within days of S&P announcement |
 | SSGA SPY | (CSV export from fund page) | SPY NAV TR for M1 reconciliation; SPY distributions history for the dividend table cross-check | Daily for NAV; per-distribution for dividends |
 
-Sharadar is the v1 source for all four equity tables. The four tables are pulled together as a single snapshot bundle on every refresh so that the dual-timestamp model (period_end_dt, available_dt) is internally consistent across tables at the pull moment. The SSGA SPY data is pulled separately and is required only for the M1 reconciliation harness.
+Sharadar is the v1 source for all five equity tables. The five tables are pulled together as a single snapshot bundle on every refresh so that the dual-timestamp model (period_end_dt, available_dt) is internally consistent across tables at the pull moment. The SSGA SPY data is pulled separately and is required only for the M1 reconciliation harness.
 
 Documented gaps deferred to v1.1 per ADR 0001 decision 11: borrow availability and rate feed; full PIT S&P 500 reconstitution effective dates beyond what the SP500 event log captures.
 
@@ -49,6 +50,7 @@ The data itself is gitignored (see [Repository policy](#repository-policy) below
 data/snapshots/
   sharadar_2026-05-28/
     sep.parquet
+    actions.parquet
     sf1.parquet
     tickers.parquet
     sp500.parquet
@@ -77,6 +79,7 @@ notes = "Initial M1 pull."
 
 [snapshots.sharadar_2026-05-28.files]
 "sep.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
+"actions.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
 "sf1.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
 "tickers.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
 "sp500.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
