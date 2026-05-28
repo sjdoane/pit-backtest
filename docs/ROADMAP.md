@@ -1,16 +1,18 @@
 # Roadmap
 
-Status: Research phase 1 in progress. Implementation milestones (M1..Mn) will be defined after the research phases conclude, the spec critique lands, and the core architecture is sketched and reviewed. See [`README.md`](../README.md) for context.
+Status: Research phase 1 complete. Phase 2 is next. Implementation milestones (M1..Mn) will be defined after the research phases conclude, the spec critique lands, and the core architecture is sketched and reviewed. See [`README.md`](../README.md) for context.
 
 ## Phases
 
-### Phase 1: existing-landscape survey (in progress)
+### Phase 1: existing-landscape survey (complete)
 
 Goal: understand the design choices, strengths, and failure modes of existing open-source backtesters before designing our own.
 
 Deliverable: [`docs/research/0001-existing-backtesters.md`](research/0001-existing-backtesters.md) plus per-source detail under [`docs/research/sources/`](research/sources/).
 
 Coverage: zipline (including zipline-reloaded), backtrader, vectorbt, bt, qstrader, nautilus_trader.
+
+Key findings carried into phase 2 and the architecture ADR: the field collectively gets corporate actions and point-in-time index membership wrong; lookahead protection should be structural (Pipeline + min-period + clock injection) not by convention; execution realism must be required, not optional; sweep mode and event-driven mode should be separate, explicitly labeled paths.
 
 ### Phase 2: methodology canon (pending)
 
