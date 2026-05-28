@@ -6,7 +6,7 @@ It is not a production trading system. The audience is a reviewer or recruiter w
 
 ## Status
 
-Pre-implementation. Research phases 1 and 2 are complete; ADRs 0001 (spec critique) and 0002 (M1 through M5 roadmap, this PR) are accepted; ADR 0003 (architecture) follows. Engine code begins after ADR 0003 lands on main. The implementation is sliced into M1 through M5 over a ten-week timeline with a kill-early gate at end of week 2 on SPY reconciliation. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/decisions/`](docs/decisions/) for the current plan.
+Pre-implementation. Research phases 1 and 2 are complete; all three phase 3 ADRs are accepted (0001 spec critique, 0002 M1 through M5 roadmap, 0003 architecture, this PR). Once this PR merges, pre-M1 methodology documents land Monday, and engine code begins Tuesday of week 1. The implementation is sliced into M1 through M5 over a ten-week timeline with a kill-early gate at end of week 2 on SPY reconciliation. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/decisions/`](docs/decisions/) for the current plan and locked architecture.
 
 ## Why this exists
 

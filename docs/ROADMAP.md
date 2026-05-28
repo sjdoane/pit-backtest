@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: Research phases 1 and 2 complete. Phase 3 in progress: ADRs 0001 (spec critique) and 0002 (roadmap) accepted; ADR 0003 (architecture) next. Implementation milestones M1 through M5 are now defined; see the [Implementation phase](#implementation-phase-m1-through-m5) section below. See [`README.md`](../README.md) for context.
+Status: Research phases 1 and 2 complete. Phase 3 complete: all three ADRs accepted (0001 spec critique, 0002 M1 through M5 roadmap, 0003 architecture). The implementation phase begins on the Monday after ADR 0003 merges, with pre-M1 methodology documents, and proceeds through M1 through M5 over ten weeks. See [`README.md`](../README.md) for context.
 
 ## Phases
 
@@ -22,28 +22,27 @@ Deliverable: [`docs/research/0002-methodology.md`](research/0002-methodology.md)
 
 Key findings carried into phase 3 and the architecture ADR: the analytics layer must compute PSR, DSR, MinTRL, and a confidence-tier label by default (raw SR alone is a configuration error); the cost model defaults to SquareRootImpact with Almgren 2005 calibration (eta = 0.142, beta = 0.6, gamma = 0.314) and permanent impact must feed the price series; the data layer requires a dual-timestamp model (`period_end_dt` and `available_dt`), a typed Universe API, and persistent asset identifiers; CPCV returns a Sharpe distribution, not a scalar.
 
-### Phase 3: spec critique and architecture (in progress)
+### Phase 3: spec critique and architecture (complete)
 
-Goal: stress-test the spec, draft the architecture, both reviewed by a skeptical agent persona before lock-in.
+All three ADRs accepted and merged:
+- [`docs/decisions/0001-spec-critique.md`](decisions/0001-spec-critique.md): 20 locked decisions reframing the project as a teaching artifact with explicit non-goals.
+- [`docs/decisions/0002-roadmap-review.md`](decisions/0002-roadmap-review.md): 21 locked decisions defining M1 through M5 over ten weeks with the week-2 kill gate.
+- [`docs/decisions/0003-architecture.md`](decisions/0003-architecture.md): 23 locked decisions on the protocol hierarchy, event loop, trust boundaries, data model.
 
-Deliverables:
-- [`docs/decisions/0001-spec-critique.md`](decisions/0001-spec-critique.md) (spec critique plus skeptical review, **accepted**)
-- `docs/decisions/0002-roadmap-review.md` (M1..Mn milestone breakdown plus skeptical review, pending)
-- `docs/decisions/0003-architecture.md` (class/protocol hierarchy, event loop, trust boundaries, plus skeptical review, pending)
-
-Each ADR captures the original proposal, the skeptical reviewer's critique, the author's response, and the final locked-in decisions.
-
-Key locked-in decisions from ADR 0001 that constrain 0002 and 0003: scope is U.S. equity daily-bar only; framing is "teaching artifact" not "production-grade"; CPCV is primary validation surface with results as path distributions; the LdP chapter 14 scorecard is the default analytics output; cost model defaults to Almgren 2005 SquareRootImpact with sensitivity bands; six-layer architecture (data, signal, policy, execution, risk decomposition, analytics); Polars end-to-end with `.to_pandas()` boundary adapter; v1 data inventory is Sharadar SF1 ARQ + SEP + TICKERS with documented gaps on borrow and PIT S&P 500 reconstitution dates; performance budget is 20-year backtest on 500 names in under 60 seconds; v1 timeline is four weeks from engine implementation start or the project is killed per the kill-early rule.
+Key architectural decisions from ADR 0003 that constrain implementation: Pydantic only at adapter load, CLI/config, and user-facing render targets (everywhere else uses attrs with `slots=True, frozen=True`); CashFlow split from CorporateAction as two streams; permanent impact lives in the data source layer via `ImpactedPriceSource`, not as a separate register; `PreTradeCostEstimator` and `FillCostComputer` are separate protocols; `Signal.compute` returns `dict[AssetId, float]`; `MatchingEngine.submit` returns `list[Fill]`; Clock includes `is_market_open` and `next_bar`; `AssetId = NewType("AssetId", int)` with a separate `IdentifierResolver` for v2 forward compatibility; LongOnlyPolicy at v1; determinism invariant documented; trust boundaries enumerated in 11 items.
 
 ## Implementation phase M1 through M5
 
 Locked in [`docs/decisions/0002-roadmap-review.md`](decisions/0002-roadmap-review.md). Ten-week timeline (extended from the original four-week proposal after the skeptical-reviewer pass). The kill-early gate fires at end of week 2 if M1 SPY reconciliation fails.
 
-### Week 1 (Monday): pre-M1 methodology docs
+### Week 1 (Monday): pre-M1 methodology and package scaffold
 
-Two short documents that ship as contracts before any engine code lands:
+Five deliverables ship as contracts before any engine logic lands:
 - [`docs/methodology/total_return_reconstruction.md`](methodology/total_return_reconstruction.md) (pending): SPDR-published SPY total return as the authoritative reference, same-day-at-close reinvestment convention, math documented.
 - [`docs/methodology/dataset_versioning.md`](methodology/dataset_versioning.md) (pending): Sharadar pull hash committed, SHA256 of parquet files, pull date recorded.
+- [`docs/methodology/pydantic_polars_boundary.md`](methodology/pydantic_polars_boundary.md) (pending): where Pydantic is allowed (adapter load, CLI, user-facing render targets) and where it is not (anything in the BarLoop hot path).
+- [`docs/methodology/determinism.md`](methodology/determinism.md) (pending): the determinism invariant and its requirements (pinned Polars, injected RNG, sorted outputs, per-process thread pool sized to 1 in Runner workers).
+- `src/pit_backtest/` package layout per the locked architecture, with protocols stubbed (`Protocol` and `...`); no implementation yet.
 
 ### M1 (weeks 1-2): walk skeleton with engine self-validation
 
