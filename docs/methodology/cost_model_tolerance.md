@@ -1,8 +1,18 @@
 # Cost-model tolerance contract
 
-Status: locked for M2 PR A.
-ADR cross-references: ADR 0005 step 9 (pre-trade vs fill-cost tolerance formula); ADR 0007 (FIM-2018 upper-ceiling sanity check + formula-derived band gate).
+Status: **dormant at M2 per ADR 0011** (was locked for M2 PR A).
+ADR cross-references: ADR 0005 step 9 (pre-trade vs fill-cost tolerance formula); ADR 0007 (FIM-2018 upper-ceiling sanity check + formula-derived band gate); ADR 0009 lock #8 (PR B documentation-only enforcement deferral); ADR 0010 (PR C1 sensitivity-band runner; deferred tolerance to PR C2); **ADR 0011 (PR C2 dormancy decision)**.
 Audience: implementers of the matcher (M2 PR B), of the SquareRootImpactMatchingEngine wiring, and reviewers reading test failures from `tests/integration/test_cost_golden_fixture.py`.
+
+## Dormancy at M2 (per ADR 0011)
+
+The locked formula below is **documentation-only at M2**. The Almgren-2005 cost model implemented in `src/pit_backtest/execution/cost/impact.py` is **mid-insensitive**: `_almgren_terms(eta, beta, gamma, sigma_D, V_D, Theta, Q, T)` does not take a mid-price argument. The formula `tolerance_bps = 0.5 + 0.1 * |delta_mid_bps|` widens a tolerance against the difference between two cost-model evaluations whose LHS is identically zero under the M2 default wiring (one shared cost-model instance for both policy and matcher per `tests/integration/test_cost_estimator_wired_to_policy.py:141`).
+
+This is not a bug in the cost model. Almgren-Thum-Hauptmann-Li 2005 Section 3 derives the square-root impact law in **fractional return space** precisely so the result is dimensionless and scale-invariant in price. The tolerance formula's mid-drift term is calibrated against a future cost model that consumes mid as an argument (e.g., a spread-sensitive impact term or the Bouchaud-Lillo-Farmer 2009 propagator with intraday signal), NOT against the Almgren-2005 formula.
+
+The matcher does NOT actively enforce the tolerance contract at M2. The `Order.estimate_bps_at_submit` attribute is a `NotImplementedError` stub property on the `Order` attrs.frozen class; reading it raises with a diagnostic pointing at this doc and at ADR 0011's activation gate. The `@pytest.mark.dormant_until_m3` marker in `tests/execution/test_orders_dormancy.py` lists every dormant-contract test so an M3 contributor running `pytest -m dormant_until_m3` sees exactly what they must reckon with before activating.
+
+**Activation gate** (per ADR 0011 lock #6): reactivation requires **distinct policy-time vs matcher-time `MarketStateLookup` snapshots**, i.e., day-shifted rolling-window stats (sigma_D, V_D, Theta) computed against different data windows. NOT `epsilon_bps > 0` (which the Quant council member proposed and the verifier corrected; `epsilon_bps` controls the slippage term, not the impact term, and does not inject mid into the Almgren formula). NOT a calendar milestone. The gate is structural.
 
 ## Goal
 
@@ -81,10 +91,10 @@ This widening is a documented artifact: on the first bar of any backtest, the po
 
 For backtest runs that rebalance on the first bar, the policy's pre-trade estimate at start-of-bar uses the bar's open as the only knowable mid, so the policy's estimate and the matcher's fill differ by the open-to-close intraday move. This is documented as a first-bar artifact and is not treated as a tolerance failure mode in the M2 acceptance criterion 1 gate.
 
-## What changed in PR B (added per ADR 0009 lock #8)
+## What changed in PR B (added per ADR 0009 lock #8); CORRECTED in PR C2 per ADR 0011
 
 PR B does NOT actively enforce the tolerance contract at the matcher. The reason is mechanical: `SquareRootImpactCostModel.estimate(...)` and `SquareRootImpactCostModel.compute(fill_state)` both read the same `MarketStateLookup` row keyed at `(asset_id, _et_date(dt))` and run the same `_almgren_terms` evaluation; their outputs are bit-identical when called against the same cost-model instance. The matcher cannot detect a policy-vs-fill drift without a SEPARATE estimate input (the policy's frozen estimate at submit time, not a re-computation at fill time).
 
-Active enforcement is M3 scope per ADR 0009: PR C lands `Order.estimate_bps_at_submit` plumbing, the matcher compares `abs(order.estimate_bps_at_submit - breakdown.total_bps) <= tolerance_bps`, and the typed `CostEstimateVsFillMismatchError` exception is added then.
+**PR B's "Active enforcement is M3 scope per ADR 0009: PR C lands `Order.estimate_bps_at_submit` plumbing" statement is corrected by ADR 0011.** The Plan-reviewer pass on the original PR C plan surfaced that the cost model at M2 is mid-insensitive (no `mid` argument in `_almgren_terms`), so the tolerance check would always pass trivially even with the `Order` plumbing. The council + verifier pass on the architectural decision settled on the dormant-tripwire pattern: `Order.estimate_bps_at_submit` is a `NotImplementedError` stub property; no matcher check ships at M2; active enforcement waits until distinct policy-time vs matcher-time `MarketStateLookup` snapshots land (NOT `epsilon_bps > 0`, NOT a calendar date).
 
-At M2 the tolerance contract is exercised symbolically by `tests/integration/test_cost_estimate_vs_fill_tolerance.py`: the test constructs two cost-model instances with different `MarketStateRow` sigma_D values (modeling estimate-time-vs-fill-time market-state drift) and verifies the locked formula `tolerance_bps = 0.5 + 0.1 * |delta_mid_bps|` evaluates to the worked-example values documented above. The formula stays falsifiable against the code even though no production path raises today.
+At M2 the tolerance contract is exercised symbolically by `tests/integration/test_cost_estimate_vs_fill_tolerance.py`: the test constructs two cost-model instances with different `MarketStateRow` sigma_D values (modeling estimate-time-vs-fill-time market-state drift) and verifies the locked formula `tolerance_bps = 0.5 + 0.1 * |delta_mid_bps|` evaluates to the worked-example values documented above. The formula stays falsifiable against the code even though no production path raises today. PR C2 also ships `tests/execution/test_orders_dormancy.py` with the `@pytest.mark.dormant_until_m3` marker so a future contributor running `pytest -m dormant_until_m3` lists every dormant-contract test.
