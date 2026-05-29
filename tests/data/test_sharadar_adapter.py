@@ -315,3 +315,152 @@ pull_date = 2026-05-29
         f"read_actions_dividends must return pl.Date for 'ex_date'; got "
         f"{dividends.schema['ex_date']}"
     )
+
+
+def test_date_range_filter_works_on_datetime_typed_input(tmp_path: Path) -> None:
+    """Regression: the date-range filter must return non-empty rows when
+    the underlying parquet has date column dtype `Datetime[ns]`.
+
+    The previous regression test
+    (test_read_sep_prices_returns_pl_date_column_even_from_datetime_source)
+    asserted that read_sep_prices RETURNS pl.Date, but it called the
+    method WITHOUT a date filter; the cast happened after the filter
+    block and the filter pattern was untested against Datetime input.
+
+    The 2026-05-29 hotfix surfaced this when Sam re-pulled with pinned
+    pandas 2.2.3: pandas datetime64[ns] -> pl.Datetime[ns]. The real
+    failure mode under Polars 1.41.1 is the UPPER bound: a Python
+    `date(2999, 12, 31)` literal OVERFLOWS Datetime[ns]'s i64-ns-since-
+    epoch representable range (~1677-2262); the literal silently
+    saturates and the comparison `pl.col('date') <= date(2999, 12, 31)`
+    yields zero rows. Narrow-window queries within the representable
+    range (e.g. `<= date(2026, 4, 30)`) still worked, masking the bug
+    from any test that did not exercise the wide-open coverage probe
+    that reconcile_spy_trailing uses (`pl.col('date') <= date(2999, 12, 31)`).
+
+    This test exercises:
+      1. A narrow-window date-range filter on Datetime[ns]-typed input
+         (pre-fix path: PASS because the upper bound is within range).
+      2. The wide-open coverage probe (pre-fix path: FAIL with 0 rows
+         because date(2999, 12, 31) overflows Datetime[ns]).
+      3. Same regression on read_actions_dividends.
+
+    Critical: `schema_overrides={"date": pl.Datetime(time_unit="ns")}`
+    is explicit; bare `pl.Datetime` defaults to `time_unit="us"` which
+    does NOT overflow at date(2999, 12, 31) and would silently neutralize
+    this test. The on-disk dtype is asserted post-write to lock the
+    invariant against a future Polars default change.
+    """
+    from datetime import datetime
+
+    snapshots_root = tmp_path / "snapshots"
+    bundle_dir = snapshots_root / "sharadar_dt_filter_regression"
+    bundle_dir.mkdir(parents=True)
+
+    sep_df = pl.DataFrame(
+        {
+            "ticker": ["SPY", "SPY", "SPY"],
+            "date": [
+                datetime(2024, 3, 14),
+                datetime(2024, 3, 15),
+                datetime(2024, 3, 18),
+            ],
+            "open": [517.0, 517.95, 513.0],
+            "high": [517.5, 518.43, 515.0],
+            "low": [516.0, 510.27, 511.0],
+            "close": [517.51, 512.85, 514.0],
+            "closeunadj": [517.51, 512.85, 514.0],
+            "volume": [70_000_000, 92_750_000, 60_000_000],
+        },
+        schema_overrides={"date": pl.Datetime(time_unit="ns")},
+    )
+    sep_path = bundle_dir / "sep.parquet"
+    sep_df.write_parquet(sep_path)
+
+    actions_df = pl.DataFrame(
+        {
+            "ticker": ["SPY"],
+            "date": [datetime(2024, 3, 15)],
+            "action": ["dividend"],
+            "value": [1.7715],
+        },
+        schema_overrides={"date": pl.Datetime(time_unit="ns")},
+    )
+    actions_path = bundle_dir / "actions.parquet"
+    actions_df.write_parquet(actions_path)
+
+    # Lock the on-disk dtype against a future Polars default change.
+    # If write_parquet ever promotes Datetime[ns] to Datetime[us] (or
+    # vice versa) the bug class shifts and this test must be revisited
+    # rather than silently passing on the wrong dtype.
+    on_disk_dtype = pl.scan_parquet(sep_path).collect_schema()["date"]
+    assert on_disk_dtype == pl.Datetime(time_unit="ns"), (
+        f"on-disk dtype is {on_disk_dtype}; expected Datetime[ns] so this "
+        f"regression test actually exercises the i64-ns-since-epoch "
+        f"overflow class. Update the test if Polars changes defaults."
+    )
+
+    sep_sha = hashlib.sha256(sep_path.read_bytes()).hexdigest()
+    actions_sha = hashlib.sha256(actions_path.read_bytes()).hexdigest()
+    manifest = f"""
+[snapshots.sharadar_dt_filter_regression]
+source = "sharadar"
+pull_date = 2026-05-29
+
+[snapshots.sharadar_dt_filter_regression.files]
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {sep_path.stat().st_size}, row_count = 3 }}
+"actions.parquet" = {{ sha256 = "{actions_sha}", size_bytes = {actions_path.stat().st_size}, row_count = 1 }}
+"""
+    (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
+
+    adapter = SharadarDataSource("sharadar_dt_filter_regression", snapshots_root)
+
+    # Narrow-window query: both bounds within Datetime[ns] representable range.
+    # Pre-fix path: PASS at 3 rows because the narrow window does not overflow.
+    # Post-fix path: PASS at 3 rows because the cast normalizes the column.
+    prices_narrow = adapter.read_sep_prices(
+        ticker="SPY",
+        start_dt=date(2024, 3, 14),
+        end_dt=date(2024, 3, 18),
+    )
+    assert prices_narrow.height == 3, (
+        f"narrow-window query returned {prices_narrow.height} rows; "
+        f"expected 3"
+    )
+
+    # The wide-open coverage probe that reconcile_spy_trailing uses.
+    # Pre-fix path: FAIL at 0 rows because date(2999, 12, 31) overflows
+    # Datetime[ns] and the <= comparison silently saturates.
+    # Post-fix path: PASS at 3 rows because the cast normalizes to pl.Date
+    # which has a wider representable range and accepts the literal.
+    coverage = adapter.read_sep_prices(
+        ticker="SPY",
+        start_dt=date(1900, 1, 1),
+        end_dt=date(2999, 12, 31),
+    )
+    assert coverage.height == 3, (
+        f"wide-open coverage query returned {coverage.height} rows; "
+        f"expected 3. The pre-fix path overflowed Datetime[ns] at "
+        f"date(2999, 12, 31); the post-fix path casts to pl.Date first."
+    )
+
+    # Same regression on dividends (wide-open + narrow-window).
+    dividends_wide = adapter.read_actions_dividends(
+        ticker="SPY",
+        start_dt=date(1900, 1, 1),
+        end_dt=date(2999, 12, 31),
+    )
+    assert dividends_wide.height == 1, (
+        f"actions wide-open coverage query returned "
+        f"{dividends_wide.height} rows; expected 1. Same overflow class."
+    )
+
+    dividends_narrow = adapter.read_actions_dividends(
+        ticker="SPY",
+        start_dt=date(2024, 3, 14),
+        end_dt=date(2024, 3, 18),
+    )
+    assert dividends_narrow.height == 1, (
+        f"actions narrow-window query returned {dividends_narrow.height} "
+        f"rows; expected 1"
+    )

@@ -17,6 +17,12 @@ dependencies = [
     "pydantic==2.9.2",
     "attrs==24.2.0",
     "pandas-market-calendars==4.4.1",
+    # pandas is pulled transitively by pandas-market-calendars and by
+    # nasdaq-data-link (dataops extra). Pinned here because pandas >= 3.0
+    # requires numpy >= 2.0 which conflicts with our numpy 1.26.4 pin.
+    # 2.2.3 is the last 2.x release with broad numpy 1.x support and is
+    # the version nasdaq-data-link 1.0.4 was tested against.
+    "pandas==2.2.3",
     "tomli==2.0.2; python_version < '3.11'",
 ]
 

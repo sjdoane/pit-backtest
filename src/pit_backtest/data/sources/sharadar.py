@@ -126,7 +126,36 @@ class SharadarDataSource(PitDataSource):
         SPY demo and the constant-weight SPY/AGG/GLD demo use this method
         directly; the full per-row PitDataSource.get_price path is M3 work.
         """
-        lf = self.get_table("sep")
+        # Cast `date` to pl.Date BEFORE filtering. nasdaq-data-link returns
+        # pandas datetime64[ns]; with the project's correct pinned
+        # pandas==2.2.3, pl.from_pandas surfaces this as
+        # Datetime(time_unit='ns'). Under Polars 1.41.1 a Python
+        # `date(2999, 12, 31)` literal OVERFLOWS Datetime[ns]'s i64-ns-since-
+        # epoch representable range (~1677-2262); the literal silently
+        # saturates and `pl.col('date') <= date(2999, 12, 31)` returns zero
+        # rows, NOT an error. The wide-open coverage probe in
+        # reconcile_spy_trailing uses exactly that upper-bound literal, so
+        # the pre-hotfix cast-after-filter pattern produced "bundle has no
+        # SPY rows" on a parquet that contained 7126 SPY rows.
+        #
+        # A prior transient `pandas==3.0.3` in uv.lock accidentally returned
+        # a nullable-date dtype which polars surfaced as pl.Date directly,
+        # which made the cast-after-filter pattern silently work. Pinning to
+        # the correct 2.2.3 restored the standard Datetime[ns] shape and
+        # exposed the latent bug. The fix here normalizes the column dtype
+        # FIRST so the filter operates on pl.Date (which has a wider
+        # representable range and accepts the wide-open literal).
+        #
+        # Regression test:
+        # tests/data/test_sharadar_adapter.py::test_date_range_filter_works_on_datetime_typed_input
+        # uses an explicit pl.Datetime(time_unit="ns") override (bare
+        # pl.Datetime defaults to "us" which would not overflow at 2999-12-31)
+        # and asserts the on-disk dtype is ns. The previous regression test
+        # asserted only the RETURN dtype (pl.Date), not that the FILTER
+        # produced non-empty rows.
+        lf = self.get_table("sep").with_columns(
+            pl.col("date").cast(pl.Date)
+        )
         if ticker is not None:
             lf = lf.filter(pl.col("ticker") == ticker)
         if start_dt is not None:
@@ -135,14 +164,7 @@ class SharadarDataSource(PitDataSource):
             lf = lf.filter(pl.col("date") <= _to_date(end_dt))
 
         df = lf.select(
-            # Cast to pl.Date so downstream `iter_rows` yields python date
-            # objects, not datetime. Nasdaq Data Link's SDK returns pandas
-            # datetime64[ns] which polars converts to pl.Datetime; without
-            # this cast the (asset_id, dt) price-index keys in the BarLoop
-            # become (int, datetime) while lookups use date(), so every
-            # lookup returns None and the constant-weight demo silently
-            # never rebalances.
-            pl.col("date").cast(pl.Date).alias("dt"),
+            pl.col("date").alias("dt"),
             pl.col("open").cast(pl.Float64),
             pl.col("high").cast(pl.Float64),
             pl.col("low").cast(pl.Float64),
@@ -170,7 +192,13 @@ class SharadarDataSource(PitDataSource):
         as cash-equivalent), delisting cash, and stock-for-stock acquisitions
         flow through M3.
         """
-        lf = self.get_table("actions").filter(pl.col("action") == "dividend")
+        # Same cast-before-filter contract as read_sep_prices; see comment
+        # there for the pandas-pin / Datetime-vs-Date silent-empty rationale.
+        lf = (
+            self.get_table("actions")
+            .with_columns(pl.col("date").cast(pl.Date))
+            .filter(pl.col("action") == "dividend")
+        )
         if ticker is not None:
             lf = lf.filter(pl.col("ticker") == ticker)
         if start_dt is not None:
@@ -179,11 +207,7 @@ class SharadarDataSource(PitDataSource):
             lf = lf.filter(pl.col("date") <= _to_date(end_dt))
 
         df = lf.select(
-            # Same date-cast rationale as read_sep_prices: nasdaq-data-link
-            # returns pl.Datetime via pandas; without the cast, ex_date keys
-            # in the reference + engine dividend index lose their date-vs-
-            # datetime equivalence and dividend credits silently never fire.
-            pl.col("date").cast(pl.Date).alias("ex_date"),
+            pl.col("date").alias("ex_date"),
             pl.col("value").cast(pl.Float64).alias("amount_per_share"),
         ).sort("ex_date").collect()
 
