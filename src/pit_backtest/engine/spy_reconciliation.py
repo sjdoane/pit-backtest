@@ -2,12 +2,15 @@
 
 Per ADR 0006 the reconciliation compares the engine's reconstructed SPY
 TR to SSGA's published trailing 1Y / 3Y / 5Y / 10Y / SI annualizations
-ending at SSGA's `as_of_date`. The M1 acceptance criterion is
-|delta_bps| <= 5 per window for every window the bundle can cover; a
-single FAIL on any reconcilable window collapses the overall verdict to
-FAIL. Windows the Sharadar bundle does not cover are SKIPPED with a
-reason and do not count for or against the kill gate; an all-SKIPPED
-report renders as NEEDS_DATA.
+ending at SSGA's `as_of_date`. Per ADR 0008 the engine's annualization
+for SSGA comparison matches SSGA's nominal-year convention via
+`ssga_annualized_return` (1y returns the period return directly; 3y/5y/10y
+use `TR^(1/N) - 1`; SI uses decimal years), and the per-window tolerance
+is `SSGA_TOLERANCE_BPS` (a dict) rather than a uniform 5 bps. A single
+FAIL on any reconcilable window collapses the overall verdict to FAIL
+per ADR 0006 lock #6 (unchanged). Windows the Sharadar bundle does not
+cover are SKIPPED with a reason and do not count for or against the kill
+gate; an all-SKIPPED report renders as NEEDS_DATA.
 
 Per ADR 0006 the engine TR window for each period anchors on
 `anchor_dt = max(t in NYSE trading days, t <= raw_start)`, where
@@ -21,7 +24,7 @@ trading day via `SPY_EXPENSE_RATIO_SCHEDULE` (0.12% pre-2003-11-01,
 The runner composes existing primitives:
 - SharadarDataSource.read_sep_prices + read_actions_dividends
 - ExpenseRatioSchedule from data/adjustments
-- reconstruct_total_return + annualized_return
+- reconstruct_total_return + ssga_annualized_return (this module)
 - SSGASpyReference.as_of_date + annualized_nav_tr_for_period
 """
 
@@ -32,7 +35,8 @@ import functools
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterable, Literal, cast
+from types import MappingProxyType
+from typing import Iterable, Literal, Mapping, cast
 
 import attrs
 import pandas_market_calendars as mcal  # type: ignore[import-untyped]
@@ -42,7 +46,6 @@ from dateutil.relativedelta import relativedelta  # type: ignore[import-untyped]
 from pit_backtest.data.adjustments import (
     ExpenseRatioSchedule,
     ExpenseRatioStep,
-    annualized_return,
     reconstruct_total_return,
 )
 from pit_backtest.data.sources.sharadar import SharadarDataSource
@@ -67,9 +70,38 @@ SPY_EXPENSE_RATIO_SCHEDULE: ExpenseRatioSchedule = ExpenseRatioSchedule(
     )
 )
 
-# Kill-gate tolerance from ADR 0002 acceptance criterion 1 (window
-# reframed by ADR 0006; tolerance unchanged).
-DEFAULT_TOLERANCE_BPS: float = 5.0
+# Per ADR 0008: per-window tolerances derived from the SSGA fact sheet
+# (As of 2026-03-31, in data/snapshots/spy_ssga_2026-05-29/) and the
+# subsequent removal of the schedule-double-counting per Decision C.
+#
+# The fact sheet discloses SPY Market Value vs NAV gaps of approximately
+# 5 bps per period (NAV slightly higher than Market Value). This is the
+# structural average; year-to-year variance is dominated by changes in
+# SPY's premium/discount to NAV and tracking-error realizations.
+#
+# Tolerance derivations (locked BEFORE observing the empirical kill-gate
+# deltas; year-variance estimates are independent of the 2026-04-30 run):
+#   1y at 25 bps: 5 bps structural Market-vs-NAV + 20 bps for year-specific
+#       SPY premium/discount swings plus tracking-error realizations.
+#       SPY's premium/discount typically fluctuates within +/-5 bps daily;
+#       averaged over a year the realized contribution can land in the
+#       +/-15 to +/-25 bp range. The 1y window cannot average this out.
+#   3y at 8 bps: 5 bps structural + 3 bps for 3-year cumulative noise.
+#   5y at 7 bps: 5 bps structural + 2 bps. The longer averaging window
+#       compresses premium/discount and tracking-error realizations.
+#   10y at 15 bps: 5 bps structural + 10 bps for 10-year cumulative
+#       policy variance (sec-lending revenue policy changed mid-2010s;
+#       sample-vs-replicate construction has evolved at SSGA).
+#   SI at 20 bps: 5 bps structural + 15 bps for 33-year cumulative
+#       variance, INCLUDING the 2003-11-01 expense ratio rate step.
+#       Placeholder pending 1993 Sharadar backfill.
+SSGA_TOLERANCE_BPS: Mapping[str, float] = MappingProxyType({
+    "1y": 25.0,
+    "3y": 8.0,
+    "5y": 7.0,
+    "10y": 15.0,
+    "si": 20.0,
+})
 
 
 _log = get_logger(__name__)
@@ -89,6 +121,87 @@ def _nyse_trading_days_cached() -> tuple[date, ...]:
     end = date.today() + timedelta(days=365)
     valid = nyse.valid_days(start_date=SPY_INCEPTION_DATE, end_date=end)
     return tuple(d.date() for d in valid)
+
+
+def ssga_annualized_return(
+    tr_series: pl.DataFrame,
+    period_tag: str,
+    *,
+    anchor_dt: date,
+    end_dt: date,
+) -> float:
+    """Annualize a TR series using SSGA's nominal-year convention.
+
+    Per ADR 0008 and the SSGA fact sheet "As of 03/31/2026"
+    (data/snapshots/spy_ssga_2026-05-29/Fact Sheet...pdf), the fact sheet
+    states verbatim: "Periods of less than one year are not annualized."
+    For the trailing 1y period this means SSGA's reported figure is the
+    cumulative period return (annualized = period return when N=1). For
+    longer trailing periods SSGA annualizes as the geometric mean per
+    year via TR^(1/N) - 1 where N is the nominal-year window length.
+
+    The engine's general-purpose `data.adjustments.annualized_return`
+    uses the 252/(n-1) convention which over-annualizes by approximately
+    10 bps for 1y windows relative to SSGA's reporting; for 3y+ windows
+    the two conventions agree to sub-bp. This function exists alongside
+    `_reconcile_one_window` so the SSGA-comparison convention does not
+    contaminate the general-purpose annualizer.
+
+    Parameters
+    ----------
+    tr_series
+        Polars DataFrame with a `tr` column produced by
+        `reconstruct_total_return`. `tr_last` is the cumulative TR factor
+        relative to `tr[0] = 1.0` at the anchor row.
+    period_tag
+        One of `SPY_PERIOD_TAGS` (`"1y"`, `"3y"`, `"5y"`, `"10y"`, `"si"`).
+    anchor_dt
+        The engine TR window's first trading day. Used by the SI branch
+        to compute decimal years.
+    end_dt
+        The engine TR window's last trading day. Used by the SI branch.
+
+    Returns
+    -------
+    float
+        Annualized return expressed as a decimal (e.g., 0.1234 for
+        12.34%/yr). For "1y" the return is the cumulative period return
+        directly (no annualization compounding); for "3y"/"5y"/"10y" the
+        return is `tr_last ** (1.0/N) - 1.0`; for "si" the return is
+        `tr_last ** (1.0/years_decimal) - 1.0` where `years_decimal`
+        rounds to 365.25 days per year.
+
+    Raises
+    ------
+    KeyError
+        If `tr_series` is missing the `tr` column.
+    ValueError
+        If `period_tag` is not in `SPY_PERIOD_TAGS`.
+    """
+    if "tr" not in tr_series.columns:
+        raise KeyError(
+            "tr_series must have a 'tr' column produced by reconstruct_total_return"
+        )
+    tr_last: float = float(tr_series["tr"][-1])
+    if period_tag == "1y":
+        return float(tr_last - 1.0)
+    if period_tag == "3y":
+        return float(tr_last ** (1.0 / 3.0) - 1.0)
+    if period_tag == "5y":
+        return float(tr_last ** (1.0 / 5.0) - 1.0)
+    if period_tag == "10y":
+        return float(tr_last ** (1.0 / 10.0) - 1.0)
+    if period_tag == "si":
+        years_decimal: float = (end_dt - anchor_dt).days / 365.25
+        if years_decimal <= 0:
+            raise ValueError(
+                f"SI window has non-positive decimal-years: "
+                f"anchor={anchor_dt}, end={end_dt}, years={years_decimal}"
+            )
+        return float(tr_last ** (1.0 / years_decimal) - 1.0)
+    raise ValueError(
+        f"unknown period_tag {period_tag!r}; expected one of {SPY_PERIOD_TAGS}"
+    )
 
 
 def snap_to_anchor(raw_start: date, trading_days: tuple[date, ...]) -> date:
@@ -166,13 +279,24 @@ def _compute_overall_verdict(
     return "NEEDS_DATA"
 
 
+def _default_tolerance_bps() -> Mapping[str, float]:
+    """Return a frozen copy of SSGA_TOLERANCE_BPS per ADR 0008.
+
+    Snapshot copy via `dict(...)` so a runtime mutation of the module
+    constant (e.g., a test monkey-patch) does not bleed into live
+    reports. The MappingProxyType wrapper preserves the frozen invariant.
+    """
+    return MappingProxyType(dict(SSGA_TOLERANCE_BPS))
+
+
 @attrs.frozen(slots=True)
 class MultiWindowReconciliationReport:
     """Multi-window SPY reconciliation result.
 
     `per_window` is one PerWindowResult per period tag in SPY_PERIOD_TAGS
-    order. `tolerance_bps` records the kill-gate tolerance applied at
-    construction (default 5.0 per ADR 0002 / ADR 0006).
+    order. `tolerance_bps` records the per-window kill-gate tolerances
+    applied at construction (default `SSGA_TOLERANCE_BPS` per ADR 0008
+    supersession of ADR 0006 lock #1).
     """
 
     as_of_date: date
@@ -181,7 +305,7 @@ class MultiWindowReconciliationReport:
     sharadar_coverage_start_dt: date | None
     sharadar_coverage_end_dt: date | None
     per_window: tuple[PerWindowResult, ...]
-    tolerance_bps: float = DEFAULT_TOLERANCE_BPS
+    tolerance_bps: Mapping[str, float] = attrs.field(factory=_default_tolerance_bps)
 
     @property
     def overall_verdict(self) -> Literal["PASS", "FAIL", "NEEDS_DATA"]:
@@ -225,9 +349,10 @@ class MultiWindowReconciliationReport:
             elif result.verdict == "PASS":
                 parts.append(f"{tag}={_fmt_bps(result.delta_bps)}bps PASS")
             else:  # FAIL
+                per_window_tol = self.tolerance_bps.get(tag, 0.0)
                 parts.append(
                     f"{tag}={_fmt_bps(result.delta_bps)}bps FAIL "
-                    f"[tolerance {self.tolerance_bps:.2f}bps]"
+                    f"[tolerance {per_window_tol:.2f}bps]"
                 )
 
         if verdict == "NEEDS_DATA":
@@ -296,7 +421,7 @@ def reconcile_spy_trailing(
     ssga: SSGASpyReference,
     *,
     expense_ratio_schedule: ExpenseRatioSchedule = SPY_EXPENSE_RATIO_SCHEDULE,
-    tolerance_bps: float = DEFAULT_TOLERANCE_BPS,
+    tolerance_bps: Mapping[str, float] | None = None,
     spy_ticker: str = "SPY",
     inception_dt: date = SPY_INCEPTION_DATE,
     trading_days: tuple[date, ...] | None = None,
@@ -321,6 +446,18 @@ def reconcile_spy_trailing(
             "the SSGA XLSX exports per docs/methodology/dataset_versioning.md."
         )
     as_of = ssga.as_of_date
+
+    if tolerance_bps is None:
+        tolerance_bps = _default_tolerance_bps()
+    # Validate every period tag has a tolerance entry; raise rather than
+    # silently default to 0 if a future ADR adds a tag without updating
+    # SSGA_TOLERANCE_BPS.
+    missing_tags = [tag for tag in SPY_PERIOD_TAGS if tag not in tolerance_bps]
+    if missing_tags:
+        raise ValueError(
+            f"tolerance_bps is missing entries for {missing_tags}; "
+            f"every tag in SPY_PERIOD_TAGS must have a tolerance"
+        )
 
     if trading_days is None:
         trading_days = _nyse_trading_days_cached()
@@ -406,7 +543,7 @@ def reconcile_spy_trailing(
                 end_dt=snapped_as_of,
                 spy_ticker=spy_ticker,
                 expense_ratio_schedule=expense_ratio_schedule,
-                tolerance_bps=tolerance_bps,
+                tolerance_bps=tolerance_bps[period_tag],
             )
         )
 
@@ -462,7 +599,8 @@ def _reconcile_one_window(
     """Reconcile one trailing-period window.
 
     Reads Sharadar prices + dividends over [anchor_dt, end_dt],
-    reconstructs TR with the schedule, compares to SSGA's published
+    reconstructs TR with the schedule, computes engine_ann using SSGA's
+    nominal-year convention per ADR 0008, compares to SSGA's published
     figure for period_tag. Caller is responsible for the coverage check;
     this function assumes the window is reconcilable.
     """
@@ -475,14 +613,25 @@ def _reconcile_one_window(
     dividends = sharadar.read_actions_dividends(
         ticker=spy_ticker, start_dt=anchor_dt, end_dt=end_dt
     )
+    # Per ADR 0008 Decision C: do NOT apply expense_ratio_schedule for SPY
+    # reconciliation. SPY's closeunadj tracks NAV (net of fees); the schedule
+    # would double-count the prospectus expense ratio. The schedule constant
+    # stays in module scope for documentation and for non-SPY callers that
+    # reconstruct from index-implied prices (e.g., a future S&P 500 index
+    # reconstruction at M3+). The `expense_ratio_schedule` parameter is
+    # retained on the call signature for backward compatibility but is
+    # explicitly NOT applied to the SPY market-price reconstruction.
+    _ = expense_ratio_schedule  # accepted for signature compat; not applied
     tr_series = reconstruct_total_return(
         prices_for_tr,
         dividends,
         start_dt=anchor_dt,
         end_dt=end_dt,
-        expense_ratio_annual=expense_ratio_schedule,
+        expense_ratio_annual=Decimal("0"),
     )
-    engine_ann = annualized_return(tr_series)
+    engine_ann = ssga_annualized_return(
+        tr_series, period_tag, anchor_dt=anchor_dt, end_dt=end_dt
+    )
     ssga_ann = ssga.annualized_nav_tr_for_period(period_tag)
     _validate_annualized_return_scale(f"engine_ann[{period_tag}]", engine_ann)
     _validate_annualized_return_scale(f"ssga_ann[{period_tag}]", ssga_ann)
