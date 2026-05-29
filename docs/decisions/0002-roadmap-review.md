@@ -333,7 +333,7 @@ These supersede ADR 0001 decision 20 (the four-week timeline). All other ADR 000
 Scope: SEP adapter; total-return reconstruction; buy-and-hold demo; constant-weight monthly rebalance demo; `TestClock` injection pattern; structured logging with `--log-level` flag. **Not in M1**: `FillPriceModel` enum (M2); performance budget CI (M2); `docs/TESTING.md` (M4); pyproject lockfile finalization (M2).
 
 Acceptance criteria:
-1. Buy-and-hold SPY from 2005-01-01 through 2024-12-31 reproduces SPDR-published SPY total return within 5 bps annualized; reinvestment convention is same-day-at-close on ex-date.
+1. Buy-and-hold SPY from 2005-01-01 through 2024-12-31 reproduces SPDR-published SPY total return within 5 bps annualized; reinvestment convention is same-day-at-close on ex-date. **Superseded by [ADR 0006](0006-trailing-period-spy-reconciliation.md):** the comparison surface is now SSGA's published trailing 1Y / 3Y / 5Y / 10Y / SI annualizations anchored on SSGA's `as_of_date`; the 5-bp tolerance per period and the same-day-at-close reinvestment convention are unchanged.
 2. Constant-weight monthly rebalance on SPY, AGG, GLD with equal target weights and fractional-share support produces final P&L matching a spreadsheet hand calculation to 1e-10.
 3. `docs/methodology/total_return_reconstruction.md` and `docs/methodology/dataset_versioning.md` exist with the math and the Sharadar pull hash committed.
 4. Structured logging works at INFO and DEBUG levels.
@@ -343,7 +343,7 @@ Acceptance criteria:
 Scope: `SquareRootImpact` (Almgren 2005) as default; `LinearImpact`, `FixedBps` as alternatives; `NoImpact` only with `unsuitable_for_deployment=True` flag and runtime warning; `Commission` with typed units and /100.0 regression unit test; `pre_trade_cost_estimate` API; `permanent_impact_register`; sensitivity-band runner over eta in [0.05, 0.10, 0.142, 0.20, 0.30]; `--impact-model=bouchaud` flag for beta=0.5; `FillPriceModel` enum (added here, when there is more than one option); performance budget CI on the SPY backtest.
 
 Acceptance criteria:
-1. SPY monthly rebalance at $1M notional from 2005 to 2024 produces total impact cost in `[A, B]` bps annualized where `A` is the model output at `eta=0.05` and `B` at `eta=0.30`, with `eta=0.142` central estimate falling between. Sanity-checked against Frazzini-Israel-Moskowitz 2018 (~10 bps for liquid US large-cap).
+1. SPY monthly rebalance at $1M notional from 2005 to 2024 produces total impact cost in `[A, B]` bps annualized where `A` is the model output at `eta=0.05` and `B` at `eta=0.30`, with `eta=0.142` central estimate falling between. Sanity-checked against Frazzini-Israel-Moskowitz 2018 (~10 bps for liquid US large-cap). **Superseded by [ADR 0007](0007-fim-2018-demoted-to-upper-ceiling.md):** the formula-derived band is the gate; FIM 2018 is preserved as an upper-ceiling sanity check (central cost < 50 bps annualized) rather than a central-estimate target, because SPY at $1M notional is sub-scale for FIM's institutional calibration.
 2. Sensitivity band rendering shows five SPY equity curves on one plot.
 3. Commission unit test deliberately fails when a /100.0 silent rescale is introduced and passes when removed.
 4. Pre-trade cost matches realized fill cost within the documented tolerance.
