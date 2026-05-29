@@ -138,6 +138,17 @@ def test_bar_loop_wires_explicit_cost_estimator_to_policy(tmp_path: Path) -> Non
     )
     # Wiring assertion: the BarLoop stored the real cost model, not
     # the no-op stand-in.
+    #
+    # ADR 0011 lock #5: this identity assertion is LOAD-BEARING for the
+    # tolerance contract dormancy. The fact that policy and matcher
+    # share the SAME cost-model instance is precisely why the tolerance
+    # check cannot fire at M2 (both estimate() and compute() calls
+    # resolve to the same MarketStateLookup row and produce bit-identical
+    # outputs). A future contributor at M3 who wants to ACTIVATE the
+    # tolerance contract must introduce distinct policy-time vs
+    # matcher-time MarketStateLookup snapshots; that activation
+    # supersedes this assertion. Do NOT delete this line as a "cleanup"
+    # without superseding ADR 0011.
     assert bar_loop._cost_estimator is cost_model
     assert not isinstance(bar_loop._cost_estimator, _NoopCostEstimator)
 
