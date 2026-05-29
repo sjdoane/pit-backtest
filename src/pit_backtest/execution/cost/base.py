@@ -87,3 +87,22 @@ class FillCostComputer(Protocol):
     def compute(self, fill_state: FillState) -> CostBreakdown:
         """Return the detailed cost breakdown for this fill."""
         ...
+
+
+class CostModel(PreTradeCostEstimator, FillCostComputer, Protocol):
+    """Combined PreTradeCostEstimator + FillCostComputer Protocol.
+
+    Per ADR 0009 lock #2 the matcher consumes a class that implements
+    both protocols (the architecture committed at ADR 0003 decision 4
+    keeps the protocols themselves split so researchers cannot
+    accidentally put expensive computation in the pre-trade path; the
+    matcher's input type is the combined view because the matcher
+    legitimately needs both methods on the same instance).
+
+    SquareRootImpactCostModel and NoImpact both structurally satisfy
+    this Protocol; the matcher's type hint can therefore be a single
+    `CostModel` parameter without losing protocol-discipline at the
+    construction site.
+    """
+
+    pass
