@@ -28,6 +28,9 @@ dev = [
     "mypy==1.13.0",
     "ruff==0.7.4",
 ]
+dataops = [
+    "nasdaq-data-link==1.0.5",
+]
 
 [project.scripts]
 pit-backtest = "pit_backtest.cli.main:main"

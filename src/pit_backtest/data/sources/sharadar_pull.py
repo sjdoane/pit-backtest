@@ -304,11 +304,20 @@ def main(argv: list[str] | None = None) -> int:
     pull_date = args.pull_date or datetime.now().date()
 
     if args.download:
-        api_key = os.environ.get("SHARADAR_API_KEY")
+        # The official SDK env var is NASDAQ_DATA_LINK_API_KEY; the
+        # legacy SHARADAR_API_KEY is kept for backwards compat. See
+        # docs/vendor/nasdaq-data-link-pull.md.
+        api_key = os.environ.get("NASDAQ_DATA_LINK_API_KEY") or os.environ.get(
+            "SHARADAR_API_KEY"
+        )
         if not api_key:
-            _log.error("missing_api_key", extra={"env_var": "SHARADAR_API_KEY"})
+            _log.error(
+                "missing_api_key",
+                extra={"env_var": "NASDAQ_DATA_LINK_API_KEY or SHARADAR_API_KEY"},
+            )
             print(
-                "SHARADAR_API_KEY env var not set; cannot attempt download",
+                "neither NASDAQ_DATA_LINK_API_KEY nor SHARADAR_API_KEY env var "
+                "is set; cannot attempt download",
                 file=sys.stderr,
             )
             return 2

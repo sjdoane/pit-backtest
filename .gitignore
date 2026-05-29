@@ -161,6 +161,12 @@ secrets/
 credentials.json
 service-account*.json
 
+# Vendor docs scraped to text (Nasdaq Data Link, SSGA, etc.) stay local
+# to avoid pasting third-party content into the repo. The summarized
+# reference at docs/vendor/ is the canonical project artifact.
+Nasdaq API Docs.txt
+*.vendor-scrape.txt
+
 # Local agent / scratch
 .claude/local/
 scratch/
