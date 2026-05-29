@@ -24,10 +24,11 @@ Key findings carried into phase 3 and the architecture ADR: the analytics layer 
 
 ### Phase 3: spec critique and architecture (complete)
 
-All three ADRs accepted and merged:
+All three phase-3 ADRs plus the M1-implementation-phase ADR 0004 accepted and merged:
 - [`docs/decisions/0001-spec-critique.md`](decisions/0001-spec-critique.md): 20 locked decisions reframing the project as a teaching artifact with explicit non-goals.
 - [`docs/decisions/0002-roadmap-review.md`](decisions/0002-roadmap-review.md): 21 locked decisions defining M1 through M5 over ten weeks with the week-2 kill gate.
 - [`docs/decisions/0003-architecture.md`](decisions/0003-architecture.md): 23 locked decisions on the protocol hierarchy, event loop, trust boundaries, data model.
+- [`docs/decisions/0004-rebalance-calendar-independence.md`](decisions/0004-rebalance-calendar-independence.md): rebalance calendar is fund-policy-determined and independent of the backtest window; `start_dt` is not forced as a rebalance date. Captured during the M1-day-3 skeptical-reviewer pass.
 
 Key architectural decisions from ADR 0003 that constrain implementation: Pydantic only at adapter load, CLI/config, and user-facing render targets (everywhere else uses attrs with `slots=True, frozen=True`); CashFlow split from CorporateAction as two streams; permanent impact lives in the data source layer via `ImpactedPriceSource`, not as a separate register; `PreTradeCostEstimator` and `FillCostComputer` are separate protocols; `Signal.compute` returns `dict[AssetId, float]`; `MatchingEngine.submit` returns `list[Fill]`; Clock includes `is_market_open` and `next_bar`; `AssetId = NewType("AssetId", int)` with a separate `IdentifierResolver` for v2 forward compatibility; LongOnlyPolicy at v1; determinism invariant documented; trust boundaries enumerated in 11 items.
 
