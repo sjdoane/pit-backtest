@@ -25,7 +25,7 @@ This repo is an opinionated response to those failure modes within a deliberatel
 - **The LdP chapter 14 scorecard**. PSR, DSR, MinTRL, HHI, drawdown stats, per-year decomposition are the default analytics. Raw Sharpe shown alone is a configuration error.
 - **Cost realism with honest uncertainty bounds**. Default cost model is SquareRootImpact with Almgren 2005 calibration (eta=0.142, beta=0.6, gamma=0.314), labeled as a 1998-2000 calibration. Sensitivity bands at eta in [0.05, 0.30] are required in every backtest report. A `--impact-model=bouchaud` flag substitutes beta=0.5.
 - **Point-in-time data with persistent identifiers**. Dual-timestamp model (`period_end_dt`, `available_dt`) on every record. Typed `Universe` API with `is_member(asset_id, date)`. Persistent asset identifiers via Sharadar TICKERS.
-- **Engine self-validation**. M1 reconciles buy-and-hold SPY against the actual SPY total return within 5 bps annualized; a deterministic hand-computable strategy is verified to exact match. M5 includes differential testing against `zipline-reloaded` with a published reconciliation report.
+- **Engine self-validation**. M1 reconciles buy-and-hold SPY against SSGA's published SPY NAV TR for the trailing 1Y / 3Y / 5Y / 10Y / SI periods (anchored on SSGA's as-of date) within 5 bps annualized per period; a deterministic hand-computable strategy is verified to exact match. M5 includes differential testing against `zipline-reloaded` with a published reconciliation report.
 
 ## Explicit non-goals
 
@@ -105,10 +105,10 @@ Open a new PowerShell window so the variable loads. On Windows, also point uv at
 [Environment]::SetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", "C:\Users\<you>\.venvs\pit-backtest", "User")
 ```
 
-Pull data and run the kill-gate:
+Pull data and run the kill-gate. Pass `--end-date` to pull through SSGA's most recent `as_of_date` (per ADR 0006 the kill gate is anchored on the SSGA as-of date; the bundle must cover at least one trailing window for the gate to report PASS or FAIL rather than NEEDS_DATA).
 
 ```
-uv run python scripts/pull_m1_data.py
+uv run python scripts/pull_m1_data.py --end-date 2026-04-30
 # Manually download spdr-etf-historical-distributions.xlsx and
 # spdr-product-data-us-en.xlsx from
 # https://www.ssga.com/us/en/intermediary/etfs/spdr-sp-500-etf-spy
@@ -118,6 +118,8 @@ uv run python -m pit_backtest.data.sources.sharadar_pull --bundle spy_ssga_<YYYY
 uv run python -m examples.spy_buy_and_hold --compare-to-ssga
 uv run python -m examples.constant_weight_three_names --diff-against-reference
 ```
+
+`examples.spy_buy_and_hold --compare-to-ssga` exits 0 on PASS, 1 on FAIL, 2 on NEEDS_DATA (the bundle covers no trailing window) or any missing-bundle condition.
 
 See [`docs/vendor/nasdaq-data-link-pull.md`](docs/vendor/nasdaq-data-link-pull.md) for the full pull procedure and troubleshooting.
 
@@ -138,4 +140,7 @@ CI runs the synthetic-fixture tests on every push; the snapshot-gated real-data 
 5. [`docs/decisions/0002-roadmap-review.md`](docs/decisions/0002-roadmap-review.md): the M1 through M5 acceptance criteria, with the ten-week timeline and kill gate.
 6. [`docs/decisions/0003-architecture.md`](docs/decisions/0003-architecture.md): the protocol hierarchy, the trust boundary list, the data model.
 7. [`docs/decisions/0004-rebalance-calendar-independence.md`](docs/decisions/0004-rebalance-calendar-independence.md): rebalance calendars are fund-policy-determined, independent of backtest window. Captured during M1 day 3 implementation.
-8. [`docs/methodology/`](docs/methodology/): the four pre-M1 contracts (total-return reconstruction, dataset versioning, Pydantic/Polars/attrs boundary, determinism invariant). Read after the ADRs; these are the implementation contracts the engine code in M1 onward is held to.
+8. [`docs/decisions/0005-m2-cost-realism-plan.md`](docs/decisions/0005-m2-cost-realism-plan.md): M2 cost-realism implementation plan; 18 locked decisions including the Almgren formula form, VWAP refusal, the four-PR split, and the queued ADRs 0006 and 0007.
+9. [`docs/decisions/0006-trailing-period-spy-reconciliation.md`](docs/decisions/0006-trailing-period-spy-reconciliation.md): SPY reconciliation reframed from a single 2005-2024 window to SSGA's published trailing 1Y / 3Y / 5Y / 10Y / SI periods anchored on SSGA's as-of date; snap-backward anchor convention; `ExpenseRatioSchedule` for the 2003-11-01 step.
+10. [`docs/decisions/0007-fim-2018-demoted-to-upper-ceiling.md`](docs/decisions/0007-fim-2018-demoted-to-upper-ceiling.md): M2 cost-realism acceptance criterion revised; formula-derived `[eta=0.05, eta=0.30]` band is the gate; FIM 2018 preserved as a 50-bp upper-ceiling sanity check.
+11. [`docs/methodology/`](docs/methodology/): the four pre-M1 contracts (total-return reconstruction, dataset versioning, Pydantic/Polars/attrs boundary, determinism invariant). Read after the ADRs; these are the implementation contracts the engine code in M1 onward is held to.

@@ -7,13 +7,21 @@ unadjusted prices and return computation sees adjusted prices.
 
 The total-return reconstruction (M1) lives here as a pure function. See
 docs/methodology/total_return_reconstruction.md for the math and tolerance.
+
+Per ADR 0006, reconstruct_total_return supports a step-function expense
+ratio via ExpenseRatioSchedule. The schedule is needed for the SI window
+(SPY inception 1993-01-22) which straddles the 2003-11-01 expense-ratio
+reduction from 0.12% to 0.0945%.
 """
 
 from __future__ import annotations
 
+import bisect
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Union
 
+import attrs
 import polars as pl
 
 
@@ -21,6 +29,84 @@ import polars as pl
 # docs/methodology/total_return_reconstruction.md: SSGA's published 1-year,
 # 3-year, 5-year, 10-year SPY NAV TR uses a 252-trading-day convention.
 TRADING_DAYS_PER_YEAR = 252
+
+
+@attrs.frozen(slots=True)
+class ExpenseRatioStep:
+    """One step of a stepwise time-varying expense-ratio schedule.
+
+    The rate is annualized; the per-trading-day drag is rate / 252.
+    """
+
+    effective_from: date
+    rate: Decimal
+
+
+@attrs.frozen(slots=True)
+class ExpenseRatioSchedule:
+    """A stepwise expense-ratio schedule sorted ascending by effective_from.
+
+    The schedule supports scalar lookups via rate_for(d) and frame-wide
+    joins inside reconstruct_total_return via to_drag_frame(). The two
+    paths agree at every boundary day per ADR 0006: a query date equal
+    to a step's effective_from picks up the new rate.
+
+    For SPY's history, ADR 0006 locks::
+
+        ExpenseRatioSchedule(rows=(
+            ExpenseRatioStep(date(1993, 1, 22), Decimal("0.0012")),
+            ExpenseRatioStep(date(2003, 11, 1), Decimal("0.000945")),
+        ))
+    """
+
+    rows: tuple[ExpenseRatioStep, ...]
+
+    def __attrs_post_init__(self) -> None:
+        if not self.rows:
+            raise ValueError("ExpenseRatioSchedule requires at least one step")
+        effective_dates = [step.effective_from for step in self.rows]
+        if effective_dates != sorted(effective_dates):
+            raise ValueError(
+                "ExpenseRatioSchedule rows must be sorted ascending by effective_from; "
+                f"got {effective_dates}"
+            )
+
+    def rate_for(self, d: date) -> Decimal:
+        """Return the rate effective on date d (inclusive of effective_from).
+
+        Uses bisect_right; the step at index (bisect_right - 1) is the
+        most recent step satisfying effective_from <= d. Raises
+        ValueError if d precedes the schedule's first effective_from.
+        """
+        effective_dates = [step.effective_from for step in self.rows]
+        idx = bisect.bisect_right(effective_dates, d) - 1
+        if idx < 0:
+            raise ValueError(
+                f"date {d} precedes the schedule's first effective_from "
+                f"({self.rows[0].effective_from}); no rate is defined"
+            )
+        return self.rows[idx].rate
+
+    def to_drag_frame(self) -> pl.DataFrame:
+        """Return a Polars frame keyed by effective_from with the per-day drag.
+
+        Columns: effective_from (pl.Date), daily_drag (pl.Float64).
+        Used by reconstruct_total_return's schedule branch as the right
+        side of a join_asof(strategy='backward') against the prices frame.
+        The Decimal-to-float conversion happens here once.
+        """
+        return pl.DataFrame(
+            {
+                "effective_from": [step.effective_from for step in self.rows],
+                "daily_drag": [
+                    float(step.rate) / TRADING_DAYS_PER_YEAR for step in self.rows
+                ],
+            },
+            schema={"effective_from": pl.Date, "daily_drag": pl.Float64},
+        )
+
+
+ExpenseRatioParam = Union[Decimal, ExpenseRatioSchedule]
 
 
 def adjusted_close(
@@ -47,7 +133,7 @@ def reconstruct_total_return(
     dividends: pl.DataFrame,
     start_dt: date | datetime,
     end_dt: date | datetime,
-    expense_ratio_annual: Decimal,
+    expense_ratio_annual: ExpenseRatioParam,
 ) -> pl.DataFrame:
     """Reconstruct a daily total-return series from prices + dividends.
 
@@ -56,8 +142,11 @@ def reconstruct_total_return(
     update; see docs/methodology/total_return_reconstruction.md).
 
     Expense-ratio drag applied per trading day as a multiplicative factor
-    (1 - expense_ratio_annual / 252) on every multiplier except the first
-    row (the first row is the reference, TR[0] = 1.0, no time elapsed).
+    (1 - daily_drag) on every multiplier except the first row (the first
+    row is the reference, TR[0] = 1.0, no time elapsed). The drag rate
+    is constant when expense_ratio_annual is a Decimal; it is a step
+    function when expense_ratio_annual is an ExpenseRatioSchedule (per
+    ADR 0006, the SI window for SPY straddles the 2003-11-01 reduction).
 
     Parameters
     ----------
@@ -73,10 +162,12 @@ def reconstruct_total_return(
     end_dt
         Reconciliation window end (inclusive).
     expense_ratio_annual
-        SPY expense ratio for the window. Constant across the window; the
-        step-function case for windows crossing the 2003-11 SPY ratio
-        change is a follow-up (out of scope for the M1 2005-2024 window
-        which is entirely after the change).
+        Either a `Decimal` for a constant rate across the window, or an
+        `ExpenseRatioSchedule` for a stepwise time-varying rate (e.g.
+        SPY's pre-2003 0.12% / post-2003 0.0945% split). The schedule
+        path uses `join_asof(strategy='backward')` so the boundary day
+        `dt == effective_from` picks up the new rate. The scalar path
+        is byte-for-byte equivalent to the pre-ADR-0006 implementation.
 
     Returns
     -------
@@ -91,15 +182,17 @@ def reconstruct_total_return(
         If `prices` is missing `dt` or `close`, or `dividends` is missing
         `ex_date` or `amount_per_share`.
     ValueError
-        If no rows in `prices` fall in [start_dt, end_dt].
+        If no rows in `prices` fall in [start_dt, end_dt], or if a schedule
+        is supplied but does not cover the window's first trading day.
 
     Tolerance commitment
     --------------------
-    Reconstruction matches SPDR-published SPY NAV TR to within 5 bps
-    annualized over 2005-2024 with the expense-ratio drag explicitly
-    subtracted (M1 kill-early gate). The toy three-day fixture in
+    Reconstruction matches SSGA-published SPY NAV TR to within 5 bps
+    annualized per trailing period (1y / 3y / 5y / 10y / SI ending at
+    SSGA's as_of_date) with the expense-ratio drag explicitly subtracted
+    (M1 kill-early gate per ADR 0006). The toy three-day fixture in
     `tests/data/test_tr_reconstruction.py` exercises the algebra; the
-    SPY reconciliation harness gates on the full window.
+    SPY reconciliation harness gates on each trailing period.
     """
     _validate_price_columns(prices)
     _validate_dividend_columns(dividends)
@@ -117,8 +210,6 @@ def reconstruct_total_return(
             f"check the input frame and the window bounds."
         )
 
-    daily_drag = float(expense_ratio_annual) / TRADING_DAYS_PER_YEAR
-
     dividends_aligned = dividends.rename({"ex_date": "dt"}).select(
         ["dt", pl.col("amount_per_share").cast(pl.Float64).alias("div")]
     )
@@ -129,6 +220,35 @@ def reconstruct_total_return(
         .sort("dt")
     )
 
+    # Resolve daily_drag as either a scalar literal (Decimal path) or a
+    # per-row column (ExpenseRatioSchedule path). The two paths agree at
+    # every boundary day per ADR 0006; the scalar path is byte-for-byte
+    # equivalent to the pre-ADR-0006 implementation.
+    if isinstance(expense_ratio_annual, ExpenseRatioSchedule):
+        # Validate coverage: the window's first trading day must be at or
+        # after the schedule's first effective_from. Otherwise the join
+        # would silently produce null daily_drag and the multiplier would
+        # become NaN.
+        first_dt = combined["dt"][0]
+        if first_dt < expense_ratio_annual.rows[0].effective_from:
+            raise ValueError(
+                f"ExpenseRatioSchedule's first effective_from "
+                f"({expense_ratio_annual.rows[0].effective_from}) is after "
+                f"the window's first trading day ({first_dt}); add an earlier "
+                f"step or narrow the window."
+            )
+        drag_frame = expense_ratio_annual.to_drag_frame()
+        combined = combined.sort("dt").join_asof(
+            drag_frame.sort("effective_from"),
+            left_on="dt",
+            right_on="effective_from",
+            strategy="backward",
+        )
+        daily_drag_expr: pl.Expr = pl.col("daily_drag")
+    else:
+        scalar_drag = float(expense_ratio_annual) / TRADING_DAYS_PER_YEAR
+        daily_drag_expr = pl.lit(scalar_drag)
+
     # First row's multiplier is 1.0 by definition (the reference); subsequent
     # rows use (close + div) / prior_close * (1 - daily_drag). The when/then
     # picks up the first row via the null on shift(1).
@@ -138,7 +258,7 @@ def reconstruct_total_return(
         .otherwise(
             (pl.col("close") + pl.col("div"))
             / pl.col("close").shift(1)
-            * (1.0 - daily_drag)
+            * (1.0 - daily_drag_expr)
         )
         .alias("multiplier")
     )
