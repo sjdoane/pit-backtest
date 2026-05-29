@@ -20,3 +20,19 @@
 # "sf1.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
 # "tickers.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
 # "sp500.parquet" = { sha256 = "<64-hex>", size_bytes = 0, row_count = 0 }
+
+[snapshots.sharadar_2026-05-29]
+source = "sharadar"
+pull_date = 2026-05-29
+
+[snapshots.sharadar_2026-05-29.files]
+"actions.parquet" = { sha256 = "be31adc5cbb2d56a2d9d284560162e9ce4340dbe40c654c91760192088d15c86", size_bytes = 6100, row_count = 321 }
+"sep.parquet" = { sha256 = "3b79083006d1d99dc58f4daf3ca48679718ea1f52e5917872b58648b63b85e82", size_bytes = 368678, row_count = 15099 }
+
+[snapshots.spy_ssga_2026-05-29]
+source = "sharadar"
+pull_date = 2026-05-29
+
+[snapshots.spy_ssga_2026-05-29.files]
+"spdr-etf-historical-distributions.xlsx" = { sha256 = "8ec63cf8532aa6b5a48aabb7d697409ee354134b9c59f56db441f924cb35ddaf", size_bytes = 563067 }
+"spdr-product-data-us-en.xlsx" = { sha256 = "dc4c1a92ed88ba408608be8c8284ba12aae6e514d40c58766d679d39388a5f85", size_bytes = 93164 }
