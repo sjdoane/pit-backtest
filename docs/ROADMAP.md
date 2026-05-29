@@ -66,6 +66,12 @@ Scope: `SquareRootImpact` (Almgren 2005) default; `LinearImpact`, `FixedBps` alt
 
 Acceptance: SPY $1M monthly rebalance total impact cost falls in the [eta=0.05, eta=0.30] band sanity-checked against Frazzini-Israel-Moskowitz 2018; sensitivity band renders five curves; /100.0 regression unit test passes; permanent-impact fixture verifies next-bar mid-price drop; CI runs the perf benchmark with 10% regression threshold.
 
+Progress:
+- **PR A shipped** (cost-model math + Commission + golden fixture + ADR 0006/0007). Almgren formula + MarketStateLookup + PerShareCommission/BasisPointsCommission + rolling helpers + `docs/methodology/cost_model_tolerance.md`. The FIM 2018 acceptance criterion 1 is the formula-derived `[eta=0.05, eta=0.30]` band as the gate with 50 bp annualized as the upper-ceiling sanity check (ADR 0007).
+- **PR B shipped** (ImpactedPriceSource + SquareRootImpactMatchingEngine + BarLoop wiring + ADR 0009). ImpactedPriceSource standalone decorator with per-asset cumulative impact register; SquareRootImpactMatchingEngine supporting OPEN/CLOSE/ARRIVAL (NEXT_BAR_OPEN deferred to M3); MatchingEngine Protocol extended with `on_bar_start`; BarLoop wires cost_estimator to policy per ADR 0003 decision 4; Layer 2 1e-10 invariant split into two tests; golden fixture E2E; permanent-impact next-bar mid-drops fixture per acceptance criterion 5; determinism trust boundary extended to 12 items.
+- **PR C pending** (SensitivityBand + Runner.run_sweep + analytics/sensitivity.py + examples/spy_cost_sensitivity.py + active tolerance enforcement via Order.estimate_bps_at_submit).
+- **PR D pending** (bench/spy_20y.py on synthetic data + bench/compare.py + .github/workflows/perf-budget.yml + .bench-baseline.json).
+
 ### M3 (weeks 5-7): PIT data with corporate actions
 
 Goal: PIT discipline on every data record; survivorship-bias-free universes; splits, dividends, delistings, spin-offs flow correctly.
