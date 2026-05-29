@@ -114,7 +114,11 @@ This example becomes a unit-test fixture once the SSGA pull lands: `tests/data/t
 
 ## Modeling the expense-ratio drag
 
-The SSGA SPY NAV TR is net of the fund's expense ratio. Reconstruction from prices and dividends alone is gross of expenses and will systematically overstate SSGA's reported TR by approximately the cumulative expense drag.
+The SSGA SPY NAV TR is net of the fund's expense ratio.
+
+**Correction per ADR 0008 Decision C:** The original methodology doc claimed "reconstruction from prices and dividends alone is gross of expenses." That claim applies to INDEX reconstruction (using index price + index dividends). It does NOT apply to SPY market-price reconstruction. SPY's closeunadj is the fund's market closing price, which tracks NAV. NAV is computed net of expenses by construction (the prospectus expense ratio is deducted daily from fund assets). Reconstructing TR from SPY market price + SPY dividends therefore approximates SPY NAV TR directly, **already net of expenses**.
+
+The M1 SPY reconciliation harness consequently does NOT apply the `SPY_EXPENSE_RATIO_SCHEDULE` to SPY's TR reconstruction; doing so would double-count the prospectus expense and bias the engine below SSGA NAV TR by ~9 bps annualized. The schedule constant is retained in `engine/spy_reconciliation.py` as documentation of the prospectus history and for potential M3+ callers that reconstruct from an actual S&P 500 INDEX TR rather than from SPY market prices.
 
 SPY expense-ratio history:
 
