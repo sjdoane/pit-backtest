@@ -12,7 +12,7 @@ Reconstruct a SPY total-return series from a price series plus a dividend series
 
 The reconciliation reference is the SPY fund net asset value total return as published by State Street Global Advisors (SSGA, the SPDR brand owner) on the SPY fund page:
 
-- URL: https://www.ssga.com/us/en/intermediary/etfs/spy
+- URL: https://www.ssga.com/us/en/intermediary/etfs/spdr-sp-500-etf-spy (URL of record; SSGA's older slug `etfs/spy` no longer redirects)
 - Source tab: Performance (for the cumulative and annualized NAV TR) and Distributions (for every ex-date and per-share cash amount in the fund's history).
 - Snapshot policy: a CSV export of the SSGA Performance and Distributions tabs is committed to `data/snapshots/spy_ssga_<YYYY-MM-DD>/` on each pull. The directory name records the pull date. The SHA256 of each file is recorded in [`dataset_versioning.md`](dataset_versioning.md).
 - Initial pull date: 2026-05-28 (the date this document was authored). The first snapshot commit will replace this placeholder with the actual pull date.

@@ -36,6 +36,11 @@ dataops = [
     # parquet SHA256 is what determinism gates on, not the in-memory
     # conversion path.
     "pyarrow>=18.0,<22",
+    # openpyxl reads the SSGA-native XLSX exports (spdr-etf-historical-
+    # distributions.xlsx and spdr-product-data-us-en.xlsx) directly so
+    # we do not have to ask the user to transcribe period-return numbers
+    # by hand. See docs/vendor/nasdaq-data-link-pull.md for the workflow.
+    "openpyxl>=3.1,<4",
 ]
 
 [project.scripts]

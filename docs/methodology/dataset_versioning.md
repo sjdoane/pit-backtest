@@ -37,7 +37,7 @@ Each pull produces a snapshot bundle. The procedure for a fresh pull:
 
 1. Acquire a Sharadar API key with subscriptions to SEP, SF1, TICKERS, SP500 (the four core tables; ~$50/month at the time of writing).
 2. Run `python -m pit_backtest.data.sources.sharadar.pull --output data/snapshots/sharadar_<YYYY-MM-DD>/`. This script (M1 deliverable) downloads each table as parquet via the Sharadar bulk-export API and writes them to the dated subdirectory.
-3. Pull the SSGA SPY snapshot manually from https://www.ssga.com/us/en/intermediary/etfs/spy: download the Performance CSV (cumulative and annualized NAV TR) and the Distributions CSV (ex-date and per-share amounts). Save under `data/snapshots/spy_ssga_<YYYY-MM-DD>/`.
+3. Pull the SSGA SPY snapshot manually from https://www.ssga.com/us/en/intermediary/etfs/spdr-sp-500-etf-spy (the older `etfs/spy` URL no longer redirects). From the Document section, download `spdr-etf-historical-distributions.xlsx` (ETF Historical Distributions link) and `spdr-product-data-us-en.xlsx` (Download Product Data link). Save both into `data/snapshots/spy_ssga_<YYYY-MM-DD>/`. The loader reads the XLSXs natively (filters to TICKER='SPY' and extracts SPY's row); see `docs/vendor/nasdaq-data-link-pull.md` for the workflow.
 4. Run `python -m pit_backtest.data.sources.manifest update`. This script (M1 deliverable) computes the SHA256 of every parquet and CSV in `data/snapshots/`, updates `data/snapshots/manifest.toml`, and prints a diff against the prior manifest.
 5. Update [this document's pull-log table](#pull-log) with the new entry (pull date, snapshot bundle name, short SHA256 prefix per file, notes on any vendor data changes observed).
 6. Commit the manifest update and the doc update in a single commit with subject `chore(data): refresh Sharadar snapshot <YYYY-MM-DD>`.
@@ -87,7 +87,7 @@ notes = "Initial M1 pull."
 [snapshots.spy_ssga_2026-05-28]
 source = "ssga_spy"
 pull_date = "2026-05-28"
-source_url = "https://www.ssga.com/us/en/intermediary/etfs/spy"
+source_url = "https://www.ssga.com/us/en/intermediary/etfs/spdr-sp-500-etf-spy"
 notes = "Initial M1 reconciliation reference."
 
 [snapshots.spy_ssga_2026-05-28.files]
