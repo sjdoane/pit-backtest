@@ -85,7 +85,37 @@ LICENSE
 
 ## Running locally
 
-Not yet runnable. The package scaffold imports and the contract tests pass, but every engine path raises `NotImplementedError` until M1 lands the SEP adapter, the total-return reconstruction, the buy-and-hold demo, and the constant-weight monthly rebalance demo (target: end of week 2). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the schedule and [`docs/methodology/`](docs/methodology/) for the contracts M1 builds against.
+The M1 engine path is wired. Both demos run against synthetic fixtures in CI; the real-data versions require a Sharadar snapshot under `data/snapshots/`.
+
+Setup:
+
+```
+uv sync --all-extras
+```
+
+Set the Sharadar API key (do not paste in chat):
+
+```
+[Environment]::SetEnvironmentVariable("SHARADAR_API_KEY", "<your_key>", "User")
+```
+
+Open a new PowerShell window so the variable loads.
+
+After pulling Sharadar SEP + ACTIONS into `data/snapshots/sharadar_<YYYY-MM-DD>/` and SSGA SPY into `data/snapshots/spy_ssga_<YYYY-MM-DD>/`:
+
+```
+python -m pit_backtest.data.sources.sharadar_pull --bundle sharadar_<YYYY-MM-DD> --refresh-hashes
+python -m examples.spy_buy_and_hold --compare-to-ssga
+python -m examples.constant_weight_three_names --diff-against-reference
+```
+
+Or just the test suite:
+
+```
+$env:PYTHONHASHSEED="0"; uv run pytest tests/
+```
+
+CI runs the synthetic-fixture tests on every push; the snapshot-gated real-data tests skip cleanly when no snapshot is present.
 
 ## Suggested reading order for a reviewer
 
