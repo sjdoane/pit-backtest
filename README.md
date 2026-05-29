@@ -90,24 +90,36 @@ The M1 engine path is wired. Both demos run against synthetic fixtures in CI; th
 Setup:
 
 ```
-uv sync --all-extras
+uv sync --extra dev --extra dataops
 ```
 
-Set the Sharadar API key (do not paste in chat):
+Set the Nasdaq Data Link API key (the official env var; legacy `SHARADAR_API_KEY` also accepted; never paste secrets in chat):
 
 ```
-[Environment]::SetEnvironmentVariable("SHARADAR_API_KEY", "<your_key>", "User")
+[Environment]::SetEnvironmentVariable("NASDAQ_DATA_LINK_API_KEY", "<your_key>", "User")
 ```
 
-Open a new PowerShell window so the variable loads.
-
-After pulling Sharadar SEP + ACTIONS into `data/snapshots/sharadar_<YYYY-MM-DD>/` and SSGA SPY into `data/snapshots/spy_ssga_<YYYY-MM-DD>/`:
+Open a new PowerShell window so the variable loads. On Windows, also point uv at a venv outside OneDrive to avoid lazy-sync file locks:
 
 ```
-python -m pit_backtest.data.sources.sharadar_pull --bundle sharadar_<YYYY-MM-DD> --refresh-hashes
-python -m examples.spy_buy_and_hold --compare-to-ssga
-python -m examples.constant_weight_three_names --diff-against-reference
+[Environment]::SetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", "C:\Users\<you>\.venvs\pit-backtest", "User")
 ```
+
+Pull data and run the kill-gate:
+
+```
+uv run python scripts/pull_m1_data.py
+# Manually download spdr-etf-historical-distributions.xlsx and
+# spdr-product-data-us-en.xlsx from
+# https://www.ssga.com/us/en/intermediary/etfs/spdr-sp-500-etf-spy
+# into data/snapshots/spy_ssga_<YYYY-MM-DD>/  (do not rename them).
+uv run python -m pit_backtest.data.sources.sharadar_pull --bundle sharadar_<YYYY-MM-DD> --refresh-hashes
+uv run python -m pit_backtest.data.sources.sharadar_pull --bundle spy_ssga_<YYYY-MM-DD> --refresh-hashes
+uv run python -m examples.spy_buy_and_hold --compare-to-ssga
+uv run python -m examples.constant_weight_three_names --diff-against-reference
+```
+
+See [`docs/vendor/nasdaq-data-link-pull.md`](docs/vendor/nasdaq-data-link-pull.md) for the full pull procedure and troubleshooting.
 
 Or just the test suite:
 

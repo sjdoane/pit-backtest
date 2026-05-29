@@ -108,18 +108,29 @@ Note on SEP vs SFP: historically SEP covered common stocks only and SFP covered 
 
 For the M1 SPY reconciliation, the SSGA-published SPY NAV TR is the authoritative reference (per `docs/methodology/total_return_reconstruction.md`). No API; download two CSVs from the SSGA fund page:
 
-- URL: https://www.ssga.com/us/en/intermediary/etfs/spy
-- Performance tab: export `performance.csv` (period, NAV TR%, market price TR%).
-- Distributions tab: export `distributions.csv` (ex_date, record_date, payable_date, amount_per_share).
+- URL of record (verified 2026-05-29): https://www.ssga.com/us/en/intermediary/etfs/spdr-sp-500-etf-spy
 
-Drop both into `data/snapshots/spy_ssga_<YYYY-MM-DD>/`. `sharadar_pull --bundle spy_ssga_<YYYY-MM-DD> --refresh-hashes` works on this bundle too (it hashes any `.parquet` and `.csv` it finds).
+The older `etfs/spy` URL no longer redirects; SSGA expanded the slug to include the full fund name. Always verify the URL with WebFetch when starting a new session that touches this workflow.
+
+Scroll to the **Document** section and download two files into `data/snapshots/spy_ssga_<YYYY-MM-DD>/`:
+
+1. **`spdr-etf-historical-distributions.xlsx`** via the "ETF Historical Distributions" link under Fund Documents. Per-distribution rows for every SPDR ETF; the loader filters to TICKER='SPY'.
+2. **`spdr-product-data-us-en.xlsx`** via the "Download Product Data" link under Information & Schedules. Single-row-per-ETF snapshot containing the SSGA-published annualized Total Returns. The loader extracts SPY's row and reads the 1Y / 3Y / 5Y / 10Y / Since Inception cells.
+
+Do not rename the files; the loader auto-detects them by exact filename. Then:
+
+```
+uv run python -m pit_backtest.data.sources.sharadar_pull --bundle spy_ssga_<YYYY-MM-DD> --refresh-hashes
+```
+
+If SSGA exports older-format CSVs (`distributions.csv` + `performance.csv`) instead, the loader also reads those as a fallback per the original schema. See `src/pit_backtest/data/sources/ssga.py` module docstring for the column mappings and `tests/data/test_ssga_loader.py` for the synthetic XLSX shape.
 
 ## Full M1 pull procedure
 
 1. Set `NASDAQ_DATA_LINK_API_KEY` (one-time, see Authentication above).
 2. Install the SDK: `uv sync --extra dataops`.
 3. Run the M1 pull script: `uv run python scripts/pull_m1_data.py`. This creates `data/snapshots/sharadar_<today>/sep.parquet` and `actions.parquet` filtered to SPY/AGG/GLD over 2005-2024.
-4. Manually download the SSGA CSVs into `data/snapshots/spy_ssga_<today>/`.
+4. Manually download `spdr-etf-historical-distributions.xlsx` and `spdr-product-data-us-en.xlsx` from the SSGA SPY fund page into `data/snapshots/spy_ssga_<today>/`. Do not rename them; the loader auto-detects by exact filename.
 5. Refresh manifest hashes for both bundles:
    ```
    uv run python -m pit_backtest.data.sources.sharadar_pull --bundle sharadar_<today> --refresh-hashes
