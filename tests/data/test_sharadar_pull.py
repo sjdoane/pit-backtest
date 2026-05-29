@@ -112,7 +112,7 @@ def test_refresh_hashes_idempotent(tmp_path: Path) -> None:
 def test_refresh_hashes_no_parquets_raises(tmp_path: Path) -> None:
     bundle_dir = tmp_path / "snapshots" / "sharadar_2026-05-28"
     bundle_dir.mkdir(parents=True)
-    with pytest.raises(FileNotFoundError, match="no .parquet files"):
+    with pytest.raises(FileNotFoundError, match=r"no \.parquet/\.xlsx/\.csv files"):
         refresh_hashes(
             bundle_dir=bundle_dir,
             manifest_path=tmp_path / "snapshots" / "manifest.toml",
