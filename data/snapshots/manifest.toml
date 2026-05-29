@@ -26,8 +26,8 @@ source = "sharadar"
 pull_date = 2026-05-29
 
 [snapshots.sharadar_2026-05-29.files]
-"actions.parquet" = { sha256 = "be31adc5cbb2d56a2d9d284560162e9ce4340dbe40c654c91760192088d15c86", size_bytes = 6100, row_count = 321 }
-"sep.parquet" = { sha256 = "3b79083006d1d99dc58f4daf3ca48679718ea1f52e5917872b58648b63b85e82", size_bytes = 368678, row_count = 15099 }
+"actions.parquet" = { sha256 = "6f51ea8d43f86a39f368402747e4e213964a89df300359f270109eb01fa724dd", size_bytes = 6269, row_count = 341 }
+"sep.parquet" = { sha256 = "23baad08501630d1f735aba6d19bd0b3d1de9c7cfe78e1e20149120582aaa3fc", size_bytes = 394589, row_count = 16095 }
 
 [snapshots.spy_ssga_2026-05-29]
 source = "sharadar"
