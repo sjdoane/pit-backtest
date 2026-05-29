@@ -1,0 +1,95 @@
+{
+  "fixture_version": 1,
+  "description": "M2 PR A golden fixture per ADR 0005 step 13. 3 bars on one synthetic asset; 3 orders; expected per-fill bps and commission dollars committed out-of-band. The PR B BarLoop end-to-end test will reuse this same JSON; PR A's loader exercises the cost-model math standalone (SquareRootImpactCostModel.estimate + .compute + Commission.commission_for) without going through the matcher.",
+  "adr_references": ["0005", "0007"],
+  "cost_model": {
+    "type": "square_root_impact",
+    "eta": "0.142",
+    "beta": "0.6",
+    "gamma": "0.314"
+  },
+  "commission": {
+    "type": "per_share",
+    "rate_per_share": "0.005"
+  },
+  "market_state": [
+    {
+      "asset_id": 1,
+      "dt": "2024-01-02",
+      "sigma_D": 0.012,
+      "V_D": 80000000.0,
+      "Theta": 8700000000.0
+    },
+    {
+      "asset_id": 1,
+      "dt": "2024-01-03",
+      "sigma_D": 0.012,
+      "V_D": 81000000.0,
+      "Theta": 8700000000.0
+    },
+    {
+      "asset_id": 1,
+      "dt": "2024-01-04",
+      "sigma_D": 0.012,
+      "V_D": 79500000.0,
+      "Theta": 8700000000.0
+    }
+  ],
+  "bars": [
+    {"dt": "2024-01-02", "open": "500.00", "high": "501.50", "low": "499.10", "close": "500.80", "volume": 80000000},
+    {"dt": "2024-01-03", "open": "500.80", "high": "502.40", "low": "500.20", "close": "502.10", "volume": 81000000},
+    {"dt": "2024-01-04", "open": "502.10", "high": "503.00", "low": "501.50", "close": "502.75", "volume": 79500000}
+  ],
+  "orders": [
+    {
+      "order_id": "o1",
+      "dt": "2024-01-02",
+      "shares": "2000",
+      "direction": "buy",
+      "notional_usd": "1000000.00"
+    },
+    {
+      "order_id": "o2",
+      "dt": "2024-01-03",
+      "shares": "-1500",
+      "direction": "sell",
+      "notional_usd": "-750000.00"
+    },
+    {
+      "order_id": "o3",
+      "dt": "2024-01-04",
+      "shares": "5000",
+      "direction": "buy",
+      "notional_usd": "2500000.00"
+    }
+  ],
+  "expected": [
+    {
+      "order_id": "o1",
+      "permanent_impact_bps_min": 0.0014,
+      "permanent_impact_bps_max": 0.0016,
+      "temporary_impact_bps_min": 0.029,
+      "temporary_impact_bps_max": 0.031,
+      "slippage_bps": "0",
+      "commission_usd": "10.000"
+    },
+    {
+      "order_id": "o2",
+      "permanent_impact_bps_min": 0.0010,
+      "permanent_impact_bps_max": 0.0013,
+      "temporary_impact_bps_min": 0.023,
+      "temporary_impact_bps_max": 0.025,
+      "slippage_bps": "0",
+      "commission_usd": "7.500"
+    },
+    {
+      "order_id": "o3",
+      "permanent_impact_bps_min": 0.0037,
+      "permanent_impact_bps_max": 0.0041,
+      "temporary_impact_bps_min": 0.050,
+      "temporary_impact_bps_max": 0.053,
+      "slippage_bps": "0",
+      "commission_usd": "25.000"
+    }
+  ]
+}
