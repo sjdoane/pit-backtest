@@ -99,10 +99,21 @@ Set the Nasdaq Data Link API key (the official env var; legacy `SHARADAR_API_KEY
 [Environment]::SetEnvironmentVariable("NASDAQ_DATA_LINK_API_KEY", "<your_key>", "User")
 ```
 
-Open a new PowerShell window so the variable loads. On Windows, also point uv at a venv outside OneDrive to avoid lazy-sync file locks:
+Open a new PowerShell window so the variable loads. On Windows, also point uv at a venv outside OneDrive and force copy-mode linking (the default hardlink mode fails on OneDrive reparse points):
 
 ```
 [Environment]::SetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", "C:\Users\<you>\.venvs\pit-backtest", "User")
+[Environment]::SetEnvironmentVariable("UV_LINK_MODE", "copy", "User")
+```
+
+Both variables MUST be set at User scope (not just in the current shell). If `UV_PROJECT_ENVIRONMENT` is unset in a shell, uv silently writes to an in-tree `.venv` inside OneDrive which then accumulates corruption from interrupted installs. Verify with `uv pip show pandas` after `uv sync`: the `Location` field must be your `.venvs\pit-backtest\Lib\site-packages` path, not `<project>\.venv\Lib\site-packages`. If you see the wrong path, set the variables and nuke BOTH venvs:
+
+```
+$env:UV_PROJECT_ENVIRONMENT = "C:\Users\<you>\.venvs\pit-backtest"
+$env:UV_LINK_MODE = "copy"
+Remove-Item -Recurse -Force ".venv" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Users\<you>\.venvs\pit-backtest" -ErrorAction SilentlyContinue
+uv sync --extra dev --extra dataops
 ```
 
 Pull data and run the kill-gate. Pass `--end-date` to pull through SSGA's most recent `as_of_date` (per ADR 0006 the kill gate is anchored on the SSGA as-of date; the bundle must cover at least one trailing window for the gate to report PASS or FAIL rather than NEEDS_DATA).
