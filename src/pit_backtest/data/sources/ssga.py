@@ -33,6 +33,7 @@ download workflow.
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,7 @@ _DIST_AMOUNT_COL = "DIVIDEND ($)"
 # are "1 Year", "3 Year", "5 Year", "10 Year", "Since Inception".
 _PROD_TICKER_HEADER = "Ticker"
 _PROD_ANN_RETURNS_HEADER = "Total Returns (Annualized)"
+_PROD_AS_OF_HEADER = "Total Returns as of Date"
 _PROD_ANN_PERIOD_LABELS = ("1 Year", "3 Year", "5 Year", "10 Year", "Since Inception")
 # Map SSGA's "1 Year" -> our canonical "1y" tag used everywhere downstream.
 _SSGA_PERIOD_TO_TAG = {
@@ -98,10 +100,25 @@ class SSGASpyReference:
 
         self._distributions: pl.DataFrame | None = None
         self._performance: pl.DataFrame | None = None
+        self._as_of_date: date | None = None
 
     @property
     def bundle_name(self) -> str:
         return self._bundle_name
+
+    @property
+    def as_of_date(self) -> date | None:
+        """The as-of date for SSGA's published trailing returns.
+
+        SSGA's product-data returns are trailing periods ending at this
+        date (e.g., "10y" is the 10 years ending here). The reconciliation
+        harness aligns the engine's window to this date per ADR 0006.
+        None for the legacy CSV path, which had no as-of column. Triggers
+        a performance() load if not yet read.
+        """
+        if self._performance is None:
+            self.performance()
+        return self._as_of_date
 
     def dividends(self) -> pl.DataFrame:
         """Return the SSGA-published SPY distribution history.
@@ -154,7 +171,9 @@ class SSGASpyReference:
         xlsx_path = self._bundle_dir / _PRODUCT_DATA_XLSX_FILENAME
         csv_path = self._bundle_dir / _PERFORMANCE_CSV_FILENAME
         if xlsx_path.is_file():
-            self._performance = _read_performance_xlsx(xlsx_path)
+            self._performance, self._as_of_date = read_performance_xlsx_with_as_of(
+                xlsx_path
+            )
         elif csv_path.is_file():
             raw = pl.read_csv(csv_path)
             self._performance = raw.select(
@@ -201,11 +220,76 @@ def reconciliation_delta_bps(
     return (engine_annualized_return - ssga_annualized_return) * 10_000.0
 
 
+def _clean_ticker(raw: object) -> str:
+    """Normalize an SSGA ticker cell to its bare symbol.
+
+    SSGA decorates tickers with a registered-trademark suffix (SPY becomes
+    "SPY" + U+00AE), which surfaces as "SPYM" / "SPY?" depending on console
+    encoding. Take the leading run of [A-Za-z0-9.] so "SPY(R)" -> "SPY",
+    "GLD(R)" -> "GLD", "GLDM(R)" -> "GLDM" (distinct funds stay distinct).
+    """
+    import re
+
+    match = re.match(r"[A-Za-z0-9.]+", str(raw).strip())
+    return match.group(0) if match else ""
+
+
+def _parse_ssga_date(raw: object) -> date:
+    """Parse an SSGA date cell.
+
+    The distributions XLSX stores ex-dates as text "MM/DD/YYYY"; openpyxl
+    returns the string. Some cells may already be datetime if SSGA changes
+    the formatting, so handle both.
+    """
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    text = str(raw).strip()
+    return datetime.strptime(text, "%m/%d/%Y").date()
+
+
+def _parse_ssga_pct(raw: object) -> float | None:
+    """Parse an SSGA percent cell to a float in percent.
+
+    Product-data returns are text like "31.01%"; strip the trailing percent
+    sign and surrounding whitespace. SSGA uses "-" for not-applicable;
+    return None for those. The dividend column is a bare number-as-text
+    ("1.796999" or " 0.859222 "); the same parser handles it (no percent
+    sign to strip).
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip().rstrip("%").strip()
+    if text in ("", "-"):
+        return None
+    return float(text)
+
+
+def _find_header_row(
+    all_rows: list[tuple[Any, ...]], marker: str, max_scan: int = 12
+) -> int:
+    """Return the index of the first row containing `marker` as a cell value.
+
+    SSGA prepends a disclaimer paragraph row (and sometimes blanks) before
+    the real header row, so the header is not always row 0. Scan the first
+    `max_scan` rows. Raises SSGAFormatError if not found.
+    """
+    for idx, row in enumerate(all_rows[:max_scan]):
+        if row is not None and marker in row:
+            return idx
+    raise SSGAFormatError(
+        f"could not find header row containing {marker!r} in the first "
+        f"{max_scan} rows of the SSGA XLSX; the export layout may have changed"
+    )
+
+
 def _read_distributions_xlsx(path: Path) -> pl.DataFrame:
     """Read SSGA's distributions XLSX and produce our canonical schema.
 
     Filters to TICKER='SPY'. Returns columns (ex_date, amount_per_share)
-    sorted by ex_date.
+    sorted by ex_date. Handles MM/DD/YYYY date strings and whitespace-
+    padded number-as-text dividend cells.
     """
     import openpyxl  # type: ignore[import-untyped]
 
@@ -216,9 +300,11 @@ def _read_distributions_xlsx(path: Path) -> pl.DataFrame:
             f"found {workbook.sheetnames}"
         )
     sheet = workbook[_DISTRIBUTIONS_XLSX_SHEET]
+    all_rows = list(sheet.iter_rows(values_only=True))
+    workbook.close()
 
-    rows_iter = sheet.iter_rows(values_only=True)
-    header = list(next(rows_iter))
+    header_idx = _find_header_row(all_rows, _DIST_TICKER_COL)
+    header = list(all_rows[header_idx])
     try:
         ticker_col = header.index(_DIST_TICKER_COL)
         ex_date_col = header.index(_DIST_EX_DATE_COL)
@@ -230,21 +316,20 @@ def _read_distributions_xlsx(path: Path) -> pl.DataFrame:
             f"got headers {header}"
         ) from e
 
-    ex_dates: list[Any] = []
+    ex_dates: list[date] = []
     amounts: list[float] = []
-    for row in rows_iter:
+    for row in all_rows[header_idx + 1 :]:
         if row is None:
             continue
-        ticker = row[ticker_col]
-        if ticker != "SPY":
+        raw_ticker = row[ticker_col] if len(row) > ticker_col else None
+        if raw_ticker is None or _clean_ticker(raw_ticker) != "SPY":
             continue
-        ex_date = row[ex_date_col]
-        amount = row[amount_col]
-        if ex_date is None or amount is None:
+        ex_raw = row[ex_date_col]
+        amt = _parse_ssga_pct(row[amount_col])
+        if ex_raw is None or amt is None:
             continue
-        ex_dates.append(ex_date)
-        amounts.append(float(amount))
-    workbook.close()
+        ex_dates.append(_parse_ssga_date(ex_raw))
+        amounts.append(amt)
 
     if not ex_dates:
         raise SSGAFormatError(
@@ -259,13 +344,18 @@ def _read_distributions_xlsx(path: Path) -> pl.DataFrame:
     )
 
 
-def _read_performance_xlsx(path: Path) -> pl.DataFrame:
-    """Read SSGA's product-data XLSX and produce our performance schema.
+def read_performance_xlsx_with_as_of(path: Path) -> tuple[pl.DataFrame, date | None]:
+    """Read SSGA's product-data XLSX; return (performance_frame, as_of_date).
 
     Returns columns (period, annualized_nav_tr_pct, annualized_market_price_tr_pct).
     annualized_market_price_tr_pct is NaN because the workbook does not
     expose a Market Price annualized return; the reconciliation uses the
     NAV column exclusively.
+
+    The returns are TRAILING periods ending at as_of_date (e.g., "10y" is
+    the 10 years ending at as_of_date, NOT a fixed 2005-2024 window). The
+    reconciliation harness must align the engine's window to as_of_date;
+    see ADR 0006.
     """
     import math
 
@@ -278,47 +368,49 @@ def _read_performance_xlsx(path: Path) -> pl.DataFrame:
             f"found {workbook.sheetnames}"
         )
     sheet = workbook[_PRODUCT_DATA_XLSX_SHEET]
+    all_rows = list(sheet.iter_rows(values_only=True))
+    workbook.close()
 
-    rows_iter = sheet.iter_rows(values_only=True)
-    header_row_1 = list(next(rows_iter))
-    header_row_2 = list(next(rows_iter))
+    # SSGA prepends a disclaimer row; the group-header row is the one that
+    # contains "Ticker", and the period sub-labels are the row after it.
+    header_idx = _find_header_row(all_rows, _PROD_TICKER_HEADER)
+    header_row = list(all_rows[header_idx])
+    subheader_row = list(all_rows[header_idx + 1])
 
+    ticker_col = header_row.index(_PROD_TICKER_HEADER)
     try:
-        ticker_col = header_row_1.index(_PROD_TICKER_HEADER)
+        ann_block_start = header_row.index(_PROD_ANN_RETURNS_HEADER)
     except ValueError as e:
         raise SSGAFormatError(
-            f"SSGA product-data XLSX header row 1 missing '{_PROD_TICKER_HEADER}'; "
-            f"got {header_row_1}"
+            f"SSGA product-data XLSX header row missing "
+            f"'{_PROD_ANN_RETURNS_HEADER}'; got {header_row}"
         ) from e
 
-    try:
-        ann_block_start = header_row_1.index(_PROD_ANN_RETURNS_HEADER)
-    except ValueError as e:
-        raise SSGAFormatError(
-            f"SSGA product-data XLSX header row 1 missing "
-            f"'{_PROD_ANN_RETURNS_HEADER}'; got {header_row_1}"
-        ) from e
+    as_of_col = (
+        header_row.index(_PROD_AS_OF_HEADER)
+        if _PROD_AS_OF_HEADER in header_row
+        else None
+    )
 
     period_cols: dict[str, int] = {}
     for offset, expected_label in enumerate(_PROD_ANN_PERIOD_LABELS):
         col = ann_block_start + offset
-        actual_label = header_row_2[col] if col < len(header_row_2) else None
+        actual_label = subheader_row[col] if col < len(subheader_row) else None
         if actual_label != expected_label:
             raise SSGAFormatError(
-                f"SSGA product-data XLSX header row 2 column {col} expected "
+                f"SSGA product-data XLSX sub-header column {col} expected "
                 f"'{expected_label}' but got '{actual_label}'. The Annualized "
                 f"Total Returns block layout has changed; update _PROD_ANN_PERIOD_LABELS."
             )
         period_cols[_SSGA_PERIOD_TO_TAG[expected_label]] = col
 
     spy_row: tuple[Any, ...] | None = None
-    for row in rows_iter:
+    for row in all_rows[header_idx + 1 :]:
         if row is None:
             continue
-        if len(row) > ticker_col and row[ticker_col] == "SPY":
+        if len(row) > ticker_col and _clean_ticker(row[ticker_col]) == "SPY":
             spy_row = row
             break
-    workbook.close()
 
     if spy_row is None:
         raise SSGAFormatError(
@@ -326,25 +418,50 @@ def _read_performance_xlsx(path: Path) -> pl.DataFrame:
             f"file may be missing the SPY entry or the workbook structure has changed."
         )
 
+    as_of_date: date | None = None
+    if as_of_col is not None and len(spy_row) > as_of_col:
+        as_of_raw = spy_row[as_of_col]
+        if as_of_raw is not None:
+            as_of_date = _parse_as_of_date(as_of_raw)
+
     periods: list[str] = []
     nav_pct: list[float] = []
     mkt_pct: list[float] = []
     for tag in ("1y", "3y", "5y", "10y", "si"):
         col = period_cols[tag]
-        raw_value = spy_row[col]
-        if raw_value is None:
+        parsed = _parse_ssga_pct(spy_row[col] if col < len(spy_row) else None)
+        if parsed is None:
             continue
-        as_float = float(raw_value)
-        # SSGA product-data returns are quoted in percent at one decimal
-        # place (e.g., 9.95 for 9.95%/yr). They are NOT decimals.
         periods.append(tag)
-        nav_pct.append(as_float)
+        nav_pct.append(parsed)
         mkt_pct.append(math.nan)
 
-    return pl.DataFrame(
+    frame = pl.DataFrame(
         {
             "period": periods,
             "annualized_nav_tr_pct": nav_pct,
             "annualized_market_price_tr_pct": mkt_pct,
         }
     )
+    return frame, as_of_date
+
+
+def _parse_as_of_date(raw: object) -> date | None:
+    """Parse SSGA's "Total Returns as of Date" cell, e.g. "Apr 30 2026"."""
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    text = str(raw).strip()
+    for fmt in ("%b %d %Y", "%B %d %Y", "%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _read_performance_xlsx(path: Path) -> pl.DataFrame:
+    """Backwards-compatible wrapper returning just the performance frame."""
+    frame, _as_of = read_performance_xlsx_with_as_of(path)
+    return frame

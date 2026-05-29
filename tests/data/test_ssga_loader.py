@@ -146,14 +146,21 @@ def test_reconciliation_delta_bps_zero_on_match() -> None:
 # ----- SSGA-native XLSX fixtures -----
 
 
+# Registered-trademark suffix SSGA decorates tickers with in the product
+# data export. Reproduced in fixtures so the loader's ticker-cleaning is
+# tested against the real quirk.
+_RTM = "®"
+
+
 def _write_distributions_xlsx(
     path: Path,
     rows: list[tuple[str, str, date, float]],
 ) -> None:
-    """Write a minimal SSGA distributions XLSX.
+    """Write a faithful SSGA distributions XLSX.
 
-    Each row is (fund_name, ticker, ex_date, dividend_amount). The
-    workbook has a sheet named "dividend" with the SSGA column shape.
+    Each row is (fund_name, ticker, ex_date, dividend_amount). Reproduces
+    the real SSGA quirks: ex-dates are MM/DD/YYYY text strings, dividend
+    amounts are whitespace-padded number-as-text, sheet named "dividend".
     """
     wb = openpyxl.Workbook()
     sheet = wb.active
@@ -173,17 +180,18 @@ def _write_distributions_xlsx(
         ]
     )
     for fund_name, ticker, ex_date, dividend in rows:
+        ex_text = ex_date.strftime("%m/%d/%Y")
         sheet.append(
             [
                 fund_name,
                 ticker,
                 "78462F103",
-                ex_date,
-                ex_date,
-                ex_date,
-                dividend,
-                0.0,
-                0.0,
+                ex_text,
+                ex_text,
+                ex_text,
+                f" {dividend:.6f} ",  # whitespace-padded number-as-text
+                "",
+                "",
                 "Q",
             ]
         )
@@ -194,34 +202,47 @@ def _write_product_data_xlsx(
     path: Path,
     spy_returns: tuple[float, float, float, float, float],
     other_tickers: list[tuple[str, tuple[float, float, float, float, float]]] | None = None,
+    as_of: str = "Apr 30 2026",
 ) -> None:
-    """Write a minimal SSGA product-data XLSX with the two-tier header.
+    """Write a faithful SSGA product-data XLSX.
+
+    Reproduces the real quirks: a disclaimer paragraph in row 0; the
+    group-header row at row 1 starting with "As of**", "Ticker", "Name";
+    the period sub-labels at row 2; data rows from row 3. Tickers carry a
+    registered-trademark suffix; returns are percentage strings ("9.95%");
+    "-" marks not-applicable.
 
     spy_returns is (1y, 3y, 5y, 10y, since_inception) in percent.
-    other_tickers is an optional list of additional rows to confirm the
-    loader filters to SPY correctly.
     """
     wb = openpyxl.Workbook()
     sheet = wb.active
     sheet.title = "Sheet1"
 
-    # Row 1: group headers. Leave blanks under the Annualized block to
-    # mirror SSGA's actual layout.
+    # Row 0: disclaimer paragraph (single cell, rest None).
+    sheet.append(["Past performance is not a reliable indicator of future performance."])
+
+    # Row 1: group headers. Columns:
+    #   0 As of**, 1 Ticker, 2 Name, 3 Total Returns as of Date,
+    #   4 Total Returns (Annualized), 5-8 blank, 9 1 yr. FFO Growth
     sheet.append(
         [
+            "As of** ",
             "Ticker",
             "Name",
+            "Total Returns as of Date",
             "Total Returns (Annualized)",
             None,
             None,
             None,
             None,
-            "1 yr. FFO Growth",
+            "1 yr. FFO Growth ",
         ]
     )
-    # Row 2: sub-headers
+    # Row 2: sub-headers (period labels under the Annualized block).
     sheet.append(
         [
+            None,
+            None,
             None,
             None,
             "1 Year",
@@ -233,21 +254,21 @@ def _write_product_data_xlsx(
         ]
     )
 
+    def _row(ticker: str, name: str, returns: tuple[float, ...]) -> list[object]:
+        return [
+            "May 27 2026",
+            f"{ticker}{_RTM}",
+            name,
+            as_of,
+            *[f"{r:.2f}%" for r in returns],
+            "-",
+        ]
+
     if other_tickers:
         for ticker, returns in other_tickers:
-            sheet.append(
-                [ticker, f"{ticker} fund", *returns, 0.0]
-            )
+            sheet.append(_row(ticker, f"{ticker} fund", returns))
 
-    # SPY data row
-    sheet.append(
-        [
-            "SPY",
-            "State Street SPDR S&P 500 ETF Trust",
-            *spy_returns,
-            0.0,
-        ]
-    )
+    sheet.append(_row("SPY", "State Street SPDR S&P 500 ETF Trust", spy_returns))
     wb.save(path)
 
 
