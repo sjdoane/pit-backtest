@@ -135,7 +135,14 @@ class SharadarDataSource(PitDataSource):
             lf = lf.filter(pl.col("date") <= _to_date(end_dt))
 
         df = lf.select(
-            pl.col("date").alias("dt"),
+            # Cast to pl.Date so downstream `iter_rows` yields python date
+            # objects, not datetime. Nasdaq Data Link's SDK returns pandas
+            # datetime64[ns] which polars converts to pl.Datetime; without
+            # this cast the (asset_id, dt) price-index keys in the BarLoop
+            # become (int, datetime) while lookups use date(), so every
+            # lookup returns None and the constant-weight demo silently
+            # never rebalances.
+            pl.col("date").cast(pl.Date).alias("dt"),
             pl.col("open").cast(pl.Float64),
             pl.col("high").cast(pl.Float64),
             pl.col("low").cast(pl.Float64),
@@ -172,7 +179,11 @@ class SharadarDataSource(PitDataSource):
             lf = lf.filter(pl.col("date") <= _to_date(end_dt))
 
         df = lf.select(
-            pl.col("date").alias("ex_date"),
+            # Same date-cast rationale as read_sep_prices: nasdaq-data-link
+            # returns pl.Datetime via pandas; without the cast, ex_date keys
+            # in the reference + engine dividend index lose their date-vs-
+            # datetime equivalence and dividend credits silently never fire.
+            pl.col("date").cast(pl.Date).alias("ex_date"),
             pl.col("value").cast(pl.Float64).alias("amount_per_share"),
         ).sort("ex_date").collect()
 

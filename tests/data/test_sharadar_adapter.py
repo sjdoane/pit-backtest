@@ -232,3 +232,86 @@ def test_end_to_end_tr_reconstruction(tmp_path: Path) -> None:
     assert tr_values[3] == pytest.approx(
         expected_mult_day2 * expected_mult_day3, abs=1e-10
     )
+
+
+def test_read_sep_prices_returns_pl_date_column_even_from_datetime_source(
+    tmp_path: Path,
+) -> None:
+    """Regression: nasdaq-data-link's SDK returns pandas datetime64[ns] for
+    the date column; pl.from_pandas converts to pl.Datetime; write_parquet
+    preserves it. If read_sep_prices does not cast back to pl.Date, the
+    downstream (asset_id, dt) price-index keys become (int, datetime) while
+    lookups use date(), and every lookup silently returns None. The
+    constant-weight demo then runs 3774 bars, never rebalances, and stays
+    100% in cash with the reference reproducing the same wrong number
+    (engine == reference: PASS on $0 vs $0).
+
+    This test pins the cast so the failure mode cannot recur.
+    """
+    from datetime import datetime
+
+    snapshots_root = tmp_path / "snapshots"
+    bundle_dir = snapshots_root / "sharadar_dt_regression"
+    bundle_dir.mkdir(parents=True)
+
+    # Use pl.Datetime explicitly to mirror what pl.from_pandas produces.
+    sep_df = pl.DataFrame(
+        {
+            "ticker": ["SPY", "SPY"],
+            "date": [datetime(2024, 3, 14), datetime(2024, 3, 15)],
+            "open": [517.0, 517.95],
+            "high": [517.5, 518.43],
+            "low": [516.0, 510.27],
+            "close": [517.51, 512.85],
+            "closeunadj": [517.51, 512.85],
+            "volume": [70_000_000, 92_750_000],
+        },
+        schema_overrides={"date": pl.Datetime},
+    )
+    sep_path = bundle_dir / "sep.parquet"
+    sep_df.write_parquet(sep_path)
+
+    actions_df = pl.DataFrame(
+        {
+            "ticker": ["SPY"],
+            "date": [datetime(2024, 3, 15)],
+            "action": ["dividend"],
+            "value": [1.7715],
+        },
+        schema_overrides={"date": pl.Datetime},
+    )
+    actions_path = bundle_dir / "actions.parquet"
+    actions_df.write_parquet(actions_path)
+
+    sep_sha = hashlib.sha256(sep_path.read_bytes()).hexdigest()
+    actions_sha = hashlib.sha256(actions_path.read_bytes()).hexdigest()
+    manifest = f"""
+[snapshots.sharadar_dt_regression]
+source = "sharadar"
+pull_date = 2026-05-29
+
+[snapshots.sharadar_dt_regression.files]
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {sep_path.stat().st_size}, row_count = 2 }}
+"actions.parquet" = {{ sha256 = "{actions_sha}", size_bytes = {actions_path.stat().st_size}, row_count = 1 }}
+"""
+    (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
+
+    adapter = SharadarDataSource("sharadar_dt_regression", snapshots_root)
+
+    prices = adapter.read_sep_prices(ticker="SPY")
+    assert prices.schema["dt"] == pl.Date, (
+        f"read_sep_prices must return pl.Date for 'dt'; got {prices.schema['dt']}. "
+        f"Without the cast, downstream BarLoop price-index keys mismatch and "
+        f"the constant-weight demo silently never rebalances."
+    )
+    # Iterating must yield python date objects, not datetime
+    first_dt = prices["dt"][0]
+    assert isinstance(first_dt, date) and not isinstance(first_dt, datetime), (
+        f"prices['dt'][0] must be a date, not a datetime; got {type(first_dt)}"
+    )
+
+    dividends = adapter.read_actions_dividends(ticker="SPY")
+    assert dividends.schema["ex_date"] == pl.Date, (
+        f"read_actions_dividends must return pl.Date for 'ex_date'; got "
+        f"{dividends.schema['ex_date']}"
+    )

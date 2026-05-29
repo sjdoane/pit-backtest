@@ -71,29 +71,43 @@ def refresh_hashes(
         raise FileNotFoundError(f"bundle directory not found: {bundle_dir}")
 
     bundle_name = bundle_dir.name
-    parquets = sorted(p for p in bundle_dir.iterdir() if p.suffix == ".parquet")
-    if not parquets:
+    # Hash every data file (.parquet for Sharadar; .xlsx / .csv for SSGA-
+    # native exports; .pdf provenance kept locally but skipped here).
+    # See docs/vendor/nasdaq-data-link-pull.md for the supported shapes.
+    hashable_suffixes = {".parquet", ".xlsx", ".csv"}
+    data_files = sorted(
+        p for p in bundle_dir.iterdir() if p.suffix.lower() in hashable_suffixes
+    )
+    if not data_files:
         raise FileNotFoundError(
-            f"no .parquet files in {bundle_dir}; download data first or run "
+            f"no .parquet/.xlsx/.csv files in {bundle_dir}; download data first or run "
             f"with --download"
         )
 
     entries: dict[str, SnapshotFileEntry] = {}
-    for parquet_path in parquets:
-        sha = compute_sha256(parquet_path)
-        size = parquet_path.stat().st_size
-        # row_count requires reading the file; cheap with Polars scan + count
-        row_count = pl.scan_parquet(parquet_path).select(pl.len()).collect()[0, 0]
-        entries[parquet_path.name] = SnapshotFileEntry(
-            sha256=sha, size_bytes=size, row_count=int(row_count)
+    for path in data_files:
+        sha = compute_sha256(path)
+        size = path.stat().st_size
+        # row_count is parquet-only (cheap via Polars scan); XLSX/CSV are
+        # variable-row-count vendor exports and the manifest schema allows
+        # row_count=None for them.
+        row_count: int | None
+        if path.suffix.lower() == ".parquet":
+            row_count = int(
+                pl.scan_parquet(path).select(pl.len()).collect()[0, 0]
+            )
+        else:
+            row_count = None
+        entries[path.name] = SnapshotFileEntry(
+            sha256=sha, size_bytes=size, row_count=row_count
         )
         _log.info(
             "computed_hash",
             extra={
-                "file": parquet_path.name,
+                "file": path.name,
                 "sha256_short": sha[:12],
                 "size_mb": f"{size / 1024 / 1024:.2f}",
-                "row_count": row_count,
+                "row_count": row_count if row_count is not None else "n/a",
             },
         )
 
