@@ -24,12 +24,14 @@ Key findings carried into phase 3 and the architecture ADR: the analytics layer 
 
 ### Phase 3: spec critique and architecture (complete)
 
-All three phase-3 ADRs plus the M1-implementation-phase ADR 0004 accepted and merged:
+All three phase-3 ADRs plus the M1-implementation-phase ADRs 0004, 0006 and the M2-implementation-phase ADRs 0005, 0007 accepted and merged:
 - [`docs/decisions/0001-spec-critique.md`](decisions/0001-spec-critique.md): 20 locked decisions reframing the project as a teaching artifact with explicit non-goals.
-- [`docs/decisions/0002-roadmap-review.md`](decisions/0002-roadmap-review.md): 21 locked decisions defining M1 through M5 over ten weeks with the week-2 kill gate.
+- [`docs/decisions/0002-roadmap-review.md`](decisions/0002-roadmap-review.md): 21 locked decisions defining M1 through M5 over ten weeks with the week-2 kill gate. M1 acceptance criterion 1 superseded by ADR 0006 (trailing-period window); M2 acceptance criterion 1 superseded by ADR 0007 (formula-derived band is the gate; FIM 2018 demoted to upper-ceiling sanity check).
 - [`docs/decisions/0003-architecture.md`](decisions/0003-architecture.md): 23 locked decisions on the protocol hierarchy, event loop, trust boundaries, data model.
 - [`docs/decisions/0004-rebalance-calendar-independence.md`](decisions/0004-rebalance-calendar-independence.md): rebalance calendar is fund-policy-determined and independent of the backtest window; `start_dt` is not forced as a rebalance date. Captured during the M1-day-3 skeptical-reviewer pass.
-- [`docs/decisions/0005-m2-cost-realism-plan.md`](decisions/0005-m2-cost-realism-plan.md): M2 implementation plan (cost realism with sensitivity bands) with 18 locked decisions covering the Almgren formula form and units, VWAP refusal, the `ImpactedPriceSource` decorator + policy split, the pre-trade vs fill-cost tolerance contract, the /100 regression-test target, the four-PR split, and the queued ADRs 0006 (cost-model acceptance criterion revision) and 0007 (`ImpactedPriceSource` on Signal `pit_view` defaults OFF). Captured during the pre-M2 Plan + skeptical-reviewer pass.
+- [`docs/decisions/0005-m2-cost-realism-plan.md`](decisions/0005-m2-cost-realism-plan.md): M2 implementation plan (cost realism with sensitivity bands) with 18 locked decisions covering the Almgren formula form and units, VWAP refusal, the `ImpactedPriceSource` decorator + policy split, the pre-trade vs fill-cost tolerance contract, the /100 regression-test target, the four-PR split. Captured during the pre-M2 Plan + skeptical-reviewer pass.
+- [`docs/decisions/0006-trailing-period-spy-reconciliation.md`](decisions/0006-trailing-period-spy-reconciliation.md): SPY reconciliation reframed from a single 2005-2024 window to SSGA's published trailing 1Y / 3Y / 5Y / 10Y / SI periods anchored on SSGA's `as_of_date`. 18 locked decisions including snap-backward anchor row, `ExpenseRatioSchedule` for the 2003-11-01 step, three-way overall verdict, the post-pull range assertion in `scripts/pull_m1_data.py`. Plan + skeptical-reviewer pass surfaced 2 Critical + 4 High findings; all addressed before code.
+- [`docs/decisions/0007-fim-2018-demoted-to-upper-ceiling.md`](decisions/0007-fim-2018-demoted-to-upper-ceiling.md): M2 cost-realism acceptance criterion revised. The Almgren formula-derived `[eta=0.05, eta=0.30]` band is the gate; FIM 2018 is preserved as a 50-bp annualized upper-ceiling sanity check, because SPY at $1M notional is sub-scale for FIM's institutional calibration.
 
 Key architectural decisions from ADR 0003 that constrain implementation: Pydantic only at adapter load, CLI/config, and user-facing render targets (everywhere else uses attrs with `slots=True, frozen=True`); CashFlow split from CorporateAction as two streams; permanent impact lives in the data source layer via `ImpactedPriceSource`, not as a separate register; `PreTradeCostEstimator` and `FillCostComputer` are separate protocols; `Signal.compute` returns `dict[AssetId, float]`; `MatchingEngine.submit` returns `list[Fill]`; Clock includes `is_market_open` and `next_bar`; `AssetId = NewType("AssetId", int)` with a separate `IdentifierResolver` for v2 forward compatibility; LongOnlyPolicy at v1; determinism invariant documented; trust boundaries enumerated in 11 items.
 
@@ -52,7 +54,7 @@ Goal: prove the engine reproduces SPY total return and a hand-computable strateg
 
 Scope: SEP adapter; total-return reconstruction; buy-and-hold demo; constant-weight monthly rebalance demo with fractional shares; `TestClock` injection pattern; structured logging.
 
-Acceptance: buy-and-hold SPY 2005-2024 within 5 bps annualized of SPDR-published SPY TR; constant-weight SPY/AGG/GLD monthly rebalance matches spreadsheet to 1e-10; methodology docs landed; logging works at INFO/DEBUG.
+Acceptance: per ADR 0006, buy-and-hold SPY reconciles against SSGA's published trailing 1Y / 3Y / 5Y / 10Y / SI annualizations (anchored on SSGA's `as_of_date`) within 5 bps annualized per window; constant-weight SPY/AGG/GLD monthly rebalance matches spreadsheet to 1e-10; methodology docs landed; logging works at INFO/DEBUG.
 
 **Kill-early gate** at end of week 2: if M1 SPY reconciliation does not pass, project is killed and `POSTMORTEM.md` is written.
 
