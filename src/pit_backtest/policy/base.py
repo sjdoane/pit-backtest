@@ -15,6 +15,7 @@ from typing import Callable, Protocol
 import attrs
 
 from pit_backtest.data.records import AssetId
+from pit_backtest.execution.cost.base import Direction
 
 
 @attrs.frozen(slots=True)
@@ -33,7 +34,7 @@ class TargetPositions:
 # layer. Imported as TYPE_CHECKING in M1 wiring to avoid circular imports.
 class PreTradeCostEstimatorLike(Protocol):
     def estimate(
-        self, asset_id: AssetId, shares: Decimal, direction: str, dt: datetime
+        self, asset_id: AssetId, shares: Decimal, direction: Direction, dt: datetime
     ) -> Decimal: ...
 
 

@@ -95,7 +95,7 @@ The trade-off: per-worker single-threading slows each path's computation. For CP
 
 ## Trust boundaries
 
-These are places the engine cannot enforce the invariant by itself; user discipline is required, and the engine documents and (where possible) lints. Per ADR 0003 decision 12, there are 11 of these. The table below combines the boundary, the engine's mechanism for catching violations, and what the user must do.
+These are places the engine cannot enforce the invariant by itself; user discipline is required, and the engine documents and (where possible) lints. Per ADR 0003 decision 12 the list started at 11 of these; ADR 0009 lock #12 extended to 12 with the ImpactedPriceSource entry below. The table below combines the boundary, the engine's mechanism for catching violations, and what the user must do.
 
 | # | Boundary | What the engine does | What the user must do |
 |---|---|---|---|
@@ -110,8 +110,11 @@ These are places the engine cannot enforce the invariant by itself; user discipl
 | 9 | Polars global thread pool with concurrent Runner workers | The Runner worker bootstrapper sets `POLARS_MAX_THREADS=1` before importing Polars. A unit test verifies that two consecutive Runner runs produce identical outputs. | Do not override `POLARS_MAX_THREADS` inside a signal or policy. If you spawn your own threads, the engine's determinism guarantee does not extend to them. |
 | 10 | Mutating frames inside plotting / notebook helpers | Engine cannot prevent. Plotting helpers in `src/pit_backtest/utils/plotting.py` (if added in M5) always clone before mutating. | Do not call `df.with_columns(...)` on a frame returned by `BacktestResult.equity_curve()` if you intend to compare runs. Clone first. |
 | 11 | Module-level `import` with network side effects | AST lint flags `requests.get(...)`, `urllib.request.urlopen(...)`, etc. at module top level in `src/pit_backtest/`. | Do not import packages that make network calls at import time. If a dependency does (rare in Python; HTTP-client libraries do not), wrap the import inside a function that the engine never calls at startup. |
+| 12 | `ImpactedPriceSource` mutable per-asset register | AST lint at `tests/lint/test_determinism_invariants.py::test_no_impacted_price_source_import_in_signal_or_policy` flags `from pit_backtest.data.sources.base import ImpactedPriceSource` in `src/pit_backtest/signal/` or `src/pit_backtest/policy/`. | Signal.compute() and Policy.target_positions() must read prices only via the engine-supplied `pit_view` (which is the cumulative-impact-aware view managed by the BarLoop), never via direct decorator access. Reading the decorator's register from inside signal/policy would couple the determinism invariant to within-bar fill order; v1's one-fill-per-(asset, dt) makes this M2-safe, but v1.1 intraday slicing would silently break determinism. |
 
-The eleven items above are the full enumerated list. The trust boundaries that the engine does enforce (single-process BarLoop ordering, `pit_view` strict-less-than, `FillPriceModel` required on `Order`) are structural; they are documented in ADR 0003 but are not "trust boundaries" in the sense of this list, because the engine catches violations at construction or call time rather than relying on user discipline.
+The `SquareRootImpactMatchingEngine` itself carries a mutable `_fills_this_bar: set[tuple[AssetId, date]]` for one-fill-per-(asset, dt) enforcement per ADR 0009 lock #7. The set is used membership-only (no iteration); the `on_bar_start(bar_dt)` hook clears it per-bar. Membership-only usage preserves Requirement 4 (no `set` iteration in signal/policy layers) at M2; any v1.1 change that iterates the set (e.g., partial-fill rollover ordering) must update Requirement 4's enforcement to cover the matcher.
+
+The twelve items above are the full enumerated list. The trust boundaries that the engine does enforce (single-process BarLoop ordering, `pit_view` strict-less-than, `FillPriceModel` required on `Order`) are structural; they are documented in ADR 0003 but are not "trust boundaries" in the sense of this list, because the engine catches violations at construction or call time rather than relying on user discipline.
 
 ## Cross-platform reproducibility
 

@@ -66,3 +66,25 @@ The matcher in PR B verifies `abs(estimate_bps - compute_breakdown.total_bps) <=
 ## Notes for future readers
 
 The base `0.5 bps` is the tolerance floor; below this, signal is noise. The `0.1 * |delta_mid_bps|` slope is calibrated for the SPY $1M monthly rebalance regime (Q/V ~ 1e-5, sigma_D ~ 1.2%/day). At significantly higher participation rates (Q/V > 1e-3 for smaller-cap names in M3 worked studies), the marginal sensitivity may exceed 0.1 and the tolerance formula may need to be revisited per a future ADR.
+
+## First-bar fallback (added in PR B per ADR 0009 lock #6)
+
+When `prior_close is None` (first bar of the backtest, first bar of any restart, any bar before the BarLoop has accumulated `last_close_raw_by_ticker[ticker]`), the conventional fallback is `mid_at_estimate = market_state.open`. This yields:
+
+```
+delta_mid_bps = (close - open) / (2 * open) * 10_000
+```
+
+For SPY at open $500.00 and close $501.00 (10 bp move), `delta_mid_bps = 10` and `tolerance_bps = 0.5 + 0.1 * 10 = 1.5 bps`.
+
+This widening is a documented artifact: on the first bar of any backtest, the policy has not yet been called with a prior bar's close to anchor its pre-trade estimate against, so the tolerance contract degenerates into a "current-bar intraday-range" check. The widening grows linearly with the intraday range. For SPY at typical 50-100 bp intraday range, the first-bar tolerance is 5.5-10.5 bps; for thinly-traded assets with 200+ bp intraday range, the first-bar tolerance grows proportionally.
+
+For backtest runs that rebalance on the first bar, the policy's pre-trade estimate at start-of-bar uses the bar's open as the only knowable mid, so the policy's estimate and the matcher's fill differ by the open-to-close intraday move. This is documented as a first-bar artifact and is not treated as a tolerance failure mode in the M2 acceptance criterion 1 gate.
+
+## What changed in PR B (added per ADR 0009 lock #8)
+
+PR B does NOT actively enforce the tolerance contract at the matcher. The reason is mechanical: `SquareRootImpactCostModel.estimate(...)` and `SquareRootImpactCostModel.compute(fill_state)` both read the same `MarketStateLookup` row keyed at `(asset_id, _et_date(dt))` and run the same `_almgren_terms` evaluation; their outputs are bit-identical when called against the same cost-model instance. The matcher cannot detect a policy-vs-fill drift without a SEPARATE estimate input (the policy's frozen estimate at submit time, not a re-computation at fill time).
+
+Active enforcement is M3 scope per ADR 0009: PR C lands `Order.estimate_bps_at_submit` plumbing, the matcher compares `abs(order.estimate_bps_at_submit - breakdown.total_bps) <= tolerance_bps`, and the typed `CostEstimateVsFillMismatchError` exception is added then.
+
+At M2 the tolerance contract is exercised symbolically by `tests/integration/test_cost_estimate_vs_fill_tolerance.py`: the test constructs two cost-model instances with different `MarketStateRow` sigma_D values (modeling estimate-time-vs-fill-time market-state drift) and verifies the locked formula `tolerance_bps = 0.5 + 0.1 * |delta_mid_bps|` evaluates to the worked-example values documented above. The formula stays falsifiable against the code even though no production path raises today.

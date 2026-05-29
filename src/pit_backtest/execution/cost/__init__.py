@@ -16,6 +16,7 @@ carry a /100 silent-rescale regression guard (the backtrader bug class).
 
 from pit_backtest.execution.cost.base import (
     CostBreakdown,
+    CostModel,
     Direction,
     FillCostComputer,
     FillState,
@@ -44,6 +45,7 @@ __all__ = [
     "BasisPointsCommission",
     "Commission",
     "CostBreakdown",
+    "CostModel",
     "DEFAULT_BETA",
     "DEFAULT_ETA",
     "DEFAULT_GAMMA",

@@ -13,15 +13,51 @@ Per ADR 0004 (rebalance calendar independence): start_dt is NOT forced as
 a rebalance date. The engine initializes as all-cash on start_dt and waits
 for the first scheduled rebalance.
 
+Per ADR 0009 lock #2, #5, #6, #10, the M2 wiring additions are:
+- impacted_source: ImpactedPriceSource | None = None. When non-None,
+  MarketState fields are routed through adjust_price() at construction
+  time and (optionally) at snapshot time. The matcher updates the
+  decorator's register after each Fill.
+- cost_estimator: PreTradeCostEstimator | None = None. When non-None,
+  replaces the _NoopCostEstimator passed to Policy.target_positions(...)
+  so the policy can opt out of trades whose expected cost exceeds the
+  alpha (ADR 0003 decision 4).
+- apply_permanent_impact_to_valuation: bool = True. The snapshot/MTM
+  step routes prices through adjust_price() when both this flag is True
+  and impacted_source is not None.
+- matching_engine.on_bar_start(bar_dt) is called unconditionally at the
+  top of each per-bar iteration so the matcher can reset per-bar state
+  (the one-fill-per-(asset, dt) dedup set in M2). Per ADR 0009 lock #6
+  the Protocol extension makes this unconditional; M1's
+  CloseFillMatchingEngine implements a no-op.
+
+Per ADR 0009 lock #4 the matcher supports FillPriceModel.OPEN/CLOSE/
+ARRIVAL. The BarLoop now reads the full OHLC tuple from SEP for each
+bar (M1 read only closeunadj) and populates the MarketState's open /
+high / low / close fields accordingly. The unadjusted close (closeunadj)
+remains the price used for cash-flow accounting at the CLOSE fill model
+to preserve M1's existing behavior; M3 corporate-action work will
+re-do the split-adjustment story properly.
+
+The policy's price_lookup (used inside EqualWeightMonthlyRebalancePolicy
+to compute NAV pre-trade) reads raw closeunadj at M2. M3 will wire the
+policy's price_lookup through ImpactedPriceSource for impact-aware NAV.
+At M2 with NoImpact (Layer 2 invariant) the two NAVs agree to 1e-10.
+
 Per-bar sequence:
 1. clock.advance_to(bar_dt) (16:00 ET).
-2. Credit dividends from end-of-prior-bar shares.
-3. Fetch today's prices for the strategy's tickers.
-4. signal.compute(universe, dt, pit_view) -> dict[AssetId, float].
-5. policy.target_positions(signal, state, cost_estimator, dt) -> TargetPositions.
-6. For each target: construct Order, submit to matching_engine, apply Fill
-   to state.cash and state.positions.
-7. state.snapshot(dt, prices_today) recorded into the equity curve.
+2. matching_engine.on_bar_start(bar_dt) (per ADR 0009 lock #6).
+3. Credit dividends from end-of-prior-bar shares.
+4. Fetch today's prices for the strategy's tickers.
+5. signal.compute(universe, dt, pit_view) -> dict[AssetId, float].
+6. policy.target_positions(signal, state, cost_estimator, dt) -> TargetPositions.
+7. For each target: construct Order, construct MarketState (with real
+   OHLC, prior_close, optionally impact-adjusted), submit to
+   matching_engine, apply Fill to state.cash (now subtracts commission
+   per ADR 0009 lock #9 cash-flow semantics) and state.positions.
+8. state.snapshot(dt, prices_today) recorded into the equity curve;
+   prices routed through adjust_price() per the valuation policy.
+9. Update last_close_raw_by_ticker for the next bar's prior_close.
 """
 
 from __future__ import annotations
@@ -33,12 +69,14 @@ from typing import Mapping
 import polars as pl
 
 from pit_backtest.data.records import AssetId
+from pit_backtest.data.sources.base import ImpactedPriceSource
 from pit_backtest.data.sources.sharadar import SharadarDataSource
 from pit_backtest.data.universe import Universe
 from pit_backtest.engine.constant_weight_result import ConstantWeightDemoResult
 from pit_backtest.engine.m1_demo import asset_id_to_ticker
 from pit_backtest.engine.state import PortfolioState
 from pit_backtest.execution.clock import TestClock
+from pit_backtest.execution.cost.base import Direction, PreTradeCostEstimator
 from pit_backtest.execution.matching import (
     CloseFillMatchingEngine,
     MarketState,
@@ -72,22 +110,27 @@ class _NoopCostEstimator:
     """Stand-in PreTradeCostEstimator for M1.
 
     The constant-weight Policy needs the protocol shape but does not
-    consult pre-trade costs (the demo runs with NoImpact). M2's policies
-    will receive a real cost estimator.
+    consult pre-trade costs (the demo runs with NoImpact). Per ADR 0009
+    lock #5 the BarLoop ctor now accepts an explicit `cost_estimator`
+    keyword that replaces this stand-in when the caller has a real cost
+    estimator to wire through; the M1 demos that omit it keep the no-op.
     """
 
     def estimate(
         self,
         asset_id: AssetId,
         shares: Decimal,
-        direction: str,
+        direction: Direction,
         dt: datetime,
     ) -> Decimal:
         return Decimal("0")
 
 
 class BarLoop:
-    """The per-bar dispatch driver for the M1 constant-weight demo."""
+    """The per-bar dispatch driver for the M1 constant-weight demo,
+    extended in M2 PR B to wire ImpactedPriceSource, the real cost
+    estimator into the policy, and the matcher's on_bar_start hook.
+    """
 
     def __init__(
         self,
@@ -100,6 +143,9 @@ class BarLoop:
         clock: TestClock,
         tickers: tuple[AssetId, ...],
         initial_capital: float,
+        impacted_source: ImpactedPriceSource | None = None,
+        cost_estimator: PreTradeCostEstimator | None = None,
+        apply_permanent_impact_to_valuation: bool = True,
     ) -> None:
         self._data_source = data_source
         self._universe = universe
@@ -116,7 +162,13 @@ class BarLoop:
             realized_pnl=0.0,
         )
         self._pit_view = _NoopPitView()
-        self._cost_estimator = _NoopCostEstimator()
+        self._cost_estimator: PreTradeCostEstimator
+        if cost_estimator is None:
+            self._cost_estimator = _NoopCostEstimator()
+        else:
+            self._cost_estimator = cost_estimator
+        self._impacted_source = impacted_source
+        self._apply_impact_to_valuation = apply_permanent_impact_to_valuation
 
     @property
     def state(self) -> PortfolioState:
@@ -141,11 +193,27 @@ class BarLoop:
 
         # Build per-bar lookup indexes. Iteration over the resulting dicts is
         # always wrapped in sorted(...) at consumption time.
+        # price_at retains M1's closeunadj-based valuation/fill price for
+        # CLOSE-model orders; bar_at carries the full OHLCV tuple per ADR
+        # 0009 lock #5 so the matcher can resolve OPEN/CLOSE/ARRIVAL
+        # arrivals against the real bar values.
         price_at: dict[tuple[AssetId, date], float] = {}
+        bar_at: dict[
+            tuple[AssetId, date],
+            tuple[float, float, float, float, float, int],
+        ] = {}
         for ticker in sorted(prices_by_asset.keys()):
             frame = prices_by_asset[ticker]
             for row in frame.iter_rows(named=True):
                 price_at[(ticker, row["dt"])] = float(row["closeunadj"])
+                bar_at[(ticker, row["dt"])] = (
+                    float(row["open"]),
+                    float(row["high"]),
+                    float(row["low"]),
+                    float(row["close"]),
+                    float(row["closeunadj"]),
+                    int(row["volume"]),
+                )
 
         divs_at: dict[date, dict[AssetId, float]] = {}
         for ticker in sorted(dividends_by_asset.keys()):
@@ -176,15 +244,30 @@ class BarLoop:
                 "end_dt": end_dt.isoformat(),
                 "initial_capital": f"{self._initial_capital:.2f}",
                 "n_trading_days": len(trading_days_in_window),
+                "impact_aware_valuation": str(
+                    self._impacted_source is not None
+                    and self._apply_impact_to_valuation
+                ),
             },
         )
 
         equity_curve_rows: list[dict[str, object]] = []
         n_rebalances = 0
+        # last_close_raw_by_ticker tracks the previous bar's RAW closeunadj
+        # per ticker. The next bar's MarketState.prior_close is derived
+        # from this (impact-adjusted at MarketState construction time if
+        # impacted_source is not None). Empty on the first bar; first-bar
+        # ARRIVAL fills are not supported per ADR 0009 lock #4.
+        last_close_raw_by_ticker: dict[AssetId, float] = {}
 
         for bar_dt in trading_days_in_window:
             self._clock.advance_to(bar_dt)
             now = self._clock.now()
+
+            # Per ADR 0009 lock #6 the matcher's per-bar reset hook fires
+            # immediately after clock advancement so the matcher's _now
+            # accessors see the advanced clock.
+            self._matching_engine.on_bar_start(bar_dt)
 
             # Step 2: credit dividends from end-of-prior-bar shares.
             bar_divs = divs_at.get(bar_dt, {})
@@ -194,7 +277,8 @@ class BarLoop:
                 if shares != 0.0:
                     self._state.cash += shares * div
 
-            # Step 3: today's prices for this strategy's tickers.
+            # Step 3: today's prices for this strategy's tickers (raw
+            # closeunadj per M1 convention).
             prices_today: dict[AssetId, float] = {}
             for ticker in self._tickers:
                 key = (ticker, bar_dt)
@@ -204,7 +288,9 @@ class BarLoop:
             # Step 4: signal.
             signal_output = self._signal.compute(self._universe, now, self._pit_view)
 
-            # Step 5: policy.
+            # Step 5: policy. Per ADR 0009 lock #5 the cost_estimator is
+            # the real cost model when the BarLoop was constructed with
+            # one; otherwise the no-op stand-in.
             targets = self._policy.target_positions(
                 signal_output=signal_output,
                 current_positions=self._state,
@@ -232,30 +318,51 @@ class BarLoop:
                         fill_price_model=FillPriceModel.CLOSE,
                         submit_dt=now,
                     )
-                    market_state = MarketState(
-                        asset_id=ticker,
-                        dt=now,
-                        open=Decimal(repr(close_t)),
-                        high=Decimal(repr(close_t)),
-                        low=Decimal(repr(close_t)),
-                        close=Decimal(repr(close_t)),
-                        volume=0,
+
+                    market_state = self._build_market_state(
+                        ticker=ticker,
+                        bar_dt=bar_dt,
+                        now=now,
+                        bar_at=bar_at,
+                        last_close_raw_by_ticker=last_close_raw_by_ticker,
                     )
+                    if market_state is None:
+                        continue
                     fills = self._matching_engine.submit(order, market_state)
                     for fill in fills:
                         fill_qty = float(fill.quantity)
                         fill_price = float(fill.fill_price)
-                        self._state.cash -= fill_qty * fill_price
+                        commission_dollars = float(fill.commission)
+                        # Cash flow per ADR 0009 lock #9: shares * fill_price
+                        # plus commission (always positive). The matcher's
+                        # signed-share convention is preserved so a sell
+                        # with negative qty produces a positive cash inflow
+                        # via the qty * price term (offset by the positive
+                        # commission outflow).
+                        self._state.cash -= fill_qty * fill_price + commission_dollars
                         self._state.positions[fill.asset_id] = (
                             self._state.positions.get(fill.asset_id, 0.0) + fill_qty
                         )
 
-            # Step 7: snapshot at today's close.
+            # Step 7: snapshot at today's close. Per ADR 0009 lock #2 the
+            # snapshot routes prices through adjust_price when the impact
+            # source is wired AND the valuation policy is ON (default).
             nav_close = self._state.cash
             for ticker in sorted(self._state.positions.keys()):
                 shares = self._state.positions[ticker]
-                if shares != 0.0 and ticker in prices_today:
-                    nav_close += shares * prices_today[ticker]
+                if shares == 0.0 or ticker not in prices_today:
+                    continue
+                raw_close = prices_today[ticker]
+                if (
+                    self._impacted_source is not None
+                    and self._apply_impact_to_valuation
+                ):
+                    impacted_close_decimal = self._impacted_source.adjust_price(
+                        ticker, Decimal(repr(raw_close))
+                    )
+                    nav_close += shares * float(impacted_close_decimal)
+                else:
+                    nav_close += shares * raw_close
 
             curve_row: dict[str, object] = {
                 "dt": bar_dt,
@@ -265,6 +372,13 @@ class BarLoop:
             for ticker in self._tickers:
                 curve_row[f"shares_{ticker}"] = self._state.positions.get(ticker, 0.0)
             equity_curve_rows.append(curve_row)
+
+            # Step 9: track the raw closeunadj per ticker for the next
+            # bar's prior_close population.
+            for ticker in self._tickers:
+                key = (ticker, bar_dt)
+                if key in price_at:
+                    last_close_raw_by_ticker[ticker] = price_at[key]
 
         equity_curve = pl.DataFrame(equity_curve_rows).sort("dt")
         final_nav = float(equity_curve["nav"][-1])
@@ -293,3 +407,69 @@ class BarLoop:
             },
         )
         return result
+
+    def _build_market_state(
+        self,
+        *,
+        ticker: AssetId,
+        bar_dt: date,
+        now: datetime,
+        bar_at: Mapping[
+            tuple[AssetId, date],
+            tuple[float, float, float, float, float, int],
+        ],
+        last_close_raw_by_ticker: Mapping[AssetId, float],
+    ) -> MarketState | None:
+        """Construct the MarketState for a (ticker, bar_dt) pair.
+
+        Returns None if the bar is missing from the SEP frame (the BarLoop
+        skips orders for missing bars in step 6). Routes open/high/low/
+        close through adjust_price when impacted_source is wired so the
+        matcher sees the impacted view of the bar.
+
+        Per ADR 0009 lock #14 construction is keyword-only.
+        """
+        bar_tuple = bar_at.get((ticker, bar_dt))
+        if bar_tuple is None:
+            return None
+        raw_open, raw_high, raw_low, _raw_close, raw_closeunadj, raw_volume = bar_tuple
+
+        # M1 uses closeunadj for the close field; M2 preserves this so the
+        # Layer 2 zero-cost invariant equals the M1 baseline at 1e-10. The
+        # split-adjusted SEP open/high/low fields are passed through as-is
+        # at M2; for the M2 demo universe (SPY/AGG/GLD, no splits in the
+        # observed windows) split-adjusted equals unadjusted within sub-bp
+        # precision. M3 will refine the split-adjustment story properly.
+        open_d = Decimal(repr(raw_open))
+        high_d = Decimal(repr(raw_high))
+        low_d = Decimal(repr(raw_low))
+        close_d = Decimal(repr(raw_closeunadj))
+
+        if self._impacted_source is not None:
+            open_d = self._impacted_source.adjust_price(ticker, open_d)
+            high_d = self._impacted_source.adjust_price(ticker, high_d)
+            low_d = self._impacted_source.adjust_price(ticker, low_d)
+            close_d = self._impacted_source.adjust_price(ticker, close_d)
+
+        prior_close_d: Decimal | None
+        if ticker in last_close_raw_by_ticker:
+            prior_close_raw_d = Decimal(repr(last_close_raw_by_ticker[ticker]))
+            if self._impacted_source is not None:
+                prior_close_d = self._impacted_source.adjust_price(
+                    ticker, prior_close_raw_d
+                )
+            else:
+                prior_close_d = prior_close_raw_d
+        else:
+            prior_close_d = None
+
+        return MarketState(
+            asset_id=ticker,
+            dt=now,
+            open=open_d,
+            high=high_d,
+            low=low_d,
+            close=close_d,
+            volume=raw_volume,
+            prior_close=prior_close_d,
+        )
