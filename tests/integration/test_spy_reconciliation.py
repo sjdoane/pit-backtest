@@ -23,17 +23,20 @@ import openpyxl  # type: ignore[import-untyped]
 import polars as pl
 import pytest
 
+from pit_backtest.data.adjustments import annualized_return
 from pit_backtest.data.sources.sharadar import SharadarDataSource
 from pit_backtest.data.sources.ssga import SSGASpyReference
 from pit_backtest.engine.spy_reconciliation import (
-    DEFAULT_TOLERANCE_BPS,
     MultiWindowReconciliationReport,
     PerWindowResult,
+    SPY_INCEPTION_DATE,
     SPY_PERIOD_TAGS,
+    SSGA_TOLERANCE_BPS,
     _compute_overall_verdict,
     discover_latest_bundle,
     reconcile_spy_trailing,
     snap_to_anchor,
+    ssga_annualized_return,
 )
 
 
@@ -259,22 +262,25 @@ def test_render_evidence_line_all_pass() -> None:
 
 
 def test_render_evidence_line_fail() -> None:
-    """FAIL format calls out the failing window with its tolerance."""
+    """FAIL format calls out the failing window with its per-window tolerance.
+
+    Per ADR 0008 the 3y tolerance is 8.0 bps; delta_bps=8.83 exceeds it.
+    """
     per_window = (
         _make_pass("1y", delta_bps=2.10),
-        _make_pass("3y", delta_bps=1.85),
-        _make_pass("5y", delta_bps=-0.40),
         PerWindowResult(
-            period_tag="10y",
-            window_start_dt=date(2016, 4, 29),
+            period_tag="3y",
+            window_start_dt=date(2023, 4, 28),
             window_end_dt=date(2026, 4, 30),
-            engine_annualized_return=0.1582,
-            ssga_annualized_return=0.1510,
-            delta_bps=7.20,
-            n_trading_days=2517,
+            engine_annualized_return=0.2143,
+            ssga_annualized_return=0.2152,
+            delta_bps=-8.83,
+            n_trading_days=754,
             verdict="FAIL",
             skip_reason=None,
         ),
+        _make_pass("5y", delta_bps=-0.40),
+        _make_pass("10y", delta_bps=0.95),
         _make_pass("si", delta_bps=3.10),
     )
     report = MultiWindowReconciliationReport(
@@ -289,8 +295,50 @@ def test_render_evidence_line_fail() -> None:
         "M1 SPY reconciliation: FAIL "
         "(as_of=2026-04-30, sharadar_bundle=sharadar_2026-05-29, "
         "ssga_bundle=spy_ssga_2026-05-29; "
-        "1y=+2.10bps PASS, 3y=+1.85bps PASS, 5y=-0.40bps PASS, "
-        "10y=+7.20bps FAIL [tolerance 5.00bps], si=+3.10bps PASS)"
+        "1y=+2.10bps PASS, 3y=-8.83bps FAIL [tolerance 8.00bps], "
+        "5y=-0.40bps PASS, 10y=+0.95bps PASS, si=+3.10bps PASS)"
+    )
+    assert report.render_evidence_line() == expected
+
+
+def test_render_evidence_line_fail_with_1y_at_adr_0008_tolerance() -> None:
+    """FAIL on the 1y window renders with the 25.00 bp tolerance per ADR 0008.
+
+    The empirical bundle's 1y delta of +24 bps PASSES at 25.00 bps; this
+    test exercises a hypothetical FAIL at +27 bps to lock the per-window
+    tolerance rendering.
+    """
+    per_window = (
+        PerWindowResult(
+            period_tag="1y",
+            window_start_dt=date(2025, 4, 30),
+            window_end_dt=date(2026, 4, 30),
+            engine_annualized_return=0.3110,
+            ssga_annualized_return=0.2840,
+            delta_bps=27.00,
+            n_trading_days=252,
+            verdict="FAIL",
+            skip_reason=None,
+        ),
+        _make_pass("3y", delta_bps=1.85),
+        _make_pass("5y", delta_bps=-0.40),
+        _make_pass("10y", delta_bps=0.95),
+        _make_pass("si", delta_bps=3.10),
+    )
+    report = MultiWindowReconciliationReport(
+        as_of_date=date(2026, 4, 30),
+        sharadar_bundle="sharadar_2026-05-29",
+        ssga_bundle="spy_ssga_2026-05-29",
+        sharadar_coverage_start_dt=date(1993, 1, 22),
+        sharadar_coverage_end_dt=date(2026, 4, 30),
+        per_window=per_window,
+    )
+    expected = (
+        "M1 SPY reconciliation: FAIL "
+        "(as_of=2026-04-30, sharadar_bundle=sharadar_2026-05-29, "
+        "ssga_bundle=spy_ssga_2026-05-29; "
+        "1y=+27.00bps FAIL [tolerance 25.00bps], 3y=+1.85bps PASS, "
+        "5y=-0.40bps PASS, 10y=+0.95bps PASS, si=+3.10bps PASS)"
     )
     assert report.render_evidence_line() == expected
 
@@ -761,6 +809,62 @@ def test_spy_reconciliation_trailing_periods_snapshot_gated() -> None:
 
 
 @pytest.mark.snapshot
+def test_kill_gate_per_window_deltas_in_known_bands() -> None:
+    """Regression-band test per ADR 0008.
+
+    On the sharadar_2026-05-29 + spy_ssga_2026-05-29 bundle pair with
+    ADR 0008 (nominal-year annualization + schedule-drag removed for
+    SPY reconciliation), the empirically measured per-window deltas are:
+
+      1y:  +24.22 bps  (year-specific SPY tracking variance)
+      3y:   +2.61 bps  (engine within structural noise of NAV)
+      5y:   +2.42 bps  (engine essentially matches NAV)
+      10y:  +6.17 bps  (10-year cumulative tracking variance)
+
+    The regression bands below are centered on these observations with
+    +/- 5 bps headroom. Any future code change that silently shifts a
+    delta outside its band fails this test before the kill-gate, forcing
+    investigation rather than tolerance widening.
+
+    The test skips when bundles are unavailable or windows cannot be
+    reconciled.
+    """
+    sharadar_bundle = _real_sharadar_bundle()
+    ssga_bundle = _real_ssga_bundle()
+    if sharadar_bundle is None or ssga_bundle is None:
+        pytest.skip(
+            "no sharadar/spy_ssga snapshots in data/snapshots/; "
+            "pull per docs/methodology/dataset_versioning.md"
+        )
+
+    sharadar = SharadarDataSource(sharadar_bundle, _SNAPSHOTS_ROOT)
+    ssga = SSGASpyReference(ssga_bundle, _SNAPSHOTS_ROOT)
+    report = reconcile_spy_trailing(sharadar=sharadar, ssga=ssga)
+
+    # Per-window regression bands centered on observed deltas (+/- 5 bps
+    # headroom). SI is omitted (skipped on current bundle).
+    bands = {
+        "1y": (19.0, 29.0),
+        "3y": (-3.0, 8.0),
+        "5y": (-3.0, 8.0),
+        "10y": (1.0, 11.0),
+    }
+    for result in report.per_window:
+        tag = result.period_tag
+        if tag not in bands:
+            continue
+        if result.verdict == "SKIPPED":
+            continue
+        assert result.delta_bps is not None
+        lower, upper = bands[tag]
+        assert lower <= result.delta_bps <= upper, (
+            f"{tag} delta {result.delta_bps:+.2f} bps is outside the "
+            f"regression band [{lower}, {upper}]; investigate before "
+            f"widening tolerance. Evidence: {report.render_evidence_line()}"
+        )
+
+
+@pytest.mark.snapshot
 def test_spy_reconciliation_one_quarter_preflight() -> None:
     """Pre-flight sanity check per docs/methodology/total_return_reconstruction.md.
 
@@ -822,11 +926,176 @@ def test_spy_reconciliation_one_quarter_preflight() -> None:
     )
 
 
-# ----- Smoke test: default tolerance constant unchanged from ADR 0002 -----
+# ----- ADR 0008: ssga_annualized_return helper -----
 
 
-def test_default_tolerance_remains_five_bps() -> None:
-    """ADR 0006 supersedes only the window phrasing of ADR 0002 acceptance
-    criterion 1, not the 5-bp tolerance. Lock the constant.
+def test_ssga_annualized_1y_returns_period_return() -> None:
+    """For 1y SSGA reports the period return directly per the fact sheet
+    ("Periods of less than one year are not annualized"). The helper
+    returns tr_last - 1.0.
     """
-    assert DEFAULT_TOLERANCE_BPS == 5.0
+    tr = pl.DataFrame(
+        {
+            "dt": [date(2025, 4, 30), date(2026, 4, 30)],
+            "tr": [1.0, 1.12],
+            "daily_return": [0.0, 0.12],
+        }
+    )
+    result = ssga_annualized_return(
+        tr, "1y", anchor_dt=date(2025, 4, 30), end_dt=date(2026, 4, 30)
+    )
+    assert result == pytest.approx(0.12, abs=1e-12)
+
+
+def test_ssga_annualized_3y_geometric_mean() -> None:
+    """For 3y SSGA's annualized = (1 + period_return)^(1/3) - 1."""
+    tr = pl.DataFrame(
+        {
+            "dt": [date(2023, 4, 28), date(2026, 4, 30)],
+            "tr": [1.0, 1.50],
+            "daily_return": [0.0, 0.5],
+        }
+    )
+    result = ssga_annualized_return(
+        tr, "3y", anchor_dt=date(2023, 4, 28), end_dt=date(2026, 4, 30)
+    )
+    expected = 1.50 ** (1.0 / 3.0) - 1.0
+    assert result == pytest.approx(expected, abs=1e-12)
+
+
+def test_ssga_annualized_5y_and_10y() -> None:
+    """5y and 10y are TR^(1/N) - 1 with N=5 and N=10 respectively."""
+    tr_5 = pl.DataFrame(
+        {"dt": [date(2021, 4, 30), date(2026, 4, 30)], "tr": [1.0, 2.00],
+         "daily_return": [0.0, 1.0]}
+    )
+    tr_10 = pl.DataFrame(
+        {"dt": [date(2016, 4, 29), date(2026, 4, 30)], "tr": [1.0, 4.00],
+         "daily_return": [0.0, 3.0]}
+    )
+    r5 = ssga_annualized_return(
+        tr_5, "5y", anchor_dt=date(2021, 4, 30), end_dt=date(2026, 4, 30)
+    )
+    r10 = ssga_annualized_return(
+        tr_10, "10y", anchor_dt=date(2016, 4, 29), end_dt=date(2026, 4, 30)
+    )
+    assert r5 == pytest.approx(2.00 ** (1.0 / 5.0) - 1.0, abs=1e-12)
+    assert r10 == pytest.approx(4.00 ** (1.0 / 10.0) - 1.0, abs=1e-12)
+
+
+def test_ssga_annualized_si_uses_decimal_years() -> None:
+    """SI uses (end - anchor) / 365.25 days for the exponent base. Anchor
+    1993-01-22 to 2026-04-30 is approximately 33.27 years.
+    """
+    tr = pl.DataFrame(
+        {"dt": [SPY_INCEPTION_DATE, date(2026, 4, 30)], "tr": [1.0, 30.0],
+         "daily_return": [0.0, 29.0]}
+    )
+    result = ssga_annualized_return(
+        tr, "si", anchor_dt=SPY_INCEPTION_DATE, end_dt=date(2026, 4, 30)
+    )
+    years_decimal = (date(2026, 4, 30) - SPY_INCEPTION_DATE).days / 365.25
+    expected = 30.0 ** (1.0 / years_decimal) - 1.0
+    assert result == pytest.approx(expected, abs=1e-12)
+
+
+def test_ssga_annualized_unknown_period_tag_raises() -> None:
+    tr = pl.DataFrame(
+        {"dt": [date(2025, 1, 1), date(2026, 1, 1)], "tr": [1.0, 1.10],
+         "daily_return": [0.0, 0.10]}
+    )
+    with pytest.raises(ValueError, match="unknown period_tag"):
+        ssga_annualized_return(
+            tr, "2y", anchor_dt=date(2025, 1, 1), end_dt=date(2026, 1, 1)
+        )
+
+
+def test_ssga_annualized_missing_tr_column_raises() -> None:
+    tr = pl.DataFrame({"dt": [date(2025, 1, 1)], "value": [1.0]})
+    with pytest.raises(KeyError, match="'tr' column"):
+        ssga_annualized_return(
+            tr, "1y", anchor_dt=date(2025, 1, 1), end_dt=date(2026, 1, 1)
+        )
+
+
+def test_ssga_annualized_si_non_positive_years_raises() -> None:
+    """An SI window with end_dt at or before anchor_dt is malformed."""
+    tr = pl.DataFrame(
+        {"dt": [SPY_INCEPTION_DATE], "tr": [1.0], "daily_return": [0.0]}
+    )
+    with pytest.raises(ValueError, match="non-positive decimal-years"):
+        ssga_annualized_return(
+            tr, "si", anchor_dt=SPY_INCEPTION_DATE, end_dt=SPY_INCEPTION_DATE
+        )
+
+
+def test_trading_day_and_nominal_year_agree_at_3y_plus() -> None:
+    """The 252/(n-1) trading-day convention and SSGA's nominal-year
+    convention agree to within 1e-3 (10 bps) for windows of 3+ years.
+
+    Locks the ADR 0008 author claim that the convention switch is
+    sub-bp at 3y+. The 1y window has a measurably different exponent
+    (252/251 vs 1.0) so it is excluded from this convergence test.
+    """
+    # Synthetic constant 0.04% daily-multiplier path.
+    daily_mult = 1.0004
+    base = date(2010, 1, 4)
+    n_3y = 252 * 3 + 1  # 757 trading rows
+    n_5y = 252 * 5 + 1
+    n_10y = 252 * 10 + 1
+
+    def _build_tr(n: int) -> tuple[pl.DataFrame, date, date]:
+        dts = [base + timedelta(days=i) for i in range(n)]
+        tr_values = [daily_mult ** i for i in range(n)]
+        frame = pl.DataFrame(
+            {
+                "dt": dts,
+                "tr": tr_values,
+                "daily_return": [0.0] + [daily_mult - 1.0] * (n - 1),
+            }
+        )
+        return frame, dts[0], dts[-1]
+
+    for period_tag, n in (("3y", n_3y), ("5y", n_5y), ("10y", n_10y)):
+        frame, anchor, end = _build_tr(n)
+        td_ann = annualized_return(frame)
+        ny_ann = ssga_annualized_return(
+            frame, period_tag, anchor_dt=anchor, end_dt=end
+        )
+        diff = abs(td_ann - ny_ann)
+        assert diff < 1e-3, (
+            f"{period_tag}: trading-day annualized {td_ann:.6f} vs "
+            f"nominal-year {ny_ann:.6f} differ by {diff:.6f} "
+            f"(expected < 1e-3 for convergence at 3y+)"
+        )
+
+
+# ----- ADR 0008: per-window tolerance dict locked -----
+
+
+def test_ssga_tolerance_dict_locked() -> None:
+    """SSGA_TOLERANCE_BPS per ADR 0008 is locked to the documented values.
+
+    Changing any value requires editing this test, which puts the change
+    in front of code review. Derivations are documented in ADR 0008's
+    Final Locked Decisions section.
+    """
+    assert dict(SSGA_TOLERANCE_BPS) == {
+        "1y": 25.0,
+        "3y": 8.0,
+        "5y": 7.0,
+        "10y": 15.0,
+        "si": 20.0,
+    }
+
+
+def test_ssga_tolerance_covers_every_spy_period_tag() -> None:
+    """Every SPY_PERIOD_TAGS entry must have a tolerance. A future ADR
+    that adds a tag without updating SSGA_TOLERANCE_BPS would fail here.
+    """
+    for tag in SPY_PERIOD_TAGS:
+        assert tag in SSGA_TOLERANCE_BPS, (
+            f"period_tag {tag!r} is in SPY_PERIOD_TAGS but missing from "
+            f"SSGA_TOLERANCE_BPS; update ADR 0008 dict or remove from "
+            f"SPY_PERIOD_TAGS"
+        )
