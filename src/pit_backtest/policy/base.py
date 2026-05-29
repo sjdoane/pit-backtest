@@ -38,8 +38,16 @@ class PreTradeCostEstimatorLike(Protocol):
 
 
 class PortfolioStateLike(Protocol):
-    cash: Decimal
-    positions: dict[AssetId, Decimal]
+    """Structural protocol the Policy layer needs from PortfolioState.
+
+    Per the M1 day 3 design: inner-loop arithmetic is float64, not Decimal.
+    The full PortfolioState (engine/state.py) carries cash and positions
+    as floats; TargetPositions.targets stays Decimal as a boundary type
+    converted at construction via Decimal(repr(float_value)).
+    """
+
+    cash: float
+    positions: dict[AssetId, float]
 
 
 class Policy(Protocol):
