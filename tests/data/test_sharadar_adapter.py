@@ -33,14 +33,28 @@ _SEP_ROWS = [
     {"ticker": "SPY", "date": date(2024, 3, 18), "open": 513.00, "high": 515.00, "low": 511.00, "close": 514.00, "closeunadj": 514.00, "volume": 60_000_000},
     # Non-SPY row to exercise the filter
     {"ticker": "AGG", "date": date(2024, 3, 15), "open": 95.00, "high": 95.50, "low": 94.80, "close": 95.20, "closeunadj": 95.20, "volume": 5_000_000},
+    # M3 PR 3: DLST row at its lastpricedate to exercise get_delisting.
+    {"ticker": "DLST", "date": date(2018, 6, 30), "open": 12.45, "high": 12.55, "low": 12.40, "close": 12.50, "closeunadj": 12.50, "volume": 100_000},
 ]
 
 _ACTIONS_ROWS = [
     {"ticker": "SPY", "date": date(2024, 3, 15), "action": "dividend", "value": 1.7715},
     {"ticker": "SPY", "date": date(2023, 12, 15), "action": "dividend", "value": 1.5800},
     {"ticker": "AGG", "date": date(2024, 3, 1), "action": "dividend", "value": 0.2800},
-    # Non-dividend action that should be filtered out by read_actions_dividends
-    {"ticker": "SPY", "date": date(2024, 3, 15), "action": "split", "value": 1.0},
+    # M3 PR 3: realistic 2-for-1 forward split (Plan-reviewer High 3:
+    # a value=1.0 ratio is a no-op that Sharadar never produces).
+    {"ticker": "SPY", "date": date(2024, 3, 15), "action": "split", "value": 2.0},
+    # M3 PR 3: spinoff dispatch row (CMW1993 + MO2004 bias note per ADR
+    # 0002 dec 14; v1 ships the cash-equivalent approximation).
+    {"ticker": "SPY", "date": date(2024, 6, 21), "action": "spinoff", "value": 12.50},
+    # M3 PR 3: announce-only codes routed through _SHARADAR_SKIPPED_ACTIONS;
+    # placed OUTSIDE the M1 SPY TR window so read_actions_dividends is
+    # unaffected.
+    {"ticker": "SPY", "date": date(2024, 9, 30), "action": "transfer", "value": 0.0},
+    {"ticker": "OLDCO", "date": date(2014, 6, 30), "action": "acquisitionbystock", "value": 0.0},
+    # M3 PR 3: unknown action triggers the WARN-and-skip path (Plan-reviewer
+    # Counter on Choice 1: vendor schema additions must not crash backtests).
+    {"ticker": "SPY", "date": date(2024, 11, 15), "action": "fictitious_action", "value": 0.0},
 ]
 
 # M3 PR 1: synthetic TICKERS rows covering the resolver edge cases:
@@ -82,6 +96,20 @@ _TICKERS_ROWS = [
         "firstquarter": date(2010, 3, 31),
         "lastquarter": date(2014, 12, 31),
         "cusip": "OLDC00001",
+    },
+    # M3 PR 3: delisted with a known SEP closeunadj at lastpricedate so
+    # get_delisting can exercise the closeunadj-based cash-flow path.
+    {
+        "permaticker": 400,
+        "ticker": "DLST",
+        "name": "Delisting Test Co",
+        "exchange": "NASDAQ",
+        "isdelisted": "Y",
+        "firstpricedate": date(2015, 1, 5),
+        "lastpricedate": date(2018, 6, 30),
+        "firstquarter": date(2015, 3, 31),
+        "lastquarter": date(2018, 6, 30),
+        "cusip": "DLST00001",
     },
 ]
 
@@ -602,7 +630,8 @@ def test_read_tickers_returns_full_column_set(tmp_path: Path) -> None:
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     df = adapter.read_tickers()
-    assert df.height == 3
+    # Includes the M3 PR 3 DLST row (permaticker=400) added at fixture time.
+    assert df.height == 4
     assert df.columns == [
         "permaticker",
         "ticker",
@@ -675,7 +704,8 @@ def test_read_tickers_sorted_by_permaticker_then_firstpricedate(
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     df = adapter.read_tickers()
-    assert df["permaticker"].to_list() == [100, 200, 300]
+    # Includes the M3 PR 3 DLST row (permaticker=400).
+    assert df["permaticker"].to_list() == [100, 200, 300, 400]
 
 
 def test_read_sf1_arq_filters_to_arq_dimension_by_default(tmp_path: Path) -> None:
@@ -1332,3 +1362,590 @@ def test_get_fundamental_case_insensitive_flavor_input(tmp_path: Path) -> None:
         AssetId(100), datetime(2024, 5, 1, 16, 0), "revenue", "Arq"  # type: ignore[arg-type]
     )
     assert upper == lower == mixed == Decimal("1000.0")
+
+
+# ============================================================
+# M3 PR 3: corp actions + cash flows + delisting dispatch tests
+# ============================================================
+
+from datetime import time  # noqa: E402
+
+from pit_backtest.data.records import (  # noqa: E402
+    CashFlow,
+    SplitAction,
+)
+from pit_backtest.data.sources.sharadar import (  # noqa: E402
+    DelistingDataQualityError,
+    _dispatch_action_row,
+)
+
+
+# ----- Dispatch helper unit tests -----
+
+def test_dispatch_action_row_dividend_returns_cash_flow() -> None:
+    row = {
+        "ticker": "SPY",
+        "date": date(2024, 3, 15),
+        "action": "dividend",
+        "value": 1.7715,
+    }
+    result = _dispatch_action_row(row, AssetId(100))
+    assert isinstance(result, CashFlow)
+    assert result.asset_id == AssetId(100)
+    assert result.dt == datetime(2024, 3, 15, 16, 0)
+    assert result.flow_type == "cash_dividend"
+    assert result.amount == Decimal("1.7715")
+
+
+def test_dispatch_action_row_split_returns_split_action() -> None:
+    row = {
+        "ticker": "SPY",
+        "date": date(2024, 3, 15),
+        "action": "split",
+        "value": 2.0,
+    }
+    result = _dispatch_action_row(row, AssetId(100))
+    assert isinstance(result, SplitAction)
+    assert result.asset_id == AssetId(100)
+    assert result.ex_date == datetime(2024, 3, 15, 16, 0)
+    assert result.ratio == Decimal("2.0")
+
+
+def test_dispatch_action_row_spinoff_returns_cash_flow_spinoff_equivalent() -> None:
+    row = {
+        "ticker": "SPY",
+        "date": date(2024, 6, 21),
+        "action": "spinoff",
+        "value": 12.50,
+    }
+    result = _dispatch_action_row(row, AssetId(100))
+    assert isinstance(result, CashFlow)
+    assert result.flow_type == "spinoff_cash_equivalent"
+    assert result.amount == Decimal("12.50")
+
+
+def test_dispatch_action_row_skipped_action_returns_none() -> None:
+    """Announce-only codes (listed, initiated, delisted, transfer,
+    tradinghaltresumed) and TICKERS-routed codes (acquisitionby*,
+    bankruptcy*) all return None (no warning).
+    """
+    skipped_actions = [
+        "listed", "initiated", "delisted", "transfer",
+        "tradinghaltresumed", "acquisitionbystock", "acquisitionbycash",
+        "acquisitionunknown", "bankruptcyliquidation",
+        "bankruptcyreorganization",
+    ]
+    for action in skipped_actions:
+        row = {
+            "ticker": "SPY", "date": date(2024, 3, 15),
+            "action": action, "value": 0.0,
+        }
+        assert _dispatch_action_row(row, AssetId(100)) is None
+
+
+def test_dispatch_action_row_unknown_action_warns_and_returns_none(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Per Plan-reviewer Counter on Choice 1: unknown action codes log
+    a WARNING and skip. Vendor adding a code mid-2027 must not crash
+    backtests.
+    """
+    row = {
+        "ticker": "SPY",
+        "date": date(2024, 11, 15),
+        "action": "vendor_added_code_xyz",
+        "value": 0.0,
+    }
+    import logging
+    with caplog.at_level(logging.WARNING, logger="pit_backtest.data.sources.sharadar"):
+        result = _dispatch_action_row(row, AssetId(100))
+    assert result is None
+    assert any("vendor_added_code_xyz" in record.message for record in caplog.records)
+
+
+# ----- get_corporate_actions tests -----
+
+def test_get_corporate_actions_happy_path_returns_split_for_spy(
+    tmp_path: Path,
+) -> None:
+    """SPY 2024-03-15 split (value=2.0) in a range covering it returns
+    [SplitAction(ratio=Decimal("2.0"), ex_date=2024-03-15 16:00)].
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    actions = adapter.get_corporate_actions(
+        AssetId(100),
+        datetime(2024, 1, 1, 16, 0),
+        datetime(2024, 12, 31, 16, 0),
+    )
+    assert len(actions) == 1
+    assert isinstance(actions[0], SplitAction)
+    assert actions[0].ratio == Decimal("2.0")
+    assert actions[0].ex_date == datetime(2024, 3, 15, 16, 0)
+
+
+def test_get_corporate_actions_filters_cash_flows_out(tmp_path: Path) -> None:
+    """A range that contains SPY's 2024-03-15 dividend + split returns
+    only the SplitAction (the dividend flows through get_cash_flows).
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    actions = adapter.get_corporate_actions(
+        AssetId(100),
+        datetime(2024, 3, 1, 16, 0),
+        datetime(2024, 3, 31, 16, 0),
+    )
+    assert len(actions) == 1
+    assert isinstance(actions[0], SplitAction)
+
+
+def test_get_corporate_actions_empty_range_returns_empty_list(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    actions = adapter.get_corporate_actions(
+        AssetId(100),
+        datetime(2020, 1, 1, 16, 0),
+        datetime(2020, 12, 31, 16, 0),
+    )
+    assert actions == []
+
+
+def test_get_corporate_actions_unknown_asset_raises_ticker_not_found(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with pytest.raises(TickerNotFoundError):
+        adapter.get_corporate_actions(
+            AssetId(999),
+            datetime(2024, 1, 1, 16, 0),
+            datetime(2024, 12, 31, 16, 0),
+        )
+
+
+# ----- get_cash_flows tests -----
+
+def test_get_cash_flows_happy_path_returns_dividend_for_spy(
+    tmp_path: Path,
+) -> None:
+    """SPY 2024-03-15 dividend (value=1.7715) in narrow range."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    flows = adapter.get_cash_flows(
+        AssetId(100),
+        datetime(2024, 3, 14, 16, 0),
+        datetime(2024, 3, 16, 16, 0),
+    )
+    assert len(flows) == 1
+    assert flows[0].flow_type == "cash_dividend"
+    assert flows[0].amount == Decimal("1.7715")
+    assert flows[0].dt == datetime(2024, 3, 15, 16, 0)
+
+
+def test_get_cash_flows_spinoff_dispatches_to_spinoff_cash_equivalent(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    flows = adapter.get_cash_flows(
+        AssetId(100),
+        datetime(2024, 6, 1, 16, 0),
+        datetime(2024, 6, 30, 16, 0),
+    )
+    assert len(flows) == 1
+    assert flows[0].flow_type == "spinoff_cash_equivalent"
+    assert flows[0].amount == Decimal("12.50")
+
+
+def test_get_cash_flows_skipped_actions_excluded_from_result(
+    tmp_path: Path,
+) -> None:
+    """The transfer row at 2024-09-30 is skipped; the range covering it
+    returns only [].
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    flows = adapter.get_cash_flows(
+        AssetId(100),
+        datetime(2024, 9, 1, 16, 0),
+        datetime(2024, 9, 30, 16, 0),
+    )
+    assert flows == []
+
+
+def test_get_cash_flows_unknown_action_logs_warning_does_not_raise(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fictitious_action row at 2024-11-15 logs a warning and is
+    skipped. The method does NOT raise.
+    """
+    import logging
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with caplog.at_level(logging.WARNING, logger="pit_backtest.data.sources.sharadar"):
+        flows = adapter.get_cash_flows(
+            AssetId(100),
+            datetime(2024, 11, 1, 16, 0),
+            datetime(2024, 11, 30, 16, 0),
+        )
+    assert flows == []
+    assert any("fictitious_action" in record.message for record in caplog.records)
+
+
+def test_get_cash_flows_date_range_filter_excludes_rows_outside(
+    tmp_path: Path,
+) -> None:
+    """The PR 2-style structural lookahead-leak analogue for the range query.
+
+    A buggy implementation that drops the start_dt filter would return
+    the 2023-12-15 dividend even though the range starts at 2024-03-14.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    flows = adapter.get_cash_flows(
+        AssetId(100),
+        datetime(2024, 3, 14, 16, 0),
+        datetime(2024, 3, 16, 16, 0),
+    )
+    # The 2023-12-15 dividend exists in the bundle but is NOT in this range.
+    for flow in flows:
+        assert flow.dt >= datetime(2024, 3, 14, 16, 0)
+        assert flow.dt <= datetime(2024, 3, 16, 16, 0)
+
+
+def test_get_cash_flows_includes_delisting_cash_when_lastpricedate_in_range(
+    tmp_path: Path,
+) -> None:
+    """For AssetId(400) (DLST, lastpricedate=2018-06-30, closeunadj=12.50)
+    a range covering that date returns a delisting_cash_proceeds CashFlow.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    flows = adapter.get_cash_flows(
+        AssetId(400),
+        datetime(2018, 6, 1, 16, 0),
+        datetime(2018, 12, 31, 16, 0),
+    )
+    delisting_flows = [f for f in flows if f.flow_type == "delisting_cash_proceeds"]
+    assert len(delisting_flows) == 1
+    assert delisting_flows[0].amount == Decimal("12.50")
+    assert delisting_flows[0].dt == datetime(2018, 6, 30, 16, 0)
+
+
+def test_get_cash_flows_excludes_delisting_cash_when_lastpricedate_outside_range(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    flows = adapter.get_cash_flows(
+        AssetId(400),
+        datetime(2017, 1, 1, 16, 0),
+        datetime(2017, 12, 31, 16, 0),
+    )
+    delisting_flows = [f for f in flows if f.flow_type == "delisting_cash_proceeds"]
+    assert delisting_flows == []
+
+
+def test_get_cash_flows_sort_ordinal_dividend_before_delisting_same_dt(
+    tmp_path: Path,
+) -> None:
+    """Per ADR 0003 dec 13: dividends apply at T (ex-date); delisting
+    cash credits at open of T+1. Same-day grouping puts dividends BEFORE
+    delisting cash so the explicit ordinal
+    (cash_dividend=0, spinoff=1, delisting=2) survives even when v1.1
+    adds new flow types that would break alphabetical tiebreaks.
+
+    This test builds an inline bundle with DLST having a dividend AND
+    a delisting on the same date.
+    """
+    import hashlib
+
+    snapshots_root = tmp_path / "snapshots"
+    bundle_dir = snapshots_root / "sharadar_sortord"
+    bundle_dir.mkdir(parents=True)
+
+    sep_rows = [
+        {
+            "ticker": "X", "date": date(2020, 6, 30),
+            "open": 5.0, "high": 5.5, "low": 4.8, "close": 5.0,
+            "closeunadj": 5.0, "volume": 1000,
+        },
+    ]
+    actions_rows = [
+        {"ticker": "X", "date": date(2020, 6, 30), "action": "dividend", "value": 0.25},
+    ]
+    tickers_rows = [
+        {
+            "permaticker": 999,
+            "ticker": "X",
+            "name": "Coincident Delisting Co",
+            "exchange": "NASDAQ",
+            "isdelisted": "Y",
+            "firstpricedate": date(2010, 1, 4),
+            "lastpricedate": date(2020, 6, 30),
+            "firstquarter": date(2010, 3, 31),
+            "lastquarter": date(2020, 6, 30),
+            "cusip": "X00000001",
+        },
+    ]
+    for table_name, rows in (
+        ("sep", sep_rows), ("actions", actions_rows), ("tickers", tickers_rows)
+    ):
+        path = bundle_dir / f"{table_name}.parquet"
+        pl.DataFrame(rows).write_parquet(path)
+
+    sep_sha = hashlib.sha256((bundle_dir / "sep.parquet").read_bytes()).hexdigest()
+    actions_sha = hashlib.sha256((bundle_dir / "actions.parquet").read_bytes()).hexdigest()
+    tickers_sha = hashlib.sha256((bundle_dir / "tickers.parquet").read_bytes()).hexdigest()
+    manifest = f"""
+[snapshots.sharadar_sortord]
+source = "sharadar"
+pull_date = 2026-05-30
+
+[snapshots.sharadar_sortord.files]
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = 1 }}
+"actions.parquet" = {{ sha256 = "{actions_sha}", size_bytes = {(bundle_dir / "actions.parquet").stat().st_size}, row_count = 1 }}
+"tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {(bundle_dir / "tickers.parquet").stat().st_size}, row_count = 1 }}
+"""
+    (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
+    adapter = SharadarDataSource("sharadar_sortord", snapshots_root)
+
+    flows = adapter.get_cash_flows(
+        AssetId(999),
+        datetime(2020, 6, 30, 16, 0),
+        datetime(2020, 6, 30, 16, 0),
+    )
+    assert len(flows) == 2
+    # cash_dividend (ordinal 0) before delisting_cash_proceeds (ordinal 2)
+    assert flows[0].flow_type == "cash_dividend"
+    assert flows[1].flow_type == "delisting_cash_proceeds"
+
+
+# ----- get_delisting tests -----
+
+def test_get_delisting_happy_path_returns_cash_flow_with_closeunadj_amount(
+    tmp_path: Path,
+) -> None:
+    """AssetId(400) (DLST, lastpricedate=2018-06-30, closeunadj=12.50)
+    returns CashFlow(flow_type="delisting_cash_proceeds", amount=12.50,
+    dt=2018-06-30 16:00).
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    result = adapter.get_delisting(AssetId(400))
+    assert isinstance(result, CashFlow)
+    assert result.flow_type == "delisting_cash_proceeds"
+    assert result.amount == Decimal("12.50")
+    assert result.dt == datetime(2018, 6, 30, 16, 0)
+
+
+def test_get_delisting_active_asset_returns_none(tmp_path: Path) -> None:
+    """SPY (AssetId(100)) is still active (isdelisted='N', lastpricedate=None)."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    assert adapter.get_delisting(AssetId(100)) is None
+
+
+def test_get_delisting_unknown_asset_raises_ticker_not_found(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with pytest.raises(TickerNotFoundError):
+        adapter.get_delisting(AssetId(999))
+
+
+def test_get_delisting_missing_sep_row_raises_delisting_data_quality_error(
+    tmp_path: Path,
+) -> None:
+    """A delisted asset whose lastpricedate has no SEP row triggers
+    DelistingDataQualityError per the documented vendor-data-quality
+    bug contract.
+    """
+    import hashlib
+
+    snapshots_root = tmp_path / "snapshots"
+    bundle_dir = snapshots_root / "sharadar_dqissue"
+    bundle_dir.mkdir(parents=True)
+
+    sep_rows: list[dict[str, object]] = []  # No SEP rows at all.
+    tickers_rows = [
+        {
+            "permaticker": 500,
+            "ticker": "MISSING",
+            "name": "Missing Bar Co",
+            "exchange": "NASDAQ",
+            "isdelisted": "Y",
+            "firstpricedate": date(2010, 1, 4),
+            "lastpricedate": date(2015, 5, 15),
+            "firstquarter": date(2010, 3, 31),
+            "lastquarter": date(2015, 6, 30),
+            "cusip": "M00000001",
+        },
+    ]
+    # Empty parquet with the right schema; Polars needs the schema for an
+    # empty frame to round-trip via parquet.
+    sep_df = pl.DataFrame(
+        sep_rows,
+        schema={
+            "ticker": pl.String, "date": pl.Date,
+            "open": pl.Float64, "high": pl.Float64, "low": pl.Float64,
+            "close": pl.Float64, "closeunadj": pl.Float64, "volume": pl.Int64,
+        },
+    )
+    sep_df.write_parquet(bundle_dir / "sep.parquet")
+    pl.DataFrame(tickers_rows).write_parquet(bundle_dir / "tickers.parquet")
+
+    sep_sha = hashlib.sha256((bundle_dir / "sep.parquet").read_bytes()).hexdigest()
+    tickers_sha = hashlib.sha256((bundle_dir / "tickers.parquet").read_bytes()).hexdigest()
+    manifest = f"""
+[snapshots.sharadar_dqissue]
+source = "sharadar"
+pull_date = 2026-05-30
+
+[snapshots.sharadar_dqissue.files]
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = 0 }}
+"tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {(bundle_dir / "tickers.parquet").stat().st_size}, row_count = 1 }}
+"""
+    (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
+    adapter = SharadarDataSource("sharadar_dqissue", snapshots_root)
+
+    with pytest.raises(DelistingDataQualityError) as exc_info:
+        adapter.get_delisting(AssetId(500))
+    message = str(exc_info.value)
+    assert "MISSING" in message
+    assert "2015-05-15" in message
+
+
+def test_get_delisting_decimal_precision_on_non_clean_closeunadj(
+    tmp_path: Path,
+) -> None:
+    """Decimal precision regression: closeunadj=517.51 round-trips via
+    `to_boundary_decimal(repr(...))` to Decimal("517.51"), NOT the
+    float64 binary expansion (Plan-reviewer High 5 pattern).
+    """
+    import hashlib
+
+    snapshots_root = tmp_path / "snapshots"
+    bundle_dir = snapshots_root / "sharadar_precdelisting"
+    bundle_dir.mkdir(parents=True)
+
+    sep_rows = [
+        {
+            "ticker": "PR",
+            "date": date(2018, 6, 30),
+            "open": 517.00, "high": 518.00, "low": 516.50,
+            "close": 517.51, "closeunadj": 517.51,
+            "volume": 1000,
+        },
+    ]
+    tickers_rows = [
+        {
+            "permaticker": 600,
+            "ticker": "PR",
+            "name": "Precision Co",
+            "exchange": "NASDAQ",
+            "isdelisted": "Y",
+            "firstpricedate": date(2010, 1, 4),
+            "lastpricedate": date(2018, 6, 30),
+            "firstquarter": date(2010, 3, 31),
+            "lastquarter": date(2018, 6, 30),
+            "cusip": "PR0000001",
+        },
+    ]
+    pl.DataFrame(sep_rows).write_parquet(bundle_dir / "sep.parquet")
+    pl.DataFrame(tickers_rows).write_parquet(bundle_dir / "tickers.parquet")
+
+    sep_sha = hashlib.sha256((bundle_dir / "sep.parquet").read_bytes()).hexdigest()
+    tickers_sha = hashlib.sha256((bundle_dir / "tickers.parquet").read_bytes()).hexdigest()
+    manifest = f"""
+[snapshots.sharadar_precdelisting]
+source = "sharadar"
+pull_date = 2026-05-30
+
+[snapshots.sharadar_precdelisting.files]
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = 1 }}
+"tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {(bundle_dir / "tickers.parquet").stat().st_size}, row_count = 1 }}
+"""
+    (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
+    adapter = SharadarDataSource("sharadar_precdelisting", snapshots_root)
+
+    result = adapter.get_delisting(AssetId(600))
+    assert isinstance(result, CashFlow)
+    assert result.amount == Decimal("517.51")
+    # Binary-expansion path would NOT equal the dec literal.
+    assert result.amount != Decimal(517.51)
+
+
+# ----- read_actions general reader tests -----
+
+def test_read_actions_default_returns_all_codes(tmp_path: Path) -> None:
+    """No action_filter means all action codes pass through."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_actions(ticker="SPY")
+    actions_seen = set(df["action"].to_list())
+    assert "dividend" in actions_seen
+    assert "split" in actions_seen
+    assert "spinoff" in actions_seen
+    assert "transfer" in actions_seen
+    assert "fictitious_action" in actions_seen
+
+
+def test_read_actions_action_filter_drops_non_matching_rows(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_actions(
+        ticker="SPY", action_filter=frozenset({"dividend"})
+    )
+    assert set(df["action"].to_list()) == {"dividend"}
+
+
+def test_read_actions_date_range_filter_applies(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_actions(
+        ticker="SPY",
+        start_dt=date(2024, 3, 1),
+        end_dt=date(2024, 3, 31),
+    )
+    # Only the 2024-03-15 dividend + split are in the range.
+    assert df.height == 2
+    assert set(df["action"].to_list()) == {"dividend", "split"}
+
+
+# ----- Resolver predicate test (moved to test_resolver.py would be better
+# but kept here for proximity to the consumer).
+
+def test_resolver_contains_returns_true_for_indexed_and_false_otherwise(
+    tmp_path: Path,
+) -> None:
+    """Plan-reviewer ratified: public predicate to avoid private-field touch."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    assert adapter._resolver.contains(AssetId(100)) is True
+    assert adapter._resolver.contains(AssetId(400)) is True
+    assert adapter._resolver.contains(AssetId(999)) is False

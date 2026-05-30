@@ -107,6 +107,16 @@ class SharadarPermatickerResolver:
         tickers_lf = source.get_table("tickers")
         self._build_indexes(tickers_lf)
 
+    def contains(self, asset_id: AssetId) -> bool:
+        """Return True if asset_id is in the resolver index.
+
+        Public predicate added in M3 PR 3 so consumers (e.g.,
+        `SharadarDataSource.get_delisting`) avoid touching the private
+        `_permaticker_history` dict. Single source of truth for "is this
+        asset known to the resolver".
+        """
+        return asset_id in self._permaticker_history
+
     @classmethod
     def from_lazy_frame(
         cls, tickers_lf: pl.LazyFrame

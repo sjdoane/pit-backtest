@@ -32,15 +32,22 @@ alongside SharadarSP500Universe + the IsMemberAt demo).
 
 from __future__ import annotations
 
-from datetime import date, datetime
+import logging
+from datetime import date, datetime, time
 from decimal import Decimal
 from functools import cached_property
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import polars as pl
 
-from pit_backtest.data.records import AssetId, CashFlow, CorporateAction
+from pit_backtest.data.records import (
+    AssetId,
+    CashFlow,
+    CashFlowType,
+    CorporateAction,
+    SplitAction,
+)
 from pit_backtest.data.resolver import (
     SharadarPermatickerResolver,
     TickerNotFoundError,
@@ -52,6 +59,9 @@ from pit_backtest.data.sources.manifest import (
     verify_bundle,
 )
 from pit_backtest.execution.cost.impact import to_boundary_decimal
+
+
+_LOG = logging.getLogger(__name__)
 
 
 # Sharadar SEP column schema (subset used at M1). The vendor publishes lowercase
@@ -110,6 +120,165 @@ def _normalize_pit_dimension(dimension: str) -> str:
 _SEP_PRICE_FIELDS: frozenset[str] = frozenset(
     {"open", "high", "low", "close", "volume"}
 )
+
+
+# ----- M3 PR 3: Sharadar ACTIONS dispatch (corporate actions + cash flows) -----
+#
+# Discriminated-union dispatch from Sharadar's ACTIONS string column to the
+# typed records in `data.records` per ADR 0003 decision 2 (CashFlow split
+# from CorporateAction as two streams) and ADR 0001 decision 8 (v1 covers
+# splits, cash dividends, delistings with cash proceeds, spin-offs as cash
+# equivalent).
+#
+# Enumeration source: Sharadar's documented ACTIONS action codes per the
+# vendor schema. Real bundles in this repo (verified against
+# data/snapshots/sharadar_2026-05-29/actions.parquet on 2026-05-30) carry
+# at minimum `dividend`, `listed`, `initiated`; broader pulls include
+# `split`, `spinoff`, `delisted`, `transfer`, `tradinghaltresumed`,
+# `acquisitionbystock`, `acquisitionbycash`, `acquisitionunknown`,
+# `bankruptcyliquidation`, `bankruptcyreorganization`.
+#
+# Dispatch policy:
+# - `_SHARADAR_DISPATCHED_ACTIONS`: v1 portfolio-impacting events that
+#   produce SplitAction or CashFlow records.
+# - `_SHARADAR_SKIPPED_ACTIONS`: announce-only (`listed`, `initiated`,
+#   `delisted`, `tradinghaltresumed`) plus events handled via the TICKERS
+#   -derived delisting path (`acquisitionby*`, `bankruptcy*`, `transfer`).
+#   Per ADR 0002 decision 16, cash + stock acquisitions and Chapter 11
+#   reorganizations are routed through `get_delisting` (which reads SEP
+#   `closeunadj` at `lastpricedate` per `docs/methodology/dataset_versioning.md:25`
+#   as the cash-flow source-of-truth), not through this ACTIONS dispatch.
+# - Anything else: log a warning and skip. Vendor adding a new code mid-2027
+#   must NOT crash existing backtests; the warning gives operators
+#   visibility, and the dispatch table can be extended in a follow-up.
+_SHARADAR_DISPATCHED_ACTIONS: frozenset[str] = frozenset(
+    {"dividend", "split", "spinoff"}
+)
+
+_SHARADAR_SKIPPED_ACTIONS: frozenset[str] = frozenset(
+    {
+        # Announce-only (not portfolio-impacting at v1):
+        "listed",
+        "initiated",
+        "delisted",
+        "transfer",
+        "tradinghaltresumed",
+        # Routed via TICKERS-derived delisting path per ADR 0002 dec 16:
+        "acquisitionbystock",
+        "acquisitionbycash",
+        "acquisitionunknown",
+        "bankruptcyliquidation",
+        "bankruptcyreorganization",
+    }
+)
+
+# Explicit ordinal for CashFlow sort within `get_cash_flows` so a v1.1
+# addition (e.g., `borrow_fee`) does not silently reorder via alphabetical
+# tie-breaking. Per ADR 0003 decision 13 the engine applies dividends at
+# ex-date and delisting cash at the open of T+1; same-day sorting puts
+# dividends BEFORE delisting cash so the bar at T includes the dividend
+# and the delisting cash hits the next bar in BarLoop's flow application.
+_CASH_FLOW_SORT_ORDINAL: dict[CashFlowType, int] = {
+    "cash_dividend": 0,
+    "spinoff_cash_equivalent": 1,
+    "delisting_cash_proceeds": 2,
+}
+
+
+def _row_date_to_datetime(row_date: date) -> datetime:
+    """Promote a Sharadar row's `date` column value to `datetime`.
+
+    Per ADR 0002 decision 11 every Sharadar date is interpreted as the
+    end-of-day America/New_York close (16:00 ET). Since the engine's
+    timezone convention is naive-datetimes-treated-as-ET throughout
+    (`docs/methodology/determinism.md` + `execution.cost.impact._et_date`),
+    no tzinfo is attached. The promotion ensures `SplitAction.ex_date`
+    and `CashFlow.dt` (both typed `datetime` per `data/records.py`)
+    receive consistent values from the cast-before-filter ACTIONS reader.
+    """
+    return datetime.combine(row_date, time(16, 0))
+
+
+def _dispatch_action_row(
+    row: dict[str, Any], asset_id: AssetId
+) -> CashFlow | SplitAction | None:
+    """Discriminated dispatch from a Sharadar ACTIONS row to a typed record.
+
+    Returns:
+      - `CashFlow` for `dividend` (cash_dividend) and `spinoff`
+        (spinoff_cash_equivalent; bias note per ADR 0002 decision 14
+        cites Cusatis-Miles-Woolridge 1993 and McConnell-Ovtchinnikov
+        2004; v1 ships the cash-equivalent approximation and v1.1 will
+        ship share-distribution semantics).
+      - `SplitAction` for `split`. `ratio=2.0` is a 2-for-1 forward split;
+        `ratio=0.5` is a 1-for-2 reverse split per `data/records.py:74-86`.
+      - `None` for skipped action codes (announce-only or TICKERS-routed
+        per ADR 0002 dec 16).
+
+    For unknown action codes the helper LOGS A WARNING and returns None
+    (does NOT raise). This preserves backward compatibility against
+    vendor schema additions; operators see the warning and can extend
+    the dispatch tables in a follow-up. The strict-raise alternative
+    was rejected per Plan-reviewer's Counter on Choice 1 (a vendor-
+    added code should not crash production backtests).
+    """
+    action: str = row["action"]
+    if action in _SHARADAR_DISPATCHED_ACTIONS:
+        dt = _row_date_to_datetime(row["date"])
+        amount_or_ratio = to_boundary_decimal(float(row["value"]))
+        if action == "dividend":
+            return CashFlow(
+                asset_id=asset_id,
+                dt=dt,
+                flow_type="cash_dividend",
+                amount=amount_or_ratio,
+            )
+        if action == "split":
+            return SplitAction(asset_id=asset_id, ex_date=dt, ratio=amount_or_ratio)
+        # action == "spinoff" by elimination
+        return CashFlow(
+            asset_id=asset_id,
+            dt=dt,
+            flow_type="spinoff_cash_equivalent",
+            amount=amount_or_ratio,
+        )
+    if action in _SHARADAR_SKIPPED_ACTIONS:
+        return None
+    _LOG.warning(
+        "Sharadar ACTIONS row has unknown action %r (asset_id=%d, date=%s); "
+        "skipping. Extend _SHARADAR_DISPATCHED_ACTIONS or "
+        "_SHARADAR_SKIPPED_ACTIONS in pit_backtest.data.sources.sharadar "
+        "to dispatch or document this code explicitly.",
+        action,
+        int(asset_id),
+        row["date"],
+    )
+    return None
+
+
+class DelistingDataQualityError(ValueError):
+    """Raised when a TICKERS-reported delisting lacks a recoverable SEP price.
+
+    Per ADR 0002 decision 16 the v1 delisting cash proceeds come from
+    SEP `closeunadj` at `lastpricedate` (per
+    `docs/methodology/dataset_versioning.md:25` as the cash-flow
+    reconstruction source-of-truth). Two failure modes are vendor data
+    quality bugs that we refuse to silently substitute:
+
+    1. TICKERS reports `isdelisted=='Y'` AND `lastpricedate is not None`
+       but the SEP table has no row at that date for the resolved ticker.
+    2. SEP has a row at `lastpricedate` but the `closeunadj` cell is
+       NULL. Ambiguous between Chapter-11-at-zero and a missing-data
+       bug; refuse rather than guess.
+
+    Note on Chapter 11: ADR 0002 decision 16 commits the v1 baseline
+    "Chapter 11 reorgs treated as a delisting at zero with a documented
+    bias note". The closeunadj-at-lastpricedate path captures the actual
+    last-traded price for bankruptcy-route delistings, which typically
+    overstates the realized proceeds (the bias). Operators who need the
+    explicit-zero baseline can dispatch off the `bankruptcyreorganization`
+    ACTIONS code in v1.1; v1 ships the SEP-based approximation.
+    """
 
 
 class PriceNotFoundError(KeyError):
@@ -294,6 +463,56 @@ class SharadarDataSource(PitDataSource):
             pl.col("date").alias("ex_date"),
             pl.col("value").cast(pl.Float64).alias("amount_per_share"),
         ).sort("ex_date").collect()
+
+        return df
+
+    def read_actions(
+        self,
+        *,
+        ticker: str | None = None,
+        start_dt: date | datetime | None = None,
+        end_dt: date | datetime | None = None,
+        action_filter: frozenset[str] | None = None,
+    ) -> pl.DataFrame:
+        """M3 PR 3: general ACTIONS reader (corp events + cash flows).
+
+        Generalizes the M1 `read_actions_dividends` so the per-row
+        PitDataSource methods (`get_corporate_actions`, `get_cash_flows`)
+        can dispatch over the full Sharadar action set rather than the
+        dividend subset. The M1 reader stays for backward compatibility
+        with the SPY TR reconstruction demo.
+
+        Args:
+          ticker: optional ticker filter.
+          start_dt: lower bound on ACTIONS `date` (inclusive).
+          end_dt: upper bound on ACTIONS `date` (inclusive).
+          action_filter: optional allowlist of action codes; rows whose
+            `action` is not in this set are dropped at the reader.
+            When None, all action codes pass through.
+
+        Returns a Polars frame with columns: ticker, date, action, value.
+        Cast-before-filter on `date` per project rule 12 (the M1 hotfix
+        contract; see `read_sep_prices` for the full rationale).
+        Sorted by (ticker, date, action) for determinism.
+        """
+        lf = self.get_table("actions").with_columns(
+            pl.col("date").cast(pl.Date)
+        )
+        if ticker is not None:
+            lf = lf.filter(pl.col("ticker") == ticker)
+        if start_dt is not None:
+            lf = lf.filter(pl.col("date") >= _to_date(start_dt))
+        if end_dt is not None:
+            lf = lf.filter(pl.col("date") <= _to_date(end_dt))
+        if action_filter is not None:
+            lf = lf.filter(pl.col("action").is_in(list(action_filter)))
+
+        df = lf.select(
+            pl.col("ticker"),
+            pl.col("date"),
+            pl.col("action"),
+            pl.col("value").cast(pl.Float64),
+        ).sort(["ticker", "date", "action"]).collect()
 
         return df
 
@@ -552,12 +771,85 @@ class SharadarDataSource(PitDataSource):
     def get_corporate_actions(
         self, asset_id: AssetId, start_dt: datetime, end_dt: datetime
     ) -> list[CorporateAction]:
-        raise NotImplementedError("M3 deliverable")
+        """Per-row ACTIONS read returning v1 corporate actions in range.
+
+        At v1 the only `CorporateAction` v1 produces from Sharadar is
+        `SplitAction` (per ADR 0001 dec 8 + ADR 0002 dec 16). Cash
+        dividends and spinoff-as-cash flow through `get_cash_flows`;
+        stock-for-stock acquisitions are cash-equivalent at v1 per
+        ADR 0002 dec 16 (they route through `get_delisting`).
+
+        For symmetry with the Protocol return type the implementation
+        also checks `get_delisting` for a `CorporateAction` result and
+        includes it when `ex_date` falls in `[start_dt, end_dt]`. At v1
+        this arm is unreachable (the v1 delisting path always returns
+        `CashFlow`); v1.1's `DelistingStockAcquisitionAction` dispatch
+        will activate this branch without contract churn.
+
+        Range semantics: `[start_dt, end_dt]` inclusive on both ends.
+        Sorted by `ex_date` ascending (Determinism Requirement 3).
+        """
+        ticker = self._resolver.get_ticker(asset_id, start_dt)
+        # NO action_filter at the reader: unknown codes must reach
+        # _dispatch_action_row so the WARN-and-skip path surfaces vendor
+        # schema additions (Plan-reviewer Counter on Choice 1). A filter
+        # at this level would silently lose visibility into new codes.
+        df = self.read_actions(
+            ticker=ticker, start_dt=start_dt, end_dt=end_dt
+        )
+        actions: list[CorporateAction] = []
+        for row in df.iter_rows(named=True):
+            dispatched = _dispatch_action_row(row, asset_id)
+            if isinstance(dispatched, SplitAction):
+                actions.append(dispatched)
+        # Symmetric stock-acquisition arm; unreachable at v1, primed for v1.1.
+        delisting = self.get_delisting(asset_id)
+        if (
+            delisting is not None
+            and not isinstance(delisting, CashFlow)
+            and _to_date(start_dt) <= delisting.ex_date.date() <= _to_date(end_dt)
+        ):
+            actions.append(delisting)
+        return sorted(actions, key=lambda a: a.ex_date)
 
     def get_cash_flows(
         self, asset_id: AssetId, start_dt: datetime, end_dt: datetime
     ) -> list[CashFlow]:
-        raise NotImplementedError("M3 deliverable (needs IdentifierResolver)")
+        """Per-row ACTIONS read returning v1 cash flows in range.
+
+        Dispatches dividend (-> cash_dividend CashFlow) and spinoff
+        (-> spinoff_cash_equivalent CashFlow with the CMW1993 + MO2004
+        bias note per ADR 0002 dec 14). The TICKERS-derived delisting
+        record is appended when `lastpricedate in [start_dt, end_dt]`.
+
+        Range semantics: `[start_dt, end_dt]` inclusive on both ends.
+        Sorted by `(dt, _CASH_FLOW_SORT_ORDINAL[flow_type])`. The
+        explicit ordinal (cash_dividend < spinoff_cash_equivalent <
+        delisting_cash_proceeds) honors ADR 0003 decision 13's "dividends
+        applied at ex-date T, delisting cash credits open of T+1"
+        ordering even when the engine groups same-day flows.
+        """
+        ticker = self._resolver.get_ticker(asset_id, start_dt)
+        # NO action_filter at the reader: unknown codes must reach
+        # _dispatch_action_row so the WARN-and-skip path surfaces vendor
+        # schema additions (Plan-reviewer Counter on Choice 1). A filter
+        # at this level would silently lose visibility into new codes.
+        df = self.read_actions(
+            ticker=ticker, start_dt=start_dt, end_dt=end_dt
+        )
+        flows: list[CashFlow] = []
+        for row in df.iter_rows(named=True):
+            dispatched = _dispatch_action_row(row, asset_id)
+            if isinstance(dispatched, CashFlow):
+                flows.append(dispatched)
+        delisting = self.get_delisting(asset_id)
+        if isinstance(delisting, CashFlow):
+            if _to_date(start_dt) <= delisting.dt.date() <= _to_date(end_dt):
+                flows.append(delisting)
+        return sorted(
+            flows,
+            key=lambda f: (f.dt, _CASH_FLOW_SORT_ORDINAL[f.flow_type]),
+        )
 
     def members_at(self, universe_id: str, dt: datetime) -> list[AssetId]:
         raise NotImplementedError("M3 deliverable")
@@ -565,7 +857,92 @@ class SharadarDataSource(PitDataSource):
     def get_delisting(
         self, asset_id: AssetId
     ) -> CashFlow | CorporateAction | None:
-        raise NotImplementedError("M3 deliverable")
+        """TICKERS-derived delisting record per ADR 0002 decision 16.
+
+        Returns:
+          - `CashFlow(flow_type="delisting_cash_proceeds")` when TICKERS
+            reports `isdelisted=='Y'` and `lastpricedate is not None`,
+            with `amount = closeunadj at lastpricedate` per
+            `docs/methodology/dataset_versioning.md:25` (the v1
+            cash-flow reconstruction source-of-truth).
+          - `None` when the asset is still active (`isdelisted=='N'` or
+            `lastpricedate is None`).
+
+        At v1 stock-for-stock acquisitions are routed through this path
+        as cash-equivalent at the announced deal price (which Sharadar
+        records as the SEP `closeunadj` at `lastpricedate`); the
+        explicit `DelistingStockAcquisitionAction` shape is deferred to
+        v1.1 per ADR 0002 dec 16.
+
+        Raises:
+          - `TickerNotFoundError` when `asset_id` is not in the resolver
+            index (no TICKERS rows for the permaticker at all).
+          - `DelistingDataQualityError` when TICKERS says delisted but
+            SEP has no row at `lastpricedate`, or SEP has the row but
+            `closeunadj` is NULL. Both are vendor data-quality bugs;
+            refuse to silently substitute.
+          - `ValueError` when SEP returns multiple rows for
+            (ticker, lastpricedate); vendor uniqueness invariant
+            violated.
+        """
+        if not self._resolver.contains(asset_id):
+            raise TickerNotFoundError(
+                f"asset_id {int(asset_id)} not in resolver index"
+            )
+        tickers_df = self.read_tickers(permaticker=int(asset_id))
+        if tickers_df.height == 0:
+            raise TickerNotFoundError(
+                f"asset_id {int(asset_id)} has no TICKERS row"
+            )
+        # Multi-row case: an asset with ticker history has multiple rows.
+        # Sort lastpricedate ascending with NULLS LAST (still-active rows
+        # last); the final row carries the canonical delisting metadata.
+        last_row = (
+            tickers_df.sort(
+                ["lastpricedate"], descending=False, nulls_last=True
+            )
+            .tail(1)
+            .row(0, named=True)
+        )
+        if last_row["isdelisted"] != "Y" or last_row["lastpricedate"] is None:
+            return None
+        lastpricedate = last_row["lastpricedate"]
+        ticker = last_row["ticker"]
+        sep_df = (
+            self.get_table("sep")
+            .with_columns(pl.col("date").cast(pl.Date))
+            .filter(pl.col("ticker") == ticker)
+            .filter(pl.col("date") == lastpricedate)
+            .collect()
+        )
+        if sep_df.height == 0:
+            raise DelistingDataQualityError(
+                f"asset_id {int(asset_id)} (ticker={ticker!r}) delisted on "
+                f"{lastpricedate.isoformat()} per TICKERS but SEP has no row "
+                f"at that date; vendor data-quality bug, refuse to silently "
+                f"substitute the previous trading-day close."
+            )
+        if sep_df.height > 1:
+            raise ValueError(
+                f"SEP returned {sep_df.height} rows for ticker={ticker!r} at "
+                f"{lastpricedate.isoformat()}; expected exactly 1. Vendor "
+                f"data-quality bug; refuse to silently pick one."
+            )
+        closeunadj = sep_df["closeunadj"][0]
+        if closeunadj is None:
+            raise DelistingDataQualityError(
+                f"asset_id {int(asset_id)} (ticker={ticker!r}) delisted on "
+                f"{lastpricedate.isoformat()} has NULL closeunadj; ambiguous "
+                f"between Chapter-11-at-zero (v1.1 dispatch) and vendor bug; "
+                f"refuse to silently substitute zero."
+            )
+        amount = to_boundary_decimal(float(closeunadj))
+        return CashFlow(
+            asset_id=asset_id,
+            dt=_row_date_to_datetime(lastpricedate),
+            flow_type="delisting_cash_proceeds",
+            amount=amount,
+        )
 
 
 def _to_date(value: date | datetime) -> date:
