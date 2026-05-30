@@ -293,6 +293,28 @@ def test_null_firstpricedate_rows_excluded_from_index() -> None:
     assert resolver.resolve_ticker("SPY", datetime(2015, 1, 1, 16, 0)) == AssetId(100)
 
 
+def test_contains_returns_true_for_indexed_permaticker_and_false_otherwise() -> None:
+    """Per M3 PR 3 Plan-reviewer: public predicate to avoid private-field touch."""
+    lf = _tickers_lf([
+        {
+            "permaticker": 100,
+            "ticker": "SPY",
+            "firstpricedate": date(2010, 1, 1),
+            "lastpricedate": None,
+        },
+        {
+            "permaticker": 200,
+            "ticker": "AGG",
+            "firstpricedate": date(2003, 9, 22),
+            "lastpricedate": None,
+        },
+    ])
+    resolver = SharadarPermatickerResolver.from_lazy_frame(lf)
+    assert resolver.contains(AssetId(100)) is True
+    assert resolver.contains(AssetId(200)) is True
+    assert resolver.contains(AssetId(999)) is False
+
+
 def test_repr_surfaces_index_sizes_for_diagnostics() -> None:
     lf = _tickers_lf([
         {
