@@ -16,28 +16,42 @@ M1 day 1 scope:
   return Polars frames keyed by ticker (string), bypassing the full
   AssetId resolution which lands in M3 with the TICKERS adapter.
 - get_table is the forward-compatibility seam from ADR 0003 decision 9.
-- The per-row PitDataSource methods (get_price, get_cash_flows,
-  get_fundamental, members_at, get_delisting) remain NotImplementedError;
-  M3 wires them when IdentifierResolver and the data quality contracts
-  land.
+
+M3 PR 1 (#24): read_tickers + read_sf1_arq low-level PIT readers shipped.
+M3 PR 2 (this PR): per-row get_price + get_fundamental shipped. Both
+consume the lazy `_resolver` cached_property to translate AssetId to
+ticker; get_price returns Decimal at the locked boundary precision;
+get_fundamental applies the PIT gate `datekey <= available_dt` as the
+structural lookahead protection.
+
+Still NotImplementedError as of M3 PR 2: get_corporate_actions and
+get_cash_flows (PR 3; discriminated-union dispatch over splits +
+dividends + delistings + spinoffs); members_at and get_delisting (PR 4;
+alongside SharadarSP500Universe + the IsMemberAt demo).
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from functools import cached_property
 from pathlib import Path
 from typing import Literal
 
 import polars as pl
 
 from pit_backtest.data.records import AssetId, CashFlow, CorporateAction
+from pit_backtest.data.resolver import (
+    SharadarPermatickerResolver,
+    TickerNotFoundError,
+)
 from pit_backtest.data.sources.base import PitDataSource
 from pit_backtest.data.sources.manifest import (
     SnapshotBundleEntry,
     load_manifest,
     verify_bundle,
 )
+from pit_backtest.execution.cost.impact import to_boundary_decimal
 
 
 # Sharadar SEP column schema (subset used at M1). The vendor publishes lowercase
@@ -68,6 +82,50 @@ _TABLE_FILENAMES = {
 _PIT_SF1_DIMENSIONS: frozenset[str] = frozenset({"ARQ", "ART", "ARY"})
 
 
+def _normalize_pit_dimension(dimension: str) -> str:
+    """Uppercase + PIT membership check (Plan-reviewer Low 10 on M3 PR 2).
+
+    Single source of truth so `read_sf1_arq` and `get_fundamental` share
+    the same validation. Returns the normalized uppercase dimension.
+
+    Raises:
+        ValueError: when the normalized dimension is not in
+            `_PIT_SF1_DIMENSIONS`. Sharadar's restated counterparts
+            MRQ / MRT / MRY are rejected here.
+    """
+    dimension_norm = dimension.upper()
+    if dimension_norm not in _PIT_SF1_DIMENSIONS:
+        raise ValueError(
+            f"SF1 dimension {dimension!r} is not PIT; accepted: "
+            f"{sorted(_PIT_SF1_DIMENSIONS)}. "
+            f"Restated dimensions (MRQ / MRT / MRY) are rejected at load "
+            f"per docs/methodology/dataset_versioning.md."
+        )
+    return dimension_norm
+
+
+# SEP price fields the engine reads. Mirrors the Literal in the
+# PitDataSource Protocol. Per Plan-reviewer Medium 9 a defensive runtime
+# check in get_price guards against `cast(PriceField, untrusted)` misuse.
+_SEP_PRICE_FIELDS: frozenset[str] = frozenset(
+    {"open", "high", "low", "close", "volume"}
+)
+
+
+class PriceNotFoundError(KeyError):
+    """Raised when get_price has no SEP row at the requested (asset, dt).
+
+    Per Plan-reviewer Low 11 on M3 PR 2 placed directly above the
+    SharadarDataSource class for grep-ability. Symmetric with
+    TickerNotFoundError; inherits from KeyError so a caller that broad-
+    catches `KeyError` will catch both. Canonical failure modes:
+    weekend / holiday, pre-IPO, post-delisting (when post-delisting also
+    falls outside the resolver's interval, TickerNotFoundError fires
+    first; PriceNotFoundError applies when the asset is in the resolver
+    index but the SEP table has no bar at the requested date).
+    """
+
+
 class SharadarDataSource(PitDataSource):
     """v1 implementation of PitDataSource backed by Sharadar parquet snapshots."""
 
@@ -87,6 +145,23 @@ class SharadarDataSource(PitDataSource):
     @property
     def bundle_entry(self) -> SnapshotBundleEntry:
         return self._manifest[self._bundle_name]
+
+    @cached_property
+    def _resolver(self) -> SharadarPermatickerResolver:
+        """Lazy-built permaticker resolver; constructed on first per-row call.
+
+        Per Plan-reviewer's Ratified Choice 1 on M3 PR 2: lazy via
+        `cached_property` so the M1 demos (`read_sep_prices`,
+        `read_actions_dividends`) that never touch per-row paths pay
+        nothing for the resolver. Users who call `get_price` or
+        `get_fundamental` pay the index build once (one pass over the
+        TICKERS LazyFrame, ~25k rows on real Sharadar) and amortize
+        across every subsequent per-row call. External callers who want
+        to share a resolver across data sources construct one themselves
+        via `SharadarPermatickerResolver(source)`; this cached property
+        exists only to make `get_price` / `get_fundamental` self-contained.
+        """
+        return SharadarPermatickerResolver(self)
 
     def get_table(self, table_name: str) -> pl.LazyFrame:
         """Return the LazyFrame for a named Sharadar table.
@@ -319,14 +394,7 @@ class SharadarDataSource(PitDataSource):
           ValueError: when dimension (after uppercase normalization) is
             not in _PIT_SF1_DIMENSIONS.
         """
-        dimension_norm = dimension.upper()
-        if dimension_norm not in _PIT_SF1_DIMENSIONS:
-            raise ValueError(
-                f"SF1 dimension {dimension!r} is not PIT; accepted: "
-                f"{sorted(_PIT_SF1_DIMENSIONS)}. "
-                f"Restated dimensions (MRQ / MRT / MRY) are rejected at load "
-                f"per docs/methodology/dataset_versioning.md."
-            )
+        dimension_norm = _normalize_pit_dimension(dimension)
 
         lf = self.get_table("sf1").with_columns(
             pl.col("calendardate").cast(pl.Date),
@@ -343,13 +411,14 @@ class SharadarDataSource(PitDataSource):
         df = lf.sort(["ticker", "datekey", "calendardate"]).collect()
         return df
 
-    # ----- Full PitDataSource protocol (M3 work) -----
-    # The per-row methods below require IdentifierResolver (M3 PR 1 above)
-    # and the corporate-action discriminated union dispatch (M3 PR 2). M1
-    # demos drive the data via the M1 convenience methods (read_sep_prices,
-    # read_actions_dividends). The M3 PR 1 additions (read_tickers,
-    # read_sf1_arq) are the low-level building blocks; get_fundamental and
-    # the other per-row methods wire in subsequent M3 PRs.
+    # ----- Per-row PitDataSource protocol -----
+    # M3 PR 2 shipped: get_price + get_fundamental real implementations
+    # consuming the lazy `_resolver` cached_property and the PR 1 readers.
+    # M3 PR 3+ remaining: get_corporate_actions + get_cash_flows
+    # (discriminated-union dispatch); members_at + get_delisting (alongside
+    # SharadarSP500Universe + IsMemberAt demo). M1 demos continue to drive
+    # the data via the M1 convenience methods (read_sep_prices,
+    # read_actions_dividends) which bypass the per-row path.
 
     def get_price(
         self,
@@ -357,7 +426,65 @@ class SharadarDataSource(PitDataSource):
         dt: datetime,
         field: Literal["open", "high", "low", "close", "volume"],
     ) -> Decimal:
-        raise NotImplementedError("M3 deliverable (needs IdentifierResolver)")
+        """Per-row SEP price read for the BarLoop's per-asset-per-bar dispatch.
+
+        Resolves asset_id -> ticker at dt via the lazy resolver, then reads
+        the SEP row at exact dt for the requested field. Returns Decimal at
+        the locked boundary precision per `pydantic_polars_boundary.md`.
+
+        Raises:
+            TickerNotFoundError: asset_id is not in the resolver index at
+                dt, or dt is outside the asset's
+                [firstpricedate, lastpricedate] interval (pre-IPO,
+                post-delisting).
+            PriceNotFoundError: asset_id is in the resolver index but the
+                SEP table has no bar at the requested date (weekend,
+                holiday, vendor gap), or the requested field is NULL on
+                the row.
+            ValueError: field is not in the SEP price field set
+                (defensive runtime guard against `cast(PriceField, ...)`
+                misuse; mypy strict catches static typos).
+            ValueError: SEP returned more than one row for the
+                (ticker, date) pair (vendor data-quality bug).
+        """
+        if field not in _SEP_PRICE_FIELDS:
+            raise ValueError(
+                f"SEP field {field!r} is not a price field; accepted: "
+                f"{sorted(_SEP_PRICE_FIELDS)}"
+            )
+        ticker = self._resolver.get_ticker(asset_id, dt)
+        lookup_date = _to_date(dt)
+        df = (
+            self.get_table("sep")
+            .with_columns(pl.col("date").cast(pl.Date))
+            .filter(pl.col("ticker") == ticker)
+            .filter(pl.col("date") == lookup_date)
+            .collect()
+        )
+        if df.height == 0:
+            raise PriceNotFoundError(
+                f"no SEP row for asset_id={int(asset_id)} ticker={ticker!r} "
+                f"at dt={lookup_date.isoformat()}"
+            )
+        if df.height > 1:
+            raise ValueError(
+                f"SEP returned {df.height} rows for asset_id={int(asset_id)} "
+                f"ticker={ticker!r} at dt={lookup_date.isoformat()}; "
+                f"expected exactly 1. Vendor data-quality bug; refuse to "
+                f"silently pick one."
+            )
+        value = df[field][0]
+        if value is None:
+            raise PriceNotFoundError(
+                f"SEP row for asset_id={int(asset_id)} ticker={ticker!r} "
+                f"at dt={lookup_date.isoformat()} has NULL {field!r}"
+            )
+        if field == "volume":
+            # Volume is Int64 in SEP. Decimal-from-int is exact at any
+            # magnitude (no float intermediate; no 2**53 ceiling per
+            # Plan-reviewer Medium 8). The cast asserts the runtime type.
+            return Decimal(int(value))
+        return to_boundary_decimal(float(value))
 
     def get_fundamental(
         self,
@@ -366,7 +493,61 @@ class SharadarDataSource(PitDataSource):
         field: str,
         flavor: Literal["ARQ", "ART", "ARY"],
     ) -> Decimal | None:
-        raise NotImplementedError("M3 deliverable")
+        """Per-row SF1 fundamental read with PIT discipline.
+
+        Returns the most recent SF1 row observable as of `available_dt`
+        (the strict PIT filter `datekey <= available_dt` enforces the
+        dual-timestamp contract; no leak possible). The
+        (datekey DESC, calendardate DESC) tiebreaker picks the more
+        current as-reported snapshot when two rows share datekey per
+        Plan-reviewer's Ratified Choice 3.
+
+        Returns None when:
+            - The asset has no SF1 row at this flavor whose datekey is
+              <= available_dt (pre-filing, or the asset is new and has
+              no history yet).
+            - The most recent observable row has NULL in the requested
+              field (vendor reported the row but did not populate the
+              field for this asset).
+
+        Raises:
+            TickerNotFoundError: asset_id is not in the resolver index
+                at available_dt.
+            ValueError: flavor (after uppercase normalization) is not in
+                `_PIT_SF1_DIMENSIONS` (rejects MRQ / MRT / MRY).
+            ValueError: field is not a column in the SF1 table.
+        """
+        flavor_norm = _normalize_pit_dimension(flavor)
+        ticker = self._resolver.get_ticker(asset_id, available_dt)
+        available_date = _to_date(available_dt)
+        lf = (
+            self.get_table("sf1")
+            .with_columns(
+                pl.col("calendardate").cast(pl.Date),
+                pl.col("datekey").cast(pl.Date),
+                pl.col("reportperiod").cast(pl.Date),
+            )
+            .filter(pl.col("ticker") == ticker)
+            .filter(pl.col("dimension") == flavor_norm)
+            .filter(pl.col("datekey") <= available_date)
+        )
+        available_columns = lf.collect_schema().names()
+        if field not in available_columns:
+            raise ValueError(
+                f"SF1 field {field!r} is not a column in the bundle's sf1 "
+                f"table; available columns: {sorted(available_columns)}"
+            )
+        df = (
+            lf.sort(["datekey", "calendardate"], descending=True)
+            .head(1)
+            .collect()
+        )
+        if df.height == 0:
+            return None
+        value = df[field][0]
+        if value is None:
+            return None
+        return to_boundary_decimal(float(value))
 
     def get_corporate_actions(
         self, asset_id: AssetId, start_dt: datetime, end_dt: datetime

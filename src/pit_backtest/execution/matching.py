@@ -44,7 +44,7 @@ from pit_backtest.execution.cost.commission import Commission
 from pit_backtest.execution.cost.commission import _BPS_TO_FRACTION_DIVISOR
 from pit_backtest.execution.cost.impact import (
     _et_date,
-    _to_boundary_decimal,
+    to_boundary_decimal,
 )
 from pit_backtest.execution.orders import Fill, FillPriceModel, Order
 
@@ -227,7 +227,7 @@ class SquareRootImpactMatchingEngine:
     - signed_perm = perm_bps / 10_000 * fill_price * sign(order.quantity)
       (uses fill_price not arrival per reviewer Medium #7 so OPEN/CLOSE/
       ARRIVAL agree on the dollar magnitude that hits the impact register)
-    - permanent_impact_per_share = _to_boundary_decimal(signed_perm)
+    - permanent_impact_per_share = to_boundary_decimal(signed_perm)
 
     Decimal boundary discipline per ADR 0009 Author response item 14:
     every float-to-Decimal conversion at the matcher boundary uses
@@ -348,7 +348,7 @@ class SquareRootImpactMatchingEngine:
             * sign
         )
         fill_price_float = float(arrival) * (1.0 + signed_temp_fraction)
-        fill_price = _to_boundary_decimal(fill_price_float)
+        fill_price = to_boundary_decimal(fill_price_float)
 
         # Per ADR 0009 lock #9 signed_perm uses fill_price not arrival so
         # OPEN/CLOSE/ARRIVAL agree on the dollar magnitude that hits the
@@ -359,7 +359,7 @@ class SquareRootImpactMatchingEngine:
             * fill_price_float
             * sign
         )
-        permanent_impact_per_share = _to_boundary_decimal(signed_perm)
+        permanent_impact_per_share = to_boundary_decimal(signed_perm)
 
         # Commission via the signed-notional convention per execution/cost/
         # commission.py: shares is signed; notional = shares * fill_price
