@@ -152,6 +152,11 @@ _SP500_ROWS = [
 # M3 PR 1: synthetic SF1 rows covering ARQ, ART, ARY (PIT) plus MRQ
 # (restated, must be rejected). The reader filters by `dimension` column;
 # the rejection test passes `dimension="MRQ"` at the read call.
+# M3 PR 5b: every row now carries `marketcap` and `sharesbas` so the
+# new `get_marketcap` SF1-hit path and `get_shares_outstanding` resolve
+# cleanly from the shared fixture. The PR 5a contracts ignore the new
+# columns; the schema-widening is non-breaking for existing tests
+# (verified by inspection per Plan-reviewer Critical 3).
 _SF1_ROWS = [
     {
         "ticker": "SPY",
@@ -162,6 +167,8 @@ _SF1_ROWS = [
         "lastupdated": date(2024, 4, 16),
         "revenue": 1000.0,
         "netinc": 100.0,
+        "marketcap": 10000.0,
+        "sharesbas": 100.0,
     },
     {
         "ticker": "SPY",
@@ -172,6 +179,8 @@ _SF1_ROWS = [
         "lastupdated": date(2024, 1, 16),
         "revenue": 950.0,
         "netinc": 95.0,
+        "marketcap": 9500.0,
+        "sharesbas": 95.0,
     },
     {
         "ticker": "SPY",
@@ -182,6 +191,8 @@ _SF1_ROWS = [
         "lastupdated": date(2024, 4, 16),
         "revenue": 3900.0,
         "netinc": 390.0,
+        "marketcap": 10000.0,
+        "sharesbas": 100.0,
     },
     {
         "ticker": "SPY",
@@ -192,6 +203,8 @@ _SF1_ROWS = [
         "lastupdated": date(2024, 3, 2),
         "revenue": 3850.0,
         "netinc": 380.0,
+        "marketcap": 9500.0,
+        "sharesbas": 95.0,
     },
     {
         "ticker": "SPY",
@@ -202,6 +215,8 @@ _SF1_ROWS = [
         "lastupdated": date(2026, 5, 1),
         "revenue": 1005.0,  # restated value; differs from ARQ
         "netinc": 102.0,
+        "marketcap": 10050.0,
+        "sharesbas": 100.0,
     },
 ]
 
@@ -2326,3 +2341,542 @@ pull_date = 2026-05-30
         )
         is False
     )
+
+
+# ============================================================================
+# M3 PR 5b: get_marketcap + get_shares_outstanding accessors
+# ============================================================================
+#
+# Tests cover the ADR 0002 dec 13 authoritative-source policy: SF1 is
+# the canonical source for marketcap and sharesbas; the SEP-estimated
+# marketcap fallback uses closeunadj * sharesbas from the SAME observable
+# SF1 row (Plan-reviewer High 5). The use_case parameter on
+# get_shares_outstanding is forward-compat for v1.1 (Plan-reviewer
+# High 4); v1 returns SF1 regardless of use_case.
+
+
+from pit_backtest.data.records import (  # noqa: E402
+    MarketCapRead,
+    SharesOutstandingRead,
+)
+
+
+def _write_sep_sf1_inline_bundle(
+    tmp_path: Path,
+    *,
+    bundle_name: str,
+    sep_rows: list[dict[str, object]],
+    sf1_rows: list[dict[str, object]],
+    tickers_rows: list[dict[str, object]],
+    sf1_schema_overrides: dict[str, pl.DataType] | None = None,
+) -> Path:
+    """Build an inline bundle for the new accessor tests.
+
+    Polars infers Null dtype for an all-None column; tests that pass
+    `marketcap=None` on a single-row SF1 frame need explicit
+    schema_overrides per Plan-reviewer gotcha. The helper threads the
+    override through so call sites stay terse.
+    """
+    snapshots_root = tmp_path / "snapshots"
+    bundle_dir = snapshots_root / bundle_name
+    bundle_dir.mkdir(parents=True)
+
+    sep_df = pl.DataFrame(sep_rows)
+    sf1_df = pl.DataFrame(sf1_rows, schema_overrides=sf1_schema_overrides)
+    tickers_df = pl.DataFrame(tickers_rows)
+
+    sep_path = bundle_dir / "sep.parquet"
+    sf1_path = bundle_dir / "sf1.parquet"
+    tickers_path = bundle_dir / "tickers.parquet"
+    sep_df.write_parquet(sep_path)
+    sf1_df.write_parquet(sf1_path)
+    tickers_df.write_parquet(tickers_path)
+
+    sep_sha = hashlib.sha256(sep_path.read_bytes()).hexdigest()
+    sf1_sha = hashlib.sha256(sf1_path.read_bytes()).hexdigest()
+    tickers_sha = hashlib.sha256(tickers_path.read_bytes()).hexdigest()
+    manifest = f"""
+[snapshots.{bundle_name}]
+source = "sharadar"
+pull_date = 2026-05-28
+
+[snapshots.{bundle_name}.files]
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {sep_path.stat().st_size}, row_count = {len(sep_rows)} }}
+"sf1.parquet" = {{ sha256 = "{sf1_sha}", size_bytes = {sf1_path.stat().st_size}, row_count = {len(sf1_rows)} }}
+"tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {tickers_path.stat().st_size}, row_count = {len(tickers_rows)} }}
+"""
+    (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
+    return snapshots_root
+
+
+# ----- get_marketcap -----
+
+
+def test_get_marketcap_returns_sf1_value_when_sf1_marketcap_populated(
+    tmp_path: Path,
+) -> None:
+    """SPY ARQ row at datekey=2024-04-15 has marketcap=10000; the
+    accessor returns the SF1 value flagged source='sf1'.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    read = adapter.get_marketcap(AssetId(100), datetime(2024, 4, 15, 16, 0))
+    assert read is not None
+    assert read.source == "sf1"
+    assert read.estimated is False
+    assert read.value == Decimal("10000")
+
+
+def test_get_marketcap_datekey_equal_to_dt_is_observable(
+    tmp_path: Path,
+) -> None:
+    """Plan-reviewer Medium 8 boundary pin: when dt == datekey exactly,
+    the SF1 row IS observable (not in the future). Mirrors the PR 2
+    `datekey <= available_dt` (NOT `<`) regression.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    # SPY ARQ datekey = 2024-04-15; reading at exactly that dt sees the row.
+    read = adapter.get_marketcap(AssetId(100), datetime(2024, 4, 15, 16, 0))
+    assert read is not None
+    assert read.value == Decimal("10000")
+
+
+def test_get_marketcap_falls_back_to_sep_estimated_when_sf1_marketcap_missing(
+    tmp_path: Path,
+) -> None:
+    """SF1 row has marketcap=None but sharesbas populated; SEP has a
+    closeunadj at dt. The accessor computes closeunadj * sharesbas and
+    flags source='sep_estimated'.
+    """
+    sep_rows = [
+        {
+            "ticker": "X", "date": date(2010, 1, 4),
+            "open": 50.0, "high": 50.5, "low": 49.5, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
+        {
+            "ticker": "X", "date": date(2020, 6, 30),
+            "open": 50.0, "high": 50.5, "low": 49.5, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
+    ]
+    sf1_rows = [
+        {
+            "ticker": "X", "dimension": "ARQ",
+            "calendardate": date(2020, 3, 31),
+            "datekey": date(2020, 4, 15),
+            "reportperiod": date(2020, 3, 31),
+            "lastupdated": date(2020, 4, 16),
+            "revenue": 100.0, "netinc": 10.0,
+            "marketcap": None,
+            "sharesbas": 100.0,
+        },
+    ]
+    tickers_rows = [
+        {
+            "permaticker": 700, "ticker": "X",
+            "name": "Estimated Co", "exchange": "NYSE", "isdelisted": "N",
+            "firstpricedate": date(2010, 1, 4), "lastpricedate": None,
+            "firstquarter": date(2010, 3, 31), "lastquarter": None,
+            "cusip": "X00000700",
+        },
+    ]
+    snapshots_root = _write_sep_sf1_inline_bundle(
+        tmp_path,
+        bundle_name="sharadar_estimated",
+        sep_rows=sep_rows,
+        sf1_rows=sf1_rows,
+        tickers_rows=tickers_rows,
+        sf1_schema_overrides={"marketcap": pl.Float64, "sharesbas": pl.Float64},
+    )
+    adapter = SharadarDataSource("sharadar_estimated", snapshots_root)
+    read = adapter.get_marketcap(AssetId(700), datetime(2020, 6, 30, 16, 0))
+    assert read is not None
+    assert read.source == "sep_estimated"
+    assert read.estimated is True
+    # closeunadj=50 * sharesbas=100 = 5000.
+    assert read.value == Decimal("5000")
+
+
+def test_get_marketcap_returns_none_when_both_marketcap_and_sharesbas_null(
+    tmp_path: Path,
+) -> None:
+    """SF1 row has BOTH marketcap=None AND sharesbas=None: the accessor
+    cannot estimate and returns None.
+    """
+    sep_rows = [
+        {
+            "ticker": "X", "date": date(2010, 1, 4),
+            "open": 50.0, "high": 50.5, "low": 49.5, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
+        {
+            "ticker": "X", "date": date(2020, 6, 30),
+            "open": 50.0, "high": 50.5, "low": 49.5, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
+    ]
+    sf1_rows = [
+        {
+            "ticker": "X", "dimension": "ARQ",
+            "calendardate": date(2020, 3, 31),
+            "datekey": date(2020, 4, 15),
+            "reportperiod": date(2020, 3, 31),
+            "lastupdated": date(2020, 4, 16),
+            "revenue": 100.0, "netinc": 10.0,
+            "marketcap": None,
+            "sharesbas": None,
+        },
+    ]
+    tickers_rows = [
+        {
+            "permaticker": 700, "ticker": "X",
+            "name": "Empty Co", "exchange": "NYSE", "isdelisted": "N",
+            "firstpricedate": date(2010, 1, 4), "lastpricedate": None,
+            "firstquarter": date(2010, 3, 31), "lastquarter": None,
+            "cusip": "X00000700",
+        },
+    ]
+    snapshots_root = _write_sep_sf1_inline_bundle(
+        tmp_path,
+        bundle_name="sharadar_emptyfunds",
+        sep_rows=sep_rows,
+        sf1_rows=sf1_rows,
+        tickers_rows=tickers_rows,
+        sf1_schema_overrides={"marketcap": pl.Float64, "sharesbas": pl.Float64},
+    )
+    adapter = SharadarDataSource("sharadar_emptyfunds", snapshots_root)
+    assert (
+        adapter.get_marketcap(AssetId(700), datetime(2020, 6, 30, 16, 0))
+        is None
+    )
+
+
+def test_get_marketcap_returns_none_when_sep_has_no_row_at_dt(
+    tmp_path: Path,
+) -> None:
+    """SF1 has marketcap=None + sharesbas populated, but SEP has no row
+    at dt (simulating a weekend / holiday). Accessor returns None.
+    """
+    sep_rows = [
+        {
+            "ticker": "X", "date": date(2010, 1, 4),
+            "open": 50.0, "high": 50.5, "low": 49.5, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
+        # No row at 2020-06-30 (the query date).
+    ]
+    sf1_rows = [
+        {
+            "ticker": "X", "dimension": "ARQ",
+            "calendardate": date(2020, 3, 31),
+            "datekey": date(2020, 4, 15),
+            "reportperiod": date(2020, 3, 31),
+            "lastupdated": date(2020, 4, 16),
+            "revenue": 100.0, "netinc": 10.0,
+            "marketcap": None,
+            "sharesbas": 100.0,
+        },
+    ]
+    tickers_rows = [
+        {
+            "permaticker": 700, "ticker": "X",
+            "name": "Holiday Co", "exchange": "NYSE", "isdelisted": "N",
+            "firstpricedate": date(2010, 1, 4), "lastpricedate": None,
+            "firstquarter": date(2010, 3, 31), "lastquarter": None,
+            "cusip": "X00000700",
+        },
+    ]
+    snapshots_root = _write_sep_sf1_inline_bundle(
+        tmp_path,
+        bundle_name="sharadar_holiday",
+        sep_rows=sep_rows,
+        sf1_rows=sf1_rows,
+        tickers_rows=tickers_rows,
+        sf1_schema_overrides={"marketcap": pl.Float64, "sharesbas": pl.Float64},
+    )
+    adapter = SharadarDataSource("sharadar_holiday", snapshots_root)
+    assert (
+        adapter.get_marketcap(AssetId(700), datetime(2020, 6, 30, 16, 0))
+        is None
+    )
+
+
+def test_get_marketcap_returns_none_when_no_observable_sf1_row(
+    tmp_path: Path,
+) -> None:
+    """dt is BEFORE any SF1 datekey for the asset; the accessor returns
+    None (no observable row at this PIT cut).
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    # SPY's earliest SF1 ARQ datekey in the fixture is 2024-01-15.
+    assert (
+        adapter.get_marketcap(AssetId(100), datetime(2023, 1, 1, 16, 0))
+        is None
+    )
+
+
+def test_get_marketcap_raises_ticker_not_found_for_unknown_asset(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    with pytest.raises(TickerNotFoundError):
+        adapter.get_marketcap(AssetId(99999), datetime(2024, 4, 15, 16, 0))
+
+
+def test_get_marketcap_does_not_leak_lookahead_strict_less_than(
+    tmp_path: Path,
+) -> None:
+    """Lookahead-leak regression per project rule 2C. SPY's earliest
+    SF1 ARQ datekey in the fixture is 2024-01-15; reading the day BEFORE
+    must return None (the row is not yet observable). A `<` vs `<=`
+    typo inside `_get_sf1_arq_row_at` would trip this.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    assert (
+        adapter.get_marketcap(AssetId(100), datetime(2024, 1, 14, 16, 0))
+        is None
+    )
+
+
+def test_get_marketcap_sep_estimated_preserves_boundary_precision(
+    tmp_path: Path,
+) -> None:
+    """Post-impl boundary-precision audit pin: the SEP-estimated product
+    stays in Decimal without a float intermediate. The chosen magnitudes
+    exhaust float64's ~16 significant digits so a regression that
+    reintroduces `float(close * sharesbas)` then `to_boundary_decimal`
+    on the product would diverge from the locked Decimal value.
+
+    Math: closeunadj=12345.6789 (8 sig figs) * sharesbas=987654321.0
+    (9 sig figs, ~15.4B shares like Apple) = 12193263111263.5269
+    (17 sig figs).
+
+    A float64 round-trip drops the trailing `.5269` digits because
+    `float(12193263111263.5269)` quantizes to the nearest representable
+    float64 (~12193263111263.527), then `Decimal(repr(...))` re-locks at
+    the shorter decimal. The in-Decimal product preserves all digits.
+    Coverage-stub magnitudes (e.g. 123.45 * 678.9) would NOT diverge
+    here because the 8-sig-fig product fits cleanly in float64; the
+    larger magnitudes are required for the regression to be observable.
+    """
+    sep_rows = [
+        {
+            "ticker": "X", "date": date(2010, 1, 4),
+            "open": 50.0, "high": 50.5, "low": 49.5, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
+        {
+            "ticker": "X", "date": date(2020, 6, 30),
+            "open": 100.0, "high": 100.5, "low": 99.5,
+            "close": 100.0, "closeunadj": 12345.6789,
+            "volume": 1000,
+        },
+    ]
+    sf1_rows = [
+        {
+            "ticker": "X", "dimension": "ARQ",
+            "calendardate": date(2020, 3, 31),
+            "datekey": date(2020, 4, 15),
+            "reportperiod": date(2020, 3, 31),
+            "lastupdated": date(2020, 4, 16),
+            "revenue": 100.0, "netinc": 10.0,
+            "marketcap": None,
+            "sharesbas": 987654321.0,
+        },
+    ]
+    tickers_rows = [
+        {
+            "permaticker": 700, "ticker": "X",
+            "name": "Precision Co", "exchange": "NYSE", "isdelisted": "N",
+            "firstpricedate": date(2010, 1, 4), "lastpricedate": None,
+            "firstquarter": date(2010, 3, 31), "lastquarter": None,
+            "cusip": "X00000700",
+        },
+    ]
+    snapshots_root = _write_sep_sf1_inline_bundle(
+        tmp_path,
+        bundle_name="sharadar_precision",
+        sep_rows=sep_rows,
+        sf1_rows=sf1_rows,
+        tickers_rows=tickers_rows,
+        sf1_schema_overrides={"marketcap": pl.Float64, "sharesbas": pl.Float64},
+    )
+    adapter = SharadarDataSource("sharadar_precision", snapshots_root)
+    read = adapter.get_marketcap(AssetId(700), datetime(2020, 6, 30, 16, 0))
+    assert read is not None
+    assert read.value == Decimal("12345.6789") * Decimal("987654321")
+    assert read.source == "sep_estimated"
+
+
+def test_get_marketcap_same_row_coupling_returns_none_when_qn_has_both_null(
+    tmp_path: Path,
+) -> None:
+    """Post-impl Low 1 regression: enforce the same-row coupling on
+    marketcap + sharesbas. Two-quarter fixture where Qn-1 has populated
+    marketcap+sharesbas and Qn has BOTH NULL. A regression that
+    decomposed the read into two independent get_fundamental calls
+    would return MarketCapRead(sep_estimated, Qn-1.sharesbas * close)
+    because get_fundamental("marketcap") would return None and traverse
+    to Qn-1 for sharesbas; the helper's single-row read correctly
+    surfaces None because the most-recent observable row's both fields
+    are NULL.
+    """
+    sep_rows = [
+        {
+            "ticker": "X", "date": date(2010, 1, 4),
+            "open": 50.0, "high": 50.5, "low": 49.5, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
+        {
+            "ticker": "X", "date": date(2020, 6, 30),
+            "open": 50.0, "high": 50.5, "low": 49.5, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
+    ]
+    sf1_rows = [
+        # Qn-1 (older, fully populated).
+        {
+            "ticker": "X", "dimension": "ARQ",
+            "calendardate": date(2020, 3, 31),
+            "datekey": date(2020, 4, 15),
+            "reportperiod": date(2020, 3, 31),
+            "lastupdated": date(2020, 4, 16),
+            "revenue": 100.0, "netinc": 10.0,
+            "marketcap": 5000.0,
+            "sharesbas": 100.0,
+        },
+        # Qn (most recent observable; vendor partial-fill with both NULL).
+        {
+            "ticker": "X", "dimension": "ARQ",
+            "calendardate": date(2020, 6, 30),
+            "datekey": date(2020, 7, 15),
+            "reportperiod": date(2020, 6, 30),
+            "lastupdated": date(2020, 7, 16),
+            "revenue": 110.0, "netinc": 12.0,
+            "marketcap": None,
+            "sharesbas": None,
+        },
+    ]
+    tickers_rows = [
+        {
+            "permaticker": 700, "ticker": "X",
+            "name": "Same-Row Co", "exchange": "NYSE", "isdelisted": "N",
+            "firstpricedate": date(2010, 1, 4), "lastpricedate": None,
+            "firstquarter": date(2010, 3, 31), "lastquarter": None,
+            "cusip": "X00000700",
+        },
+    ]
+    snapshots_root = _write_sep_sf1_inline_bundle(
+        tmp_path,
+        bundle_name="sharadar_samerow",
+        sep_rows=sep_rows,
+        sf1_rows=sf1_rows,
+        tickers_rows=tickers_rows,
+        sf1_schema_overrides={"marketcap": pl.Float64, "sharesbas": pl.Float64},
+    )
+    adapter = SharadarDataSource("sharadar_samerow", snapshots_root)
+    # Read at 2020-08-01: Qn (datekey=2020-07-15) is the most-recent
+    # observable row; its marketcap AND sharesbas are both NULL.
+    assert (
+        adapter.get_marketcap(AssetId(700), datetime(2020, 8, 1, 16, 0))
+        is None
+    )
+
+
+# ----- get_shares_outstanding -----
+
+
+def test_get_shares_outstanding_returns_sf1_sharesbas(
+    tmp_path: Path,
+) -> None:
+    """SPY ARQ row at datekey=2024-04-15 has sharesbas=100; returns
+    SharesOutstandingRead with source='sf1'.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    read = adapter.get_shares_outstanding(
+        AssetId(100),
+        datetime(2024, 4, 15, 16, 0),
+        use_case="fundamental_ratios",
+    )
+    assert read is not None
+    assert read.source == "sf1"
+    assert read.estimated is False
+    assert read.value == Decimal("100")
+
+
+def test_get_shares_outstanding_use_case_is_v1_invariant(
+    tmp_path: Path,
+) -> None:
+    """Plan-reviewer High 4 + Choice A pin: at v1 both use_case Literal
+    values return the same SF1 result. v1.1 will route 'portfolio_sizing'
+    through a broker-quote source; this test pins the v1 invariance so a
+    v1.1 change is observable in the regression suite.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    dt = datetime(2024, 4, 15, 16, 0)
+    ratios = adapter.get_shares_outstanding(
+        AssetId(100), dt, use_case="fundamental_ratios"
+    )
+    sizing = adapter.get_shares_outstanding(
+        AssetId(100), dt, use_case="portfolio_sizing"
+    )
+    assert ratios == sizing
+
+
+def test_get_shares_outstanding_returns_none_when_no_observable_sf1_row(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    assert (
+        adapter.get_shares_outstanding(
+            AssetId(100),
+            datetime(2023, 1, 1, 16, 0),
+            use_case="fundamental_ratios",
+        )
+        is None
+    )
+
+
+def test_get_shares_outstanding_raises_ticker_not_found_for_unknown_asset(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    with pytest.raises(TickerNotFoundError):
+        adapter.get_shares_outstanding(
+            AssetId(99999),
+            datetime(2024, 4, 15, 16, 0),
+            use_case="fundamental_ratios",
+        )
+
+
+# ----- attrs.frozen immutability -----
+
+
+def test_marketcap_read_is_frozen() -> None:
+    """Direct setattr raises FrozenInstanceError; per the attrs.frozen
+    inner-loop convention from docs/methodology/pydantic_polars_boundary.md.
+    """
+    import attrs
+
+    read = MarketCapRead(value=Decimal("100"), source="sf1", estimated=False)
+    with pytest.raises(attrs.exceptions.FrozenInstanceError):
+        read.value = Decimal("200")  # type: ignore[misc]
+
+
+def test_shares_outstanding_read_is_frozen() -> None:
+    import attrs
+
+    read = SharesOutstandingRead(
+        value=Decimal("100"), source="sf1", estimated=False
+    )
+    with pytest.raises(attrs.exceptions.FrozenInstanceError):
+        read.value = Decimal("200")  # type: ignore[misc]

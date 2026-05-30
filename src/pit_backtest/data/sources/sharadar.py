@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time
+from decimal import localcontext
 from decimal import Decimal
 from functools import cached_property
 from pathlib import Path
@@ -59,6 +60,9 @@ from pit_backtest.data.records import (
     CashFlow,
     CashFlowType,
     CorporateAction,
+    MarketCapRead,
+    SharesOutstandingRead,
+    SharesOutstandingUseCase,
     SplitAction,
 )
 from pit_backtest.data.resolver import (
@@ -1084,6 +1088,216 @@ class SharadarDataSource(PitDataSource):
             dt=_row_date_to_datetime(lastpricedate),
             flow_type="delisting_cash_proceeds",
             amount=amount,
+        )
+
+    # ----- M3 PR 5b: SF1-vs-SEP authoritative-source accessors -----
+    #
+    # Per ADR 0002 dec 13 SF1 is authoritative for marketcap and shares
+    # outstanding; the SEP-estimated marketcap fallback uses closeunadj
+    # (raw close) and SF1.sharesbas FROM THE SAME OBSERVABLE SF1 ROW to
+    # honor the dec-13 "contemporaneous SF1" qualifier. Reading marketcap
+    # and sharesbas via two independent get_fundamental calls would risk
+    # pairing a vendor partial-fill marketcap-NULL row with a sharesbas
+    # value from an earlier quarter; the single-row helper avoids that.
+
+    def _get_sf1_arq_row_at(
+        self, asset_id: AssetId, available_dt: datetime
+    ) -> dict[str, Any] | None:
+        """Return the most-recent observable SF1 ARQ row as a dict.
+
+        Single-row read pattern that get_marketcap uses to enforce the
+        same-row coupling on marketcap + sharesbas. The PIT filter
+        `datekey <= available_dt` is the structural lookahead protection
+        (mirrors get_fundamental at sharadar.py for parity); the
+        (datekey DESC, calendardate DESC) tiebreaker matches the same
+        choice get_fundamental made (Ratified Choice 3 in PR 2).
+
+        Returns:
+          The full SF1 row dict with all columns when an observable row
+          exists; consumers must `.get(column)` defensively because some
+          SF1 columns are vendor-optional (e.g., `marketcap` historically
+          was added in 2019). Per post-impl Medium 2 the SF1 column
+          presence is structurally validated by `_assert_sf1_row_columns`
+          at the call site in `get_marketcap`.
+
+          None when no observable ARQ row exists for the asset at or
+          before available_dt (pre-IPO, or the asset has no SF1 history
+          at all).
+
+        Raises:
+          TickerNotFoundError: asset_id is not in the resolver index at
+            available_dt.
+        """
+        ticker = self._resolver.get_ticker(asset_id, available_dt)
+        available_date = _to_date(available_dt)
+        df = (
+            self.get_table("sf1")
+            .with_columns(
+                pl.col("calendardate").cast(pl.Date),
+                pl.col("datekey").cast(pl.Date),
+                pl.col("reportperiod").cast(pl.Date),
+            )
+            .filter(pl.col("ticker") == ticker)
+            .filter(pl.col("dimension") == "ARQ")
+            .filter(pl.col("datekey") <= available_date)
+            .sort(["datekey", "calendardate"], descending=True)
+            .head(1)
+            .collect()
+        )
+        if df.height == 0:
+            return None
+        row: dict[str, Any] = df.row(0, named=True)
+        return row
+
+    def get_marketcap(
+        self, asset_id: AssetId, dt: datetime
+    ) -> MarketCapRead | None:
+        """SF1-authoritative market cap with SEP-estimated fallback.
+
+        Per ADR 0002 dec 13. Three observable outcomes:
+        - SF1 hit: SF1.marketcap is non-null on the most-recent
+          observable ARQ row; returns MarketCapRead(source="sf1",
+          estimated=False).
+        - SEP-estimated: SF1.marketcap is NULL on that same row but
+          SF1.sharesbas is populated AND SEP has a closeunadj at dt;
+          returns MarketCapRead(source="sep_estimated", estimated=True)
+          with value = closeunadj * sharesbas.
+        - None: no observable SF1 row, OR SF1 row has both marketcap
+          and sharesbas NULL, OR SEP has no row at dt (weekend / holiday
+          / pre-IPO).
+
+        PIT discipline: the SF1 single-row read applies the
+        `datekey <= dt` gate; the SEP direct-read at dt is leak-safe
+        because dt IS the bar date (no future SEP rows can match).
+
+        Per Plan-reviewer Critical 1 the SEP-estimated product stays in
+        Decimal without a float intermediate. Both inputs are already at
+        boundary precision (sharesbas via to_boundary_decimal on the SF1
+        read; close via to_boundary_decimal on the SEP read), so their
+        Decimal product is at boundary precision by construction.
+
+        Per Plan-reviewer Critical 2 the SEP read is a direct closeunadj
+        read mirroring get_delisting, NOT a get_price call. get_price
+        returns the engine-facing adjusted close which is wrong-axis for
+        the marketcap arithmetic identity (closeunadj * sharesbas is
+        the as-reported figure; close * sharesbas would mix two
+        reference frames).
+
+        Raises:
+          TickerNotFoundError: asset_id not in the resolver index at dt.
+          ValueError: SEP returns more than one row for (ticker, date).
+        """
+        row = self._get_sf1_arq_row_at(asset_id, dt)
+        if row is None:
+            return None
+
+        # Post-impl Medium 2: assert column presence so a vendor schema
+        # regression (Sharadar drops `marketcap` or `sharesbas` from SF1)
+        # raises loudly rather than silently routing every call to the
+        # SEP-estimated branch or to None. NULL VALUES are still legal
+        # and handled below; absent COLUMNS are a vendor bug we refuse to
+        # paper over.
+        for required in ("marketcap", "sharesbas"):
+            if required not in row:
+                raise ValueError(
+                    f"SF1 ARQ row for asset_id={int(asset_id)} is missing "
+                    f"required column {required!r}; available columns: "
+                    f"{sorted(row.keys())}. Vendor schema regression; "
+                    f"refuse to silently return None."
+                )
+
+        marketcap_raw = row["marketcap"]
+        if marketcap_raw is not None:
+            return MarketCapRead(
+                value=to_boundary_decimal(float(marketcap_raw)),
+                source="sf1",
+                estimated=False,
+            )
+
+        sharesbas_raw = row["sharesbas"]
+        if sharesbas_raw is None:
+            return None
+        sharesbas = to_boundary_decimal(float(sharesbas_raw))
+
+        # Direct closeunadj read at dt per ADR 0002 dec 13 (the
+        # as-reported marketcap is closeunadj * sharesbas; using the
+        # engine-facing adjusted `close` would mix reference frames
+        # across corporate-action retro-rolls).
+        ticker = self._resolver.get_ticker(asset_id, dt)
+        lookup_date = _to_date(dt)
+        sep_df = (
+            self.get_table("sep")
+            .with_columns(pl.col("date").cast(pl.Date))
+            .filter(pl.col("ticker") == ticker)
+            .filter(pl.col("date") == lookup_date)
+            .collect()
+        )
+        if sep_df.height == 0:
+            return None
+        if sep_df.height > 1:
+            raise ValueError(
+                f"SEP returned {sep_df.height} rows for ticker={ticker!r} "
+                f"at {lookup_date.isoformat()} during get_marketcap "
+                f"SEP-estimated path; expected exactly 1. Vendor "
+                f"data-quality bug; refuse to silently pick one."
+            )
+        closeunadj_raw = sep_df["closeunadj"][0]
+        if closeunadj_raw is None:
+            return None
+        close = to_boundary_decimal(float(closeunadj_raw))
+
+        # Post-impl Medium 1: wrap the Decimal multiplication in
+        # `localcontext` so a downstream caller mutating
+        # `decimal.getcontext().prec` (legacy scientific libraries,
+        # some financial packages) cannot silently truncate the product.
+        # Boundary precision is _DECIMAL_BOUNDARY_PREC from
+        # execution.cost.impact (consumed indirectly via to_boundary_decimal);
+        # the same context applies to the multiply.
+        with localcontext() as ctx:
+            ctx.prec = 28
+            value = close * sharesbas
+        return MarketCapRead(
+            value=value,
+            source="sep_estimated",
+            estimated=True,
+        )
+
+    def get_shares_outstanding(
+        self,
+        asset_id: AssetId,
+        dt: datetime,
+        *,
+        use_case: SharesOutstandingUseCase,
+    ) -> SharesOutstandingRead | None:
+        """SF1-authoritative shares outstanding.
+
+        Per ADR 0002 dec 13. v1 returns SF1.sharesbas at the most-recent
+        observable ARQ row regardless of use_case. v1.1 will route
+        use_case=="portfolio_sizing" through a broker-quote shares-count
+        source when that integration ships.
+
+        The `use_case` parameter is keyword-only forward-compat per
+        Plan-reviewer High 4 so the v1.1 signature change is additive
+        (existing v1 callers passing either Literal value continue to
+        work; the v1.1 behavior change is transparent to callers that
+        do not consult `read.source`).
+
+        Returns None when no observable SF1 row exists with non-null
+        sharesbas (pre-IPO, or the asset has no SF1 history).
+
+        Raises:
+          TickerNotFoundError: asset_id not in the resolver index at dt.
+        """
+        # use_case is forward-compat; v1 ignores it. See class docstring
+        # and Plan-reviewer High 4 for the rationale.
+        del use_case
+        value = self.get_fundamental(asset_id, dt, "sharesbas", "ARQ")
+        if value is None:
+            return None
+        return SharesOutstandingRead(
+            value=value,
+            source="sf1",
+            estimated=False,
         )
 
 

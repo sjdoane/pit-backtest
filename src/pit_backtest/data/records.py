@@ -135,3 +135,80 @@ class CashFlow:
     dt: datetime  # ex-date for dividends; settlement date for delisting cash
     flow_type: CashFlowType
     amount: Decimal  # per-share amount; portfolio impact = amount * shares_held
+
+
+# ----- M3 PR 5b: SF1-vs-SEP authoritative-source flagged records -----
+#
+# Per ADR 0002 decision 13: SF1 is authoritative for marketcap and shares
+# outstanding; SEP-derived figures are a flagged fallback for the
+# marketcap case when SF1 is missing the field. The two flagged records
+# below carry both the value AND the source provenance so consumers can
+# branch deterministically on `read.estimated` rather than infer from a
+# string compare.
+
+
+SharesOutstandingUseCase = Literal["fundamental_ratios", "portfolio_sizing"]
+"""Forward-compat: v1 returns SF1.sharesbas regardless of use_case; v1.1
+will route 'portfolio_sizing' through a broker-quote shares-count source
+once that integration ships. The parameter is accepted but unused at v1
+so the v1.1 signature change is additive (keyword-only Literal value)
+rather than breaking. Per ADR 0002 dec 13."""
+
+
+@attrs.frozen(slots=True)
+class MarketCapRead:
+    """SF1-authoritative market cap with SEP-estimated fallback.
+
+    Per ADR 0002 decision 13: SF1's `marketcap` (ARQ dimension) is the
+    as-reported figure and is authoritative when present. When the
+    most-recent observable SF1 row has `marketcap` populated, the
+    accessor returns `source="sf1"` and `estimated=False`. When the
+    SAME SF1 row has `marketcap=NULL` but `sharesbas` populated, the
+    accessor falls back to `closeunadj * sharesbas` from SEP + that
+    same SF1 row, returns `source="sep_estimated"` and `estimated=True`.
+
+    Critically the marketcap and sharesbas come from the SAME observable
+    SF1 row per the dec-13 "contemporaneous SF1" qualifier (Plan-reviewer
+    High 5). Reading the two fields via two independent `get_fundamental`
+    calls would risk pairing a vendor partial-fill marketcap-NULL at Qn
+    with a sharesbas value from an earlier Qn-1 row.
+
+    Fields:
+      value: Decimal at the locked boundary precision (per
+        pydantic_polars_boundary.md).
+      source: "sf1" when SF1.marketcap was non-null at the most-recent
+        observable row. "sep_estimated" when SF1.marketcap was NULL on
+        that row but sharesbas was populated and a SEP closeunadj exists
+        at dt.
+      estimated: True iff source == "sep_estimated". Stored explicitly
+        so `if read.estimated: warn(...)` is the canonical branch rather
+        than a string compare.
+    """
+
+    value: Decimal
+    source: Literal["sf1", "sep_estimated"]
+    estimated: bool
+
+
+@attrs.frozen(slots=True)
+class SharesOutstandingRead:
+    """SF1-authoritative shares outstanding.
+
+    Per ADR 0002 decision 13: SF1's `sharesbas` (ARQ dimension) is
+    authoritative for fundamental ratios. v1 returns this single source
+    regardless of `use_case`; v1.1 will introduce a broker-quote shares-
+    count source for `portfolio_sizing` that may differ when restated.
+
+    The Literal includes `"sep_tickers_estimated"` as forward-compat for
+    the v1.1 broker-quote branch; v1 never returns it.
+
+    Fields:
+      value: Decimal at the locked boundary precision (already coerced
+        inside `get_fundamental`).
+      source: "sf1" at v1.
+      estimated: False at v1.
+    """
+
+    value: Decimal
+    source: Literal["sf1", "sep_tickers_estimated"]
+    estimated: bool

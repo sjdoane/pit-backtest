@@ -505,12 +505,15 @@ class Sp500EventsResolveToUniqueTickersRowContract:
       TICKERS intervals (a vendor data-quality bug we refuse to silently
       resolve to one of the two permatickers).
 
-    Known blind spot (deferred to PR 5b): if SP500 itself has a duplicate
-    (ticker, date, action) triple, the per-row `_in_interval=1` aggregates
-    to >=2 and surfaces as a match_count != 1 failure that the error
-    message frames as ticker reuse. The right structural fix is a
-    dedicated `NoDuplicateSp500EventsContract` covering the SP500
-    uniqueness invariant; tracked in CHANGELOG.
+    Companion contract: `NoDuplicateSp500EventsContract` (PR 5b) covers
+    the SP500 (ticker, date, action) uniqueness invariant separately.
+    Without that companion a duplicate event row inflates match_count
+    here and the resulting failure message wrongly attributes the cause
+    to TICKERS-vs-SP500 ambiguity; with the companion, the duplicate
+    surfaces as its own named violation. Both contracts run by default
+    via `_DEFAULT_CONTRACTS`; alphabetical sort in the runner places
+    `no_duplicate_sp500_events` before this contract in aggregated
+    messages so the duplicate surfaces first when both fail.
     """
 
     name = "sp500_events_resolve_to_unique_tickers_row"
@@ -565,16 +568,61 @@ class Sp500EventsResolveToUniqueTickersRowContract:
             )
 
 
+class NoDuplicateSp500EventsContract:
+    """No duplicate (ticker, date, action) triples in SP500
+    (ADR 0002 dec 12 invariant 6; PR 5b structural fix per PR 5a
+    post-impl Medium 2).
+
+    Bug class caught: a vendor pull that double-writes an SP500 event
+    row. Without this contract, the duplicate manifests inside
+    `Sp500EventsResolveToUniqueTickersRowContract` as a match_count
+    of 2+ that the error message frames as ticker reuse, masking the
+    real cause. The dedicated contract surfaces the duplicate as its
+    own named violation so log-pattern alerts attribute the failure
+    to the SP500 table rather than to TICKERS-vs-SP500 ambiguity.
+
+    Alphabetical sort in `run_data_quality_contracts` places this
+    contract's name before `sp500_events_resolve_to_unique_tickers_row`
+    in any aggregated message, so when both fail the operator sees the
+    duplicate-event diagnosis first.
+    """
+
+    name = "no_duplicate_sp500_events"
+    required_tables = frozenset({"sp500"})
+
+    def check(self, frames: dict[str, pl.DataFrame]) -> None:
+        sp500 = frames["sp500"].with_columns(pl.col("date").cast(pl.Date))
+        counts = sp500.group_by(["ticker", "date", "action"]).agg(
+            pl.len().alias("count")
+        )
+        violations = counts.filter(pl.col("count") > 1).sort(
+            ["ticker", "date", "action"]
+        )
+        if violations.height > 0:
+            raise DataQualityError(
+                _format_violation_message(
+                    self.name,
+                    violations.height,
+                    violations,
+                    "duplicate (ticker, date, action) triple(s) in SP500",
+                )
+            )
+
+
 # Locked iteration order matches the dataset_versioning.md enumeration so
-# the canonical contract sequence is grep-able. Subsequent PRs that want
-# to pass a custom subset call `run_data_quality_contracts(source,
-# contracts=(MyContract(),))`.
+# the canonical contract sequence is grep-able. M3 PR 5b appends the
+# NoDuplicateSp500EventsContract last (position 6); aggregated failure
+# messages are sorted alphabetically by name at the runner so the tuple
+# position only affects per-contract pass/INFO order, not user-visible
+# error ordering. Subsequent PRs that want to pass a custom subset call
+# `run_data_quality_contracts(source, contracts=(MyContract(),))`.
 _DEFAULT_CONTRACTS: tuple[DataQualityContract, ...] = (
     FirstPriceWithinFiveDaysContract(),
     NoSepBarsAfterDelistingContract(),
     Sf1DatekeyNonNullAfter1990Contract(),
     NoDuplicateTickerDatekeyInSf1Contract(),
     Sp500EventsResolveToUniqueTickersRowContract(),
+    NoDuplicateSp500EventsContract(),
 )
 
 
