@@ -125,6 +125,9 @@ def test_no_impact_requires_explicit_flag() -> None:
 
 def test_render_enforcement_fires_on_raw_sr() -> None:
     """BacktestResult with raw SR alone and non-single-run tier raises."""
+    from datetime import date
+
+    from pit_backtest.analytics.drawdown import DrawdownDurationReport
     from pit_backtest.analytics.scorecard import (
         Attribution,
         BacktestResult,
@@ -152,8 +155,13 @@ def test_render_enforcement_fires_on_raw_sr() -> None:
             annualized_volatility=0.15,
         ),
         runs_and_drawdowns=RunsAndDrawdowns(
-            max_drawdown=-0.05,
-            drawdown_duration_days=10,
+            max_drawdown=0.05,
+            drawdown_duration=DrawdownDurationReport(
+                days=10,
+                is_censored_at_end=False,
+                peak_dt=date(2024, 3, 1),
+                trough_dt=date(2024, 3, 11),
+            ),
             longest_winning_run=5,
             longest_losing_run=3,
         ),
