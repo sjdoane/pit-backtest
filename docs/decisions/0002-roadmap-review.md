@@ -402,3 +402,7 @@ The items below were considered and explicitly deferred to v1.1 or later. They a
 ### Status
 
 This ADR is in **Accepted** status as of merge. The timeline restructure supersedes ADR 0001 decision 20. All other ADR 0001 decisions remain binding. Revisiting any of the M1 through M5 decisions above requires a new ADR.
+
+### M3 acceptance criterion 1 amendment footer (PR 5c, 2026-05-30)
+
+Acceptance criterion 1 specified the IsMemberAt(t) demo as a CLI plus a "two-panel plot (PIT membership equity curve vs current-membership equity curve) with the CAGR delta as the headline". PR 5c interpreted the criterion as buy-and-hold equal-weight cohort CAGR (not monthly-rebalanced) per the Plan-reviewer Choice A ratification, with the buy-and-hold-vs-rebalance gap documented as a Caveats section in the rendered Markdown report. The two-panel equity-curve plot is deferred to M5 `scripts/figures/`, where the broader figure-reproducibility pipeline lands per acceptance criterion 2 of the M5 worked momentum study. The amendment is per session_rules.md rule 4's kill-early-preference (avoid pulling matplotlib as a new dependency on a milestone-finish-line PR) and reduces the M3 PR 5c surface to a stdout Markdown report plus the four-headline-number compute. Acceptance criterion 1's four headline numbers (PIT count, current count, survivor count, equal-weight CAGR delta) are met by the `examples/sp500_survivorship.py` CLI; the equity-curve plot will be added in M5 with no architectural changes required.
