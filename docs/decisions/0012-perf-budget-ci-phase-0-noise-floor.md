@@ -109,3 +109,20 @@ These 8 decisions bind the M2 PR D implementation. Revisiting any requires a sup
 ## Status
 
 Accepted. M2 PR D implements the 8 locked decisions above (Phase 0). Phase 1 ships as a follow-up PR after empirical noise-floor data is collected on the post-merge main branch.
+
+## Phase 1 follow-up (provenance)
+
+Phase 1 shipped with the following empirical noise floor collected via `workflow_dispatch` on `main` HEAD `293a2ad3990ee4599426ba4d040168d900f6fec3`:
+
+- runner image: `ubuntu24-20260525.161.1`
+- 7-run median: 0.04299634899999205 s; stdev: 0.00022488560852116962 s; min: 0.042705421999997384 s; max: 0.04332529200000579 s
+- CoV (stdev / median): 0.523%
+- `max(20%, 3 * 0.523%) = max(20%, 1.57%) = 20%` (the 20% floor binds; the 3-sigma term sits below)
+- Python: 3.11.15; polars: 1.41.1; numpy: 1.26.4; platform: Linux-x86_64
+- measured_at: 2026-05-30T03:05:41.141607+00:00
+
+The CoV came in at the low end of the Verifier's range, tighter than the council's 5-15% worst case. One caveat: the Verifier's CoV-bound estimate framed the workload as a "60-90s CPU-bound NumPy/Polars loop", but the actual harness clocks 43 ms. The 43 ms wall-clock is two orders of magnitude under the public 60-second 500-name budget so the Phase 1 gate is a smoke test for catastrophic per-bar dispatch regressions, NOT a fine-grained calibration of the production budget. M3 PIT-data work, which makes 500-name universes available, will revisit the harness shape.
+
+The baseline is bound to the pinned `polars==1.41.1` and `numpy==1.26.4` in `pyproject.toml`; any patch bump requires a B1 baseline-rerun PR per lock #5.
+
+Locks #1 through #8 above are unchanged. This footer records provenance only; the ADR is not reopened.
