@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "median_seconds": 0.0,
+  "stdev_seconds": 0.0,
+  "min_seconds": 0.0,
+  "max_seconds": 0.0,
+  "n_runs": 0,
+  "warmup": 0,
+  "runner_image_sha": null,
+  "commit_sha": null,
+  "measured_at": null,
+  "python_version": null,
+  "polars_version": null,
+  "numpy_version": null,
+  "platform": null,
+  "_comment": "Phase 0 bootstrap placeholder per ADR 0012 lock #6. Replace with empirical baseline in Phase 1 follow-up PR after the perf-budget workflow runs once on main and collects the 7-run median + stdev."
+}
