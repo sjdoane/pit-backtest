@@ -1,0 +1,95 @@
+# Perf-budget workflow (M2 PR D Phase 0).
+#
+# Per ADR 0012 lock #3 the trigger is every PR; ubuntu-latest only
+# (no Windows matrix; cross-platform reproducibility is disavowed per
+# ADR 0001 decision 18); pinned runner image SHA; actions/cache@v4
+# keyed on uv.lock + pyproject.toml; paths: filter excludes docs.
+#
+# Per ADR 0012 lock #6 the bootstrap state is acceptable: when
+# .bench-baseline.json has n_runs=0, the workflow emits a warning and
+# exits 0. The Phase 1 follow-up PR after this PR merges runs the
+# workflow once on main via workflow_dispatch, commits the empirical
+# baseline, and flips bench/compare.py to --phase-1-gate.
+#
+# Per ADR 0012 lock #6 a PR with the label `perf-budget-skip` bypasses
+# the workflow entirely via the `if:` guard on the perf job.
+
+name: perf-budget
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  perf:
+    name: M2 SPY 20y synthetic bench (Phase 0; warning-only)
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'perf-budget-skip') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          pip install --upgrade pip
+          pip install uv
+
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Sync dependencies
+        run: |
+          uv sync --link-mode=copy --extra dev --extra dataops
+
+      - name: Record runner image
+        # Per post-impl reviewer Finding 5: use GitHub Actions runner-image
+        # env vars (ImageOS + ImageVersion) which produce a stable
+        # fingerprint like "ubuntu22-20240505.1.0", NOT `uname -a` which
+        # rotates the ephemeral hostname per run.
+        run: |
+          echo "RUNNER_IMAGE_SHA=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Run SPY 20y synthetic bench (7 runs + 1 warmup)
+        env:
+          PYTHONHASHSEED: "0"
+          POLARS_MAX_THREADS: "1"
+        run: |
+          uv run --link-mode=copy --no-sync python -m pit_backtest.bench.spy_20y \
+            --runs 7 --warmup 1 --output current.json
+          cat current.json
+
+      - name: Compare against committed baseline
+        run: |
+          uv run --link-mode=copy --no-sync python -m pit_backtest.bench.compare \
+            --current current.json --baseline .bench-baseline.json \
+            --threshold-pct 20.0 --threshold-sigma 3.0
+
+      - name: Upload current run as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-budget-current
+          path: current.json
+          retention-days: 30

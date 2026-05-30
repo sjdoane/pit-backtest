@@ -62,6 +62,7 @@ Per-bar sequence:
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Mapping
@@ -146,6 +147,7 @@ class BarLoop:
         impacted_source: ImpactedPriceSource | None = None,
         cost_estimator: PreTradeCostEstimator | None = None,
         apply_permanent_impact_to_valuation: bool = True,
+        enable_timing: bool = False,
     ) -> None:
         self._data_source = data_source
         self._universe = universe
@@ -169,13 +171,59 @@ class BarLoop:
             self._cost_estimator = cost_estimator
         self._impacted_source = impacted_source
         self._apply_impact_to_valuation = apply_permanent_impact_to_valuation
+        # Per ADR 0005 lock #12 + ADR 0012 lock #7 the timing instrumentation
+        # is opt-in via `enable_timing: bool = False` so production backtests
+        # pay zero cost. When enabled, per-step `time.perf_counter()` deltas
+        # accumulate into a dict; `timing_breakdown()` returns the dict
+        # sorted by step name. Per ADR 0012 lock #7 timing values are
+        # explicitly OUT of the determinism invariant (timing != bit-
+        # identical outputs); the sorted-list return value preserves the
+        # sorted-iteration discipline from `docs/methodology/determinism.md`.
+        self._enable_timing = enable_timing
+        self._timing: dict[str, float] = {}
 
     @property
     def state(self) -> PortfolioState:
         """Expose the live state for test assertions; mutate at your peril."""
         return self._state
 
+    def timing_breakdown(self) -> list[tuple[str, float]]:
+        """Per-step timing accumulator as a sorted list.
+
+        Per ADR 0005 lock #12 and ADR 0012 lock #7, this method is
+        meaningful only when the BarLoop was constructed with
+        `enable_timing=True`; otherwise the accumulator is empty and
+        an empty list is returned.
+
+        Returns a list of (step_name, total_seconds) tuples sorted by
+        step name. Sorted-list (not insertion-ordered dict) preserves
+        the determinism doc's sorted-iteration convention; timing
+        values themselves are explicitly OUT of the Requirement 5
+        bit-identical-output invariant per ADR 0012 lock #7.
+
+        Step buckets at v1:
+        - "preload": initial data load + per-bar index building
+        - "signal": Signal.compute aggregated across bars
+        - "policy": Policy.target_positions aggregated across bars
+        - "matcher": MatchingEngine.submit aggregated across bars
+        - "snapshot": per-bar mark-to-market + equity-curve build
+
+        The buckets do not partition the per-bar sequence completely;
+        clock advancement, dividend crediting, and price fetches are
+        not bucketed at v1 (they are sub-millisecond per bar on the M2
+        constant-weight demo). A future revision may add finer-grained
+        buckets behind a separate flag.
+        """
+        return sorted(self._timing.items())
+
     def run(self, start_dt: date, end_dt: date) -> ConstantWeightDemoResult:
+        # Per ADR 0012 lock #7 timing instrumentation is opt-in via
+        # self._enable_timing. Default-off paths use direct `if ...`
+        # guards (not context managers) so the disabled path is a
+        # single attribute access + boolean test per instrumented
+        # site, effectively zero cost on production backtests.
+        if self._enable_timing:
+            _t_preload = time.perf_counter()
         # Pre-load prices and dividends for all strategy tickers over the window.
         # Both engine and reference function read from these same eager Polars
         # frames (already sorted by dt by SharadarDataSource); no LazyFrame plan
@@ -260,6 +308,9 @@ class BarLoop:
         # ARRIVAL fills are not supported per ADR 0009 lock #4.
         last_close_raw_by_ticker: dict[AssetId, float] = {}
 
+        if self._enable_timing:
+            self._timing["preload"] = time.perf_counter() - _t_preload
+
         for bar_dt in trading_days_in_window:
             self._clock.advance_to(bar_dt)
             now = self._clock.now()
@@ -286,17 +337,29 @@ class BarLoop:
                     prices_today[ticker] = price_at[key]
 
             # Step 4: signal.
+            if self._enable_timing:
+                _t_step = time.perf_counter()
             signal_output = self._signal.compute(self._universe, now, self._pit_view)
+            if self._enable_timing:
+                self._timing["signal"] = self._timing.get("signal", 0.0) + (
+                    time.perf_counter() - _t_step
+                )
 
             # Step 5: policy. Per ADR 0009 lock #5 the cost_estimator is
             # the real cost model when the BarLoop was constructed with
             # one; otherwise the no-op stand-in.
+            if self._enable_timing:
+                _t_step = time.perf_counter()
             targets = self._policy.target_positions(
                 signal_output=signal_output,
                 current_positions=self._state,
                 cost_estimator=self._cost_estimator,
                 dt=now,
             )
+            if self._enable_timing:
+                self._timing["policy"] = self._timing.get("policy", 0.0) + (
+                    time.perf_counter() - _t_step
+                )
 
             # Step 6: convert targets into orders + fills + state updates.
             if targets.targets:
@@ -328,7 +391,13 @@ class BarLoop:
                     )
                     if market_state is None:
                         continue
+                    if self._enable_timing:
+                        _t_step = time.perf_counter()
                     fills = self._matching_engine.submit(order, market_state)
+                    if self._enable_timing:
+                        self._timing["matcher"] = self._timing.get("matcher", 0.0) + (
+                            time.perf_counter() - _t_step
+                        )
                     for fill in fills:
                         fill_qty = float(fill.quantity)
                         fill_price = float(fill.fill_price)
@@ -347,6 +416,8 @@ class BarLoop:
             # Step 7: snapshot at today's close. Per ADR 0009 lock #2 the
             # snapshot routes prices through adjust_price when the impact
             # source is wired AND the valuation policy is ON (default).
+            if self._enable_timing:
+                _t_step = time.perf_counter()
             nav_close = self._state.cash
             for ticker in sorted(self._state.positions.keys()):
                 shares = self._state.positions[ticker]
@@ -372,6 +443,10 @@ class BarLoop:
             for ticker in self._tickers:
                 curve_row[f"shares_{ticker}"] = self._state.positions.get(ticker, 0.0)
             equity_curve_rows.append(curve_row)
+            if self._enable_timing:
+                self._timing["snapshot"] = self._timing.get("snapshot", 0.0) + (
+                    time.perf_counter() - _t_step
+                )
 
             # Step 9: track the raw closeunadj per ticker for the next
             # bar's prior_close population.

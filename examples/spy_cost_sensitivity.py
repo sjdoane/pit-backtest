@@ -68,6 +68,16 @@ _DEFAULT_ETA_GRID: tuple[Decimal, ...] = (
     Decimal("0.30"),
 )
 _CENTRAL_ETA: Decimal = Decimal("0.142")
+# Per ADR 0005 lock #2 the --impact-model flag's "bouchaud" value (with
+# alias "square-root-law") substitutes beta=0.5 for the Almgren 2005
+# default of beta=0.6. Bouchaud-Lillo-Farmer 2009's "square root law"
+# is the 1/2 exponent variant; ADR 0005's docstring guidance cites the
+# distinction. Default is the Almgren 2005 calibration.
+_BETA_BY_MODEL: dict[str, Decimal] = {
+    "square-root": Decimal("0.6"),
+    "bouchaud": Decimal("0.5"),
+    "square-root-law": Decimal("0.5"),
+}
 
 
 @attrs.frozen(slots=True)
@@ -86,6 +96,12 @@ class SpyCostSensitivityRecipe:
     start_dt: date
     end_dt: date
     initial_capital: float
+    # Per ADR 0005 lock #2 and PR D scope: the recipe carries the cost-
+    # model beta exponent so the worker constructs the right
+    # SquareRootImpactCostModel under multiprocessing.spawn. Default
+    # Decimal("0.6") is Almgren-2005; Decimal("0.5") is the
+    # bouchaud / square-root-law alias.
+    beta: Decimal = Decimal("0.6")
 
 
 def build_bar_loop_for_eta(
@@ -138,7 +154,7 @@ def build_bar_loop_for_eta(
     )
     market_state_lookup = MarketStateLookup(by_key=market_state_by_key)
     cost_model = SquareRootImpactCostModel(
-        market_state=market_state_lookup, eta=eta
+        market_state=market_state_lookup, eta=eta, beta=recipe.beta
     )
     impacted_source = ImpactedPriceSource(raw=data_source)
     commission = PerShareCommission(rate_per_share=Decimal("0.005"))
@@ -204,6 +220,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="number of worker processes (default: min(5, cpu_count() - 1))",
     )
     parser.add_argument(
+        "--impact-model",
+        choices=sorted(_BETA_BY_MODEL.keys()),
+        default="square-root",
+        help=(
+            "Almgren impact-model variant per ADR 0005 lock #2. "
+            "'square-root' is Almgren-2005 default (beta=0.6); "
+            "'bouchaud' and 'square-root-law' are aliases for the "
+            "BLF 2009 1/2-exponent variant (beta=0.5). "
+            "default: square-root"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -244,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         start_dt=args.start_dt,
         end_dt=args.end_dt,
         initial_capital=args.initial_capital,
+        beta=_BETA_BY_MODEL[args.impact_model],
     )
 
     # Verify the bundle's manifest is well-formed up-front so a
