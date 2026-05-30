@@ -91,8 +91,16 @@ def _et_date(dt: datetime) -> date:
     return dt.astimezone(_ET).date()
 
 
-def _to_boundary_decimal(value: float) -> Decimal:
+def to_boundary_decimal(value: float) -> Decimal:
     """Convert a float to Decimal at the locked boundary precision.
+
+    Per Plan-reviewer High 3 on M3 PR 2: this helper is public (no
+    leading underscore) because it is consumed across packages. The
+    `data.sources.sharadar` module imports it for per-row PitDataSource
+    method returns (get_price + get_fundamental); the `execution.cost`
+    and `execution.matching` modules consume it for Order/Fill boundary
+    conversion. Single source of truth for the `Decimal(repr(float))`
+    semantic per docs/methodology/pydantic_polars_boundary.md.
 
     Uses `localcontext()` so a third-party library that lowers
     `decimal.getcontext().prec` cannot silently truncate the conversion.
@@ -100,6 +108,12 @@ def _to_boundary_decimal(value: float) -> Decimal:
     with localcontext() as ctx:
         ctx.prec = _DECIMAL_BOUNDARY_PREC
         return Decimal(repr(value))
+
+
+# Backwards-compatible private alias retained for callers that imported
+# the M2-era underscore name. The public name `to_boundary_decimal` is the
+# canonical surface; this alias may be removed in v1.1.
+_to_boundary_decimal = to_boundary_decimal
 
 
 @attrs.frozen(slots=True)
