@@ -30,13 +30,21 @@ M3 PR 4: members_at shipped via lazy `_sp500_universe` cached_property
 backed by `data.universe.SharadarSP500Universe`. v1 universe_id allowlist
 is {"sp500"}; Russell 1000 and custom universes are v1.1 scope.
 
-M3 PR 5a (this PR): `__init__` now wires `check_snapshot_freshness` and
+M3 PR 5a: `__init__` wires `check_snapshot_freshness` and
 `run_data_quality_contracts` per ADR 0002 dec 12 + ADR 0003 dec 16. The
 freshness check emits a WARNING at 30 days and a STALE-tagged WARNING at
 90 days; the contracts runner aggregates failures across the five
 invariants and raises `DataQualityError` on any. M1 SPY-only bundles do
 not ship TICKERS / SF1 / SP500 so the contracts that reference those
 tables skip with INFO logs; construction succeeds.
+
+M3 PR 5c (this PR): no production code changes. The new
+`examples/sp500_survivorship.py` CLI is a pure consumer of the M3 PR 1
+through 5b accessors (members_at, get_marketcap, read_sep_prices,
+read_actions_dividends, read_tickers, reconstruct_total_return). M3 is
+now fully shipped per ADR 0002 acceptance criteria 1 through 6 with the
+criterion-1 two-panel plot deferred to M5 `scripts/figures/` per the
+amendment footer at `docs/decisions/0002-roadmap-review.md`.
 """
 
 from __future__ import annotations
