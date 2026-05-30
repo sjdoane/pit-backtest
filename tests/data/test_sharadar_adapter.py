@@ -113,6 +113,27 @@ _TICKERS_ROWS = [
     },
 ]
 
+# M3 PR 4: Sharadar SP500 event-log rows. Per Plan-reviewer Critical 1
+# the shared fixture uses SIMPLE intervals (no add-remove-add) so the
+# story does not conflate SP500 membership with TICKERS lifecycle.
+# Multi-interval testing happens in inline bundles in test_universe.py.
+#
+# Schema per docs/methodology/dataset_versioning.md:28 and
+# docs/research/sources/methodology-point-in-time.md: (ticker, date, action).
+# No name / contraticker pass-throughs at v1 (Plan-reviewer High 1
+# corrected the original plan's hallucinated extras).
+_SP500_ROWS = [
+    # SPY added 1995-09-19 (open-ended; AssetId(100) per _TICKERS_ROWS row 1).
+    # Date chosen after SPY's TICKERS firstpricedate of 1993-01-22 so the
+    # resolver successfully maps ticker -> AssetId at the event date.
+    {"ticker": "SPY", "date": date(1995, 9, 19), "action": "added"},
+    # AGG added 2010 removed 2015 (closed interval; AssetId(200) per
+    # _TICKERS_ROWS row 2; AGG never delisted from TICKERS so "membership
+    # ended in 2015" is purely an SP500 event, not a TICKERS lifecycle event).
+    {"ticker": "AGG", "date": date(2010, 6, 15), "action": "added"},
+    {"ticker": "AGG", "date": date(2015, 12, 31), "action": "removed"},
+]
+
 # M3 PR 1: synthetic SF1 rows covering ARQ, ART, ARY (PIT) plus MRQ
 # (restated, must be rejected). The reader filters by `dimension` column;
 # the rejection test passes `dimension="MRQ"` at the read call.
@@ -196,6 +217,7 @@ def _write_synthetic_bundle(
         "actions": _ACTIONS_ROWS,
         "tickers": _TICKERS_ROWS,
         "sf1": _SF1_ROWS,
+        "sp500": _SP500_ROWS,
     }
 
     file_lines: list[str] = []
@@ -619,7 +641,7 @@ pull_date = 2026-05-29
 # M3 PR 1: TICKERS and SF1 ARQ reader tests
 # ============================================================
 
-_M3_TABLES = ("sep", "actions", "tickers", "sf1")
+_M3_TABLES = ("sep", "actions", "tickers", "sf1", "sp500")
 
 
 def test_read_tickers_returns_full_column_set(tmp_path: Path) -> None:
@@ -1949,3 +1971,319 @@ def test_resolver_contains_returns_true_for_indexed_and_false_otherwise(
     assert adapter._resolver.contains(AssetId(100)) is True
     assert adapter._resolver.contains(AssetId(400)) is True
     assert adapter._resolver.contains(AssetId(999)) is False
+
+
+# ============================================================
+# M3 PR 4: SharadarSP500Universe + members_at tests
+# ============================================================
+
+
+def test_members_at_unknown_universe_id_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with pytest.raises(ValueError) as exc_info:
+        adapter.members_at("russell_1000", datetime(2024, 1, 1, 16, 0))
+    message = str(exc_info.value)
+    assert "russell_1000" in message
+    assert "'sp500'" in message
+
+
+def test_members_at_sp500_returns_sorted_list_of_asset_ids(
+    tmp_path: Path,
+) -> None:
+    """At 2012-01-01 SPY (100) + AGG (200) are both members (AGG in
+    first interval 2010-2015). Sorted by int value."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    members = adapter.members_at("sp500", datetime(2012, 1, 1, 16, 0))
+    assert members == [AssetId(100), AssetId(200)]
+
+
+def test_members_at_sp500_after_agg_removed_excludes_agg(
+    tmp_path: Path,
+) -> None:
+    """At 2016-01-01 AGG has been removed; only SPY remains."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    members = adapter.members_at("sp500", datetime(2016, 1, 1, 16, 0))
+    assert members == [AssetId(100)]
+
+
+def test_members_at_sp500_before_any_add_returns_empty_list(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    members = adapter.members_at("sp500", datetime(1989, 12, 31, 16, 0))
+    assert members == []
+
+
+def test_members_at_cached_property_single_construction(
+    tmp_path: Path,
+) -> None:
+    """Two calls to members_at produce the same SharadarSP500Universe
+    instance (the cached_property is consulted once per adapter).
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    adapter.members_at("sp500", datetime(2012, 1, 1, 16, 0))
+    universe_1 = adapter._sp500_universe
+    adapter.members_at("sp500", datetime(2016, 1, 1, 16, 0))
+    universe_2 = adapter._sp500_universe
+    assert universe_1 is universe_2
+
+
+def test_members_at_sp500_only_bundle_missing_sp500_propagates_file_not_found(
+    tmp_path: Path,
+) -> None:
+    """Per Plan-reviewer gotcha 6: a pre-M3-PR-4-era bundle (no
+    sp500.parquet) raises FileNotFoundError, NOT an obscure
+    cached_property error.
+    """
+    snapshots_root = _write_synthetic_bundle(
+        tmp_path, tables=("sep", "actions", "tickers")
+    )
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        adapter.members_at("sp500", datetime(2012, 1, 1, 16, 0))
+    assert "sp500.parquet" in str(exc_info.value)
+
+
+def test_sharadar_sp500_universe_is_member_on_added_date_returns_true(
+    tmp_path: Path,
+) -> None:
+    """Added date is the FIRST day of membership."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    assert universe.is_member(AssetId(200), datetime(2010, 6, 15, 16, 0)) is True
+
+
+def test_sharadar_sp500_universe_is_member_on_removed_date_returns_true(
+    tmp_path: Path,
+) -> None:
+    """Removed date is the LAST day of membership (inclusive)."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    assert (
+        universe.is_member(AssetId(200), datetime(2015, 12, 31, 16, 0))
+        is True
+    )
+
+
+def test_sharadar_sp500_universe_is_member_day_after_removed_returns_false(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    assert (
+        universe.is_member(AssetId(200), datetime(2016, 1, 1, 16, 0))
+        is False
+    )
+
+
+def test_sharadar_sp500_universe_is_member_day_before_added_returns_false(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    assert (
+        universe.is_member(AssetId(200), datetime(2010, 6, 14, 16, 0))
+        is False
+    )
+
+
+def test_sharadar_sp500_universe_is_member_unknown_asset_returns_false(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    assert (
+        universe.is_member(AssetId(999), datetime(2012, 1, 1, 16, 0))
+        is False
+    )
+
+
+def test_sharadar_sp500_universe_membership_spells_open_ended_returns_none(
+    tmp_path: Path,
+) -> None:
+    """SPY added 1995-09-19 with no removed; spells return that pair."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    spells = universe.membership_spells(AssetId(100))
+    assert spells == [(datetime(1995, 9, 19, 16, 0), None)]
+
+
+def test_sharadar_sp500_universe_membership_spells_closed_interval(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    spells = universe.membership_spells(AssetId(200))
+    assert spells == [
+        (datetime(2010, 6, 15, 16, 0), datetime(2015, 12, 31, 16, 0)),
+    ]
+
+
+def test_sharadar_sp500_universe_membership_spells_unknown_asset_returns_empty(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    assert universe.membership_spells(AssetId(999)) == []
+
+
+def test_sharadar_sp500_universe_members_at_sorted_by_int_value(
+    tmp_path: Path,
+) -> None:
+    """Per Plan-reviewer Low 10: members_at must be sorted by int value
+    even when the dict insertion order is perturbed. Defense in depth
+    against future construction changes.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    members = adapter.members_at("sp500", datetime(2012, 1, 1, 16, 0))
+    assert members == sorted(members, key=int)
+
+
+def test_sharadar_sp500_universe_repr_surfaces_index_sizes(
+    tmp_path: Path,
+) -> None:
+    """Per Plan-reviewer Low 9: __repr__ surfaces asset and interval counts."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    universe = adapter._sp500_universe
+    repr_str = repr(universe)
+    # SPY (1 interval) + AGG (1 closed interval) = 2 assets, 2 intervals
+    assert "assets=2" in repr_str
+    assert "intervals=2" in repr_str
+    assert "sharadar_2026-05-28" in repr_str
+
+
+def test_read_sp500_default_returns_all_events(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sp500()
+    assert df.height == 3
+    assert df.columns == ["ticker", "date", "action"]
+    assert df.schema["date"] == pl.Date
+
+
+def test_read_sp500_filters_by_ticker(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sp500(ticker="AGG")
+    assert df.height == 2
+    assert set(df["action"].to_list()) == {"added", "removed"}
+
+
+def test_read_sp500_filters_by_action(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sp500(action="added")
+    assert df.height == 2
+    assert set(df["ticker"].to_list()) == {"SPY", "AGG"}
+
+
+def test_read_sp500_filters_by_date_range(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sp500(
+        start_dt=date(2010, 1, 1), end_dt=date(2015, 12, 31)
+    )
+    # AGG added 2010-06-15 + AGG removed 2015-12-31; SPY 1990 excluded.
+    assert df.height == 2
+    assert set(df["ticker"].to_list()) == {"AGG"}
+
+
+def test_read_sp500_sorted_by_date_action_ticker(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sp500()
+    dates = df["date"].to_list()
+    assert dates == [date(1995, 9, 19), date(2010, 6, 15), date(2015, 12, 31)]
+
+
+def test_members_at_pit_discipline_excludes_future_added_via_inline_bundle(
+    tmp_path: Path,
+) -> None:
+    """Structural PIT regression per project rule 2D.
+
+    Inline bundle with an "added" event in 2026 for a synthetic ticker.
+    members_at(2010-06-15) must NOT include the future-added asset;
+    is_member at the same date must return False.
+    """
+    import hashlib
+
+    snapshots_root = tmp_path / "snapshots"
+    bundle_dir = snapshots_root / "sharadar_pit"
+    bundle_dir.mkdir(parents=True)
+
+    sp500_rows = [
+        # SPY added after its TICKERS firstpricedate (1993-01-22).
+        {"ticker": "SPY", "date": date(1995, 9, 19), "action": "added"},
+        # Future event the engine must NOT honor at 2010.
+        {"ticker": "AGG", "date": date(2026, 1, 1), "action": "added"},
+    ]
+    tickers_rows = list(_TICKERS_ROWS)
+
+    pl.DataFrame(sp500_rows).write_parquet(bundle_dir / "sp500.parquet")
+    pl.DataFrame(tickers_rows).write_parquet(bundle_dir / "tickers.parquet")
+
+    sp500_sha = hashlib.sha256(
+        (bundle_dir / "sp500.parquet").read_bytes()
+    ).hexdigest()
+    tickers_sha = hashlib.sha256(
+        (bundle_dir / "tickers.parquet").read_bytes()
+    ).hexdigest()
+    manifest = f"""
+[snapshots.sharadar_pit]
+source = "sharadar"
+pull_date = 2026-05-30
+
+[snapshots.sharadar_pit.files]
+"sp500.parquet" = {{ sha256 = "{sp500_sha}", size_bytes = {(bundle_dir / 'sp500.parquet').stat().st_size}, row_count = 2 }}
+"tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {(bundle_dir / 'tickers.parquet').stat().st_size}, row_count = {len(tickers_rows)} }}
+"""
+    (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
+    adapter = SharadarDataSource("sharadar_pit", snapshots_root)
+
+    members_2010 = adapter.members_at("sp500", datetime(2010, 6, 15, 16, 0))
+    assert AssetId(100) in members_2010  # SPY (added 1990) IS a member
+    assert AssetId(200) not in members_2010  # AGG (added 2026) is NOT
+    assert (
+        adapter._sp500_universe.is_member(
+            AssetId(200), datetime(2010, 6, 15, 16, 0)
+        )
+        is False
+    )
