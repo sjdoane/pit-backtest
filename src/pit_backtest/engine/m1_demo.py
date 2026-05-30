@@ -71,13 +71,15 @@ class FixedTickerUniverse:
 
     def membership_spells(
         self, asset_id: AssetId
-    ) -> list[tuple[datetime, datetime]]:
-        # M1 demo: open-ended membership for any known asset; returning
-        # a sentinel pair so downstream code that asks for spells does
-        # not crash. M3 returns real spells from the SP500 event log.
+    ) -> list[tuple[datetime, datetime | None]]:
+        # M1 demo: open-ended membership for any known asset. Per M3 PR 4
+        # the Protocol return type changed from
+        # `list[tuple[datetime, datetime]]` to
+        # `list[tuple[datetime, datetime | None]]`; the open-ended end is
+        # now `None` rather than the magic `datetime.max` sentinel.
         if asset_id not in self.member_ids:
             return []
-        return [(datetime.min, datetime.max)]
+        return [(datetime.min, None)]
 
 
 def fixed_universe_from_tickers(tickers: Iterable[str]) -> FixedTickerUniverse:

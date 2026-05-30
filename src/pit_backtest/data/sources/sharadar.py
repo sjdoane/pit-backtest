@@ -18,16 +18,22 @@ M1 day 1 scope:
 - get_table is the forward-compatibility seam from ADR 0003 decision 9.
 
 M3 PR 1 (#24): read_tickers + read_sf1_arq low-level PIT readers shipped.
-M3 PR 2 (this PR): per-row get_price + get_fundamental shipped. Both
-consume the lazy `_resolver` cached_property to translate AssetId to
-ticker; get_price returns Decimal at the locked boundary precision;
+M3 PR 2 (#25): per-row get_price + get_fundamental shipped. Both consume
+the lazy `_resolver` cached_property to translate AssetId to ticker;
+get_price returns Decimal at the locked boundary precision;
 get_fundamental applies the PIT gate `datekey <= available_dt` as the
 structural lookahead protection.
+M3 PR 3 (#26): get_corporate_actions + get_cash_flows + get_delisting
+shipped via discriminated-union dispatch over the Sharadar ACTIONS
+string + TICKERS-derived delisting record.
+M3 PR 4 (this PR): members_at shipped via lazy `_sp500_universe`
+cached_property backed by `data.universe.SharadarSP500Universe`. v1
+universe_id allowlist is {"sp500"}; Russell 1000 and custom universes
+are v1.1 scope.
 
-Still NotImplementedError as of M3 PR 2: get_corporate_actions and
-get_cash_flows (PR 3; discriminated-union dispatch over splits +
-dividends + delistings + spinoffs); members_at and get_delisting (PR 4;
-alongside SharadarSP500Universe + the IsMemberAt demo).
+All per-row PitDataSource methods now have real bodies. M3 PR 5 lands
+the data quality contracts that gate ingest plus the IsMemberAt(t)
+demo per ADR 0002 acceptance criterion 1.
 """
 
 from __future__ import annotations
@@ -37,7 +43,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import polars as pl
 
@@ -59,6 +65,9 @@ from pit_backtest.data.sources.manifest import (
     verify_bundle,
 )
 from pit_backtest.execution.cost.impact import to_boundary_decimal
+
+if TYPE_CHECKING:
+    from pit_backtest.data.universe import SharadarSP500Universe
 
 
 _LOG = logging.getLogger(__name__)
@@ -630,14 +639,84 @@ class SharadarDataSource(PitDataSource):
         df = lf.sort(["ticker", "datekey", "calendardate"]).collect()
         return df
 
+    def read_sp500(
+        self,
+        *,
+        ticker: str | None = None,
+        action: str | None = None,
+        start_dt: date | datetime | None = None,
+        end_dt: date | datetime | None = None,
+    ) -> pl.DataFrame:
+        """M3 PR 4: load Sharadar SP500 event log rows.
+
+        Per `docs/methodology/dataset_versioning.md:28` and
+        `docs/research/sources/methodology-point-in-time.md`, the SP500
+        table is an event log of S&P 500 additions and removals. The
+        documented column set is `(ticker, date, action)`; Plan-reviewer
+        High 1 caught the original plan's hallucinated `name`/`contraticker`
+        pass-throughs. The reader selects the three documented columns
+        only; if vendor pulls add columns later, M3 PR 5's data quality
+        contract will validate the schema explicitly.
+
+        Args:
+          ticker: optional ticker filter.
+          action: optional action filter (typical values: "added", "removed").
+            The reader does NOT reject unknown action codes; the universe
+            interval-build state machine raises UniverseValidationError on
+            unknown codes per `data/universe.py`.
+          start_dt: lower bound on event date (inclusive).
+          end_dt: upper bound on event date (inclusive).
+
+        Sorted by (date, action, ticker) for determinism. Cast-before-filter
+        on `date` per project rule 12 (the M1 hotfix contract; same Polars
+        Datetime[ns] overflow class applies to SP500 as to SEP).
+        """
+        lf = self.get_table("sp500").with_columns(
+            pl.col("date").cast(pl.Date)
+        )
+        if ticker is not None:
+            lf = lf.filter(pl.col("ticker") == ticker)
+        if action is not None:
+            lf = lf.filter(pl.col("action") == action)
+        if start_dt is not None:
+            lf = lf.filter(pl.col("date") >= _to_date(start_dt))
+        if end_dt is not None:
+            lf = lf.filter(pl.col("date") <= _to_date(end_dt))
+
+        df = lf.select(
+            pl.col("ticker"),
+            pl.col("date"),
+            pl.col("action"),
+        ).sort(["date", "action", "ticker"]).collect()
+
+        return df
+
+    @cached_property
+    def _sp500_universe(self) -> "SharadarSP500Universe":
+        """Lazy-built SP500 universe; constructed on first members_at call.
+
+        Mirrors the resolver pattern: M1/M2 demos that never call
+        `members_at` pay nothing for the universe; per-row callers
+        amortize the event-log replay cost across every subsequent call.
+
+        The local import avoids any circularity at module-import time
+        (`universe.py` TYPE_CHECKING-imports `SharadarDataSource`; the
+        runtime cycle is broken by deferring the universe import to
+        first call).
+        """
+        from pit_backtest.data.universe import SharadarSP500Universe
+
+        return SharadarSP500Universe(self)
+
     # ----- Per-row PitDataSource protocol -----
     # M3 PR 2 shipped: get_price + get_fundamental real implementations
     # consuming the lazy `_resolver` cached_property and the PR 1 readers.
-    # M3 PR 3+ remaining: get_corporate_actions + get_cash_flows
-    # (discriminated-union dispatch); members_at + get_delisting (alongside
-    # SharadarSP500Universe + IsMemberAt demo). M1 demos continue to drive
-    # the data via the M1 convenience methods (read_sep_prices,
-    # read_actions_dividends) which bypass the per-row path.
+    # M3 PR 3 shipped: get_corporate_actions + get_cash_flows + get_delisting
+    # discriminated-union dispatch.
+    # M3 PR 4 shipped: members_at via the lazy `_sp500_universe`
+    # cached_property. All per-row PitDataSource methods now have real
+    # bodies; M3 PR 5 lands the data quality contracts that gate ingest
+    # plus the IsMemberAt(t) demo per ADR 0002 acceptance criterion 1.
 
     def get_price(
         self,
@@ -852,7 +931,39 @@ class SharadarDataSource(PitDataSource):
         )
 
     def members_at(self, universe_id: str, dt: datetime) -> list[AssetId]:
-        raise NotImplementedError("M3 deliverable")
+        """PIT universe membership read.
+
+        Dispatches by `universe_id`. v1 supports `"sp500"` only; the
+        Sharadar SP500 event log is replayed lazily via the
+        `_sp500_universe` cached_property. Other universes (Russell 1000,
+        custom) are v1.1 scope and extend the dispatch.
+
+        Per Plan-reviewer Medium 8 the error format mirrors
+        `get_table`: name the rejected universe_id, name the accepted
+        set, point at the v1.1 extension path.
+
+        Returns the sorted list of AssetIds that are S&P 500 members at
+        `dt`. Sorted by `int(asset_id)` for determinism per the
+        Universe.members_at contract.
+
+        Raises:
+          ValueError: when universe_id is not in the v1 allowlist.
+          FileNotFoundError: when the bundle does not include
+            sp500.parquet (propagates from the universe construction
+            on first call; subsequent calls hit the cached_property
+            and re-raise the FileNotFoundError instance).
+          UniverseValidationError: when the SP500 event log fails the
+            replay state machine (double-add, remove-without-add,
+            unknown action, resolver-unknown-ticker; see
+            `data/universe.py` for the locked failure-mode list).
+        """
+        if universe_id != "sp500":
+            raise ValueError(
+                f"unknown universe_id {universe_id!r}; v1 supports "
+                f"only 'sp500'. Russell 1000 and custom universes are "
+                f"v1.1 scope."
+            )
+        return self._sp500_universe.members_at(dt)
 
     def get_delisting(
         self, asset_id: AssetId
