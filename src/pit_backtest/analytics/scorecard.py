@@ -10,6 +10,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from pit_backtest.analytics.drawdown import DrawdownDurationReport
 from pit_backtest.validation.confidence_tier import ConfidenceTier
 
 
@@ -35,7 +36,7 @@ class Performance(BaseModel):
 class RunsAndDrawdowns(BaseModel):
     model_config = _SCORECARD_CONFIG
     max_drawdown: float
-    drawdown_duration_days: int
+    drawdown_duration: DrawdownDurationReport
     longest_winning_run: int
     longest_losing_run: int
 

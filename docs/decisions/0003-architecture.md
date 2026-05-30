@@ -1070,3 +1070,7 @@ Pre-M1 Monday work, in this order:
 5. Create `src/pit_backtest/` package layout per the locked architecture; stub the protocols with `Protocol` and `...`; nothing implemented.
 
 That is Monday. Tuesday is M1 day 1 with the SEP adapter and the total-return reconstruction.
+
+### M4 PR 2 amendment footer (ADR 0014, 2026-05-30)
+
+The package-layout block at line 61 of this ADR named `drawdown.py` as carrying "max_drawdown, duration, Calmar" without specifying the duration function's return type. The original stub at `src/pit_backtest/analytics/drawdown.py:13` typed the function `drawdown_duration_days -> int`. Per [ADR 0014](0014-drawdown-duration-report-contract.md) the function is renamed to `drawdown_duration_report` and the return type is widened to a `DrawdownDurationReport` attrs.frozen record carrying `days`, `is_censored_at_end`, `peak_dt`, and `trough_dt` per LdP 2018 chapter 13's censored-survival treatment of longest-drawdown duration. The `RunsAndDrawdowns.drawdown_duration_days: int` field at `analytics/scorecard.py:38` is also retyped to `drawdown_duration: DrawdownDurationReport`. M4 PR 2 implements the function bodies against the now-locked record contract.
