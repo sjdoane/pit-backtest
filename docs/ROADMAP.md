@@ -101,7 +101,7 @@ Goal: LdP ch.14 scorecard as default analytics. CPCV with path distributions. Tr
 
 Scope: `analytics.sharpe` (PSR, DSR, MinTRL); `analytics.drawdown`; `analytics.concentration` (HHI); `analytics.scorecard` (Markdown); `validation.cv` with `PurgedKFoldSplitter`, `WalkForwardSplitter`, `CPCVSplitter`; `validation.trial_registry` (SQLite WAL, single-machine concurrent); `confidence_tier` enum with render-path enforcement; `docs/TESTING.md`.
 
-Acceptance: PSR/DSR/MinTRL match the Bailey-LdP 2014 numerical example (DSR=0.971 within 1e-3); CPCV N=6 k=2 produces 5 paths as `BacktestPathDistribution`; walk-forward produces a single-path result; trial registry survives concurrent writes; render with raw SR errors unless `confidence_tier=single_run_pre_specified` and N=1; full scorecard renders for SPY.
+Acceptance: PSR/DSR/MinTRL match the Bailey-LdP 2014 numerical example (DSR=0.766 within 1e-3 per ADR 0013; the original 0.971 came from incorrect inverse-normal quantile values in the methodology doc, corrected by ADR 0013); CPCV N=6 k=2 produces 5 paths as `BacktestPathDistribution`; walk-forward produces a single-path result; trial registry survives concurrent writes; render with raw SR errors unless `confidence_tier=single_run_pre_specified` and N=1; full scorecard renders for SPY.
 
 ### M5 (week 10): worked momentum study and README reproducibility
 

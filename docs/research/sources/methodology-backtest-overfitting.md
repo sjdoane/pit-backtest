@@ -160,7 +160,7 @@ SR_0 is the Sharpe ratio threshold a strategy must exceed merely by chance when 
 **Step 3. The DSR formula:**
 
 ```
-DSR = Phi( (SR_hat - SR_0) * sqrt(T - 1) / sqrt(1 - gamma_3 * SR_0 + (gamma_4 - 1)/4 * SR_0^2) )
+DSR = Phi( (SR_hat - SR_0) * sqrt(T - 1) / sqrt(1 - gamma_3 * SR_hat + (gamma_4 - 1)/4 * SR_hat^2) )
 ```
 
 Where:
@@ -172,6 +172,8 @@ Where:
 
 DSR is a probability: the probability that the true SR exceeds SR_0 given T observations, after correcting for the fact that the strategy was the best among N candidates. DSR replaces PSR's arbitrary benchmark SR* with the data-derived SR_0.
 
+**Note on the asymptotic variance form.** The `sigma_sq` denominator uses `SR_hat` (the unrestricted-MLE plug-in) per the Bailey-LdP 2014 Wald form, matching the PSR formula at the section below. An earlier revision of this doc had `SR_0` in the denominator, which is a Score / Rao form; both are asymptotically equivalent under the null, but the Wald form is what Bailey-LdP 2014 publishes and what `analytics/sharpe.py` implements per [ADR 0013](../../decisions/0013-psr-dsr-mintrl-public-api-and-bailey-ldp-2014-pin-correction.md).
+
 ### The Effective Number of Trials
 
 N in the DSR formula should not be the raw count of backtests if many are highly correlated. Lopez de Prado (2018, *Advances in Financial Machine Learning*) proposes clustering strategies by their correlation of OOS returns, then setting N equal to the number of clusters (using the Optimal Number of Clusters algorithm). As a simpler heuristic: if testing a parameter grid with dimensions d1 x d2 x d3, count the number of unique PCA components explaining 95% of variance in the resulting SR matrix. The quantstrat implementation accepts `nTrials` and `varTrials` as separate inputs, allowing the analyst to supply their own estimate.
@@ -180,11 +182,20 @@ N in the DSR formula should not be the raw count of backtests if many are highly
 
 Inputs: SR_hat = 1.5 (annualized), T = 60 months, gamma_3 = -0.5, gamma_4 = 5, N = 30 trials, V[SR_hat_n] = 0.4.
 
-SR_0 = sqrt(0.4) * [(0.4228)(1.869) + (0.5772)(1.624)] = 0.632 * 1.727 = 1.092.
+Quantiles (verified against scipy.stats.norm.ppf):
 
-DSR = Phi( (1.5 - 1.092) * sqrt(59) / sqrt(1 + 0.546 + 1.191) ) = Phi(1.894) = 0.971.
+- `Phi_inv(1 - 1/30) = Phi_inv(0.96667) = 1.834`
+- `Phi_inv(1 - 1/(30 * e)) = Phi_inv(0.98774) = 2.249`
 
-The strategy clears at 97.1% confidence. A raw PSR against SR* = 0 gives substantially higher (and misleading) confidence because it ignores that SR_hat was the best of 30 candidates.
+SR_0 = sqrt(0.4) * [(1 - 0.5772) * 1.834 + (0.5772) * 2.249] = 0.6325 * 2.0736 = 1.311.
+
+sigma_sq = 1 - (-0.5) * 1.5 + (5 - 1)/4 * 1.5^2 = 1 + 0.75 + 2.25 = 4.0 (Wald form, SR_hat in the denominator per the Step 3 formula above).
+
+DSR = Phi( (1.5 - 1.311) * sqrt(59) / sqrt(4.0) ) = Phi(0.725) = 0.766.
+
+The strategy clears at 76.6% confidence. A raw PSR against SR* = 0 gives substantially higher (and misleading) confidence because it ignores that SR_hat was the best of 30 candidates.
+
+**Pre-correction note.** An earlier revision of this worked example reported `SR_0 = 1.092` and `DSR = 0.971`, derived from incorrect quantile values (`1.869` and `1.624` instead of the verified `1.834` and `2.249`) and a Score / Rao `sigma_sq` form using `SR_0` instead of the Wald `SR_hat` form. The 0.971 number propagated through ADR 0002 (acceptance criterion 1), ADR 0003 (decision 14 docstring), `docs/ROADMAP.md`, and `docs/methodology/dataset_versioning.md`. [ADR 0013](../../decisions/0013-psr-dsr-mintrl-public-api-and-bailey-ldp-2014-pin-correction.md) corrects all five sites and locks the canonical pin at `DSR = 0.766 within 1e-3` for the M4 PR 1 acceptance test.
 
 ---
 

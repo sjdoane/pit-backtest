@@ -510,7 +510,9 @@ def dsr(sr_hat: float, T: int, gamma_3: float, gamma_4: float,
     
     sr_0 derived from the False Strategy Theorem benchmark.
     Verified against the paper's numerical example: SR_hat=1.5, T=60,
-    gamma_3=-0.5, gamma_4=5, N=30, V[{SR_n}]=0.4 -> DSR=0.971 (within 1e-3).
+    gamma_3=-0.5, gamma_4=5, N=30, V[{SR_n}]=0.4 -> DSR=0.766 (within 1e-3) per ADR 0013;
+    the original docstring stated 0.971 derived from incorrect inverse-normal
+    quantile values corrected by ADR 0013.
     """
     ...
 
@@ -786,7 +788,7 @@ Three over-engineered places (CPCV path generic, AlgoStack temp/perm dict patter
 - Discriminated union on CorporateAction is the right Pydantic v2 idiom; pattern-match exhaustively, type checker flags missing branches in v1.1.
 - `fill_price_model` required on Order with no default. Every backtester with a default fill price model has eventually had a researcher run an experiment with the wrong default and not notice for a quarter.
 - Almgren 2005 calibration (eta=0.142, beta=0.6, gamma=0.314) as default for SquareRootImpact is the right paper to anchor on.
-- Bailey-LdP 2014 numerical anchor (DSR=0.971) as a test fixture saves two weeks of debugging when DSR numbers do not match Lopez de Prado's worked examples.
+- Bailey-LdP 2014 numerical anchor (DSR=0.766 per ADR 0013; the original 0.971 came from incorrect inverse-normal quantile values in the methodology doc) as a test fixture saves two weeks of debugging when DSR numbers do not match Lopez de Prado's worked examples.
 - Runner-outside-BarLoop separation for multiprocessing. Parallelize across paths and parameter combinations, never within a single backtest. One backtester the reviewer worked with attempted to parallelize at the bar level and the non-determinism made the test suite useless.
 - ConfidenceTier enum with four explicit levels and RenderEnforcementError on raw SR without PSR/DSR is the single best architectural decision in this document.
 

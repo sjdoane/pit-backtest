@@ -30,7 +30,11 @@ def dsr(
     """Deflated Sharpe Ratio (Bailey-LdP 2014).
 
     Verified against the paper's numerical example: SR_hat=1.5, T=60,
-    gamma_3=-0.5, gamma_4=5, N=30, V[{SR_n}]=0.4 -> DSR=0.971 (within 1e-3).
+    gamma_3=-0.5, gamma_4=5, N=30, V[{SR_n}]=0.4 -> DSR=0.766 (within 1e-3)
+    per ADR 0013. The original docstring stated 0.971 derived from
+    incorrect inverse-normal quantile values in the methodology doc;
+    ADR 0013 locks the corrected pin under the canonical Bailey-LdP 2014
+    Wald form (sigma_sq uses SR_hat, not SR_0).
     """
     raise NotImplementedError("M4 deliverable")
 
