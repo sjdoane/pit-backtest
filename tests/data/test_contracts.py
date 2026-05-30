@@ -36,6 +36,7 @@ from pit_backtest.data.contracts import (
     DataQualityError,
     FirstPriceWithinFiveDaysContract,
     LookaheadLeakError,
+    NoDuplicateSp500EventsContract,
     NoDuplicateTickerDatekeyInSf1Contract,
     NoSepBarsAfterDelistingContract,
     Sf1DatekeyNonNullAfter1990Contract,
@@ -643,7 +644,7 @@ def test_runner_all_pass_logs_pass_message(
     with caplog.at_level(logging.INFO, logger="pit_backtest.data.contracts"):
         SharadarDataSource("sharadar_2026-05-28", snapshots_root)
     assert any(
-        "all 5 data quality contracts passed" in record.message
+        "all 6 data quality contracts passed" in record.message
         for record in caplog.records
     )
 
@@ -898,7 +899,7 @@ def test_sharadar_data_source_init_runs_contracts_on_full_m3_bundle(
     with caplog.at_level(logging.INFO, logger="pit_backtest.data.contracts"):
         SharadarDataSource("sharadar_2026-05-28", snapshots_root)
     assert any(
-        "all 5 data quality contracts passed" in record.message
+        "all 6 data quality contracts passed" in record.message
         for record in caplog.records
     )
 
@@ -918,7 +919,7 @@ def test_sharadar_data_source_init_skips_contracts_on_m1_two_table_bundle(
         for record in caplog.records
         if "skipping data quality contract" in record.message
     ]
-    assert len(skipped) == 5
+    assert len(skipped) == 6
 
 
 def test_sharadar_data_source_init_freshness_warns_loudly_on_stale_bundle(
@@ -1006,3 +1007,97 @@ def test_init_wiring_does_not_break_existing_lookahead_gate_on_get_fundamental(
         flavor="ARQ",
     )
     assert result is None
+
+
+# ============================================================================
+# M3 PR 5b: NoDuplicateSp500EventsContract (Contract 6)
+# ============================================================================
+
+
+def test_no_duplicate_sp500_events_passes_on_clean_bundle() -> None:
+    """Shared _SP500_ROWS has no duplicate (ticker, date, action) triples;
+    Contract 6 returns None on success.
+    """
+    NoDuplicateSp500EventsContract().check(
+        {"sp500": pl.DataFrame(_SP500_ROWS)}
+    )
+
+
+def test_no_duplicate_sp500_events_fails_on_duplicate_triple() -> None:
+    """Two identical (SPY, 1995-09-19, 'added') rows is the target bug
+    class. The error surfaces the count column so the operator sees
+    the duplication factor.
+    """
+    sp500 = pl.DataFrame(
+        [
+            {"ticker": "SPY", "date": date(1995, 9, 19), "action": "added"},
+            {"ticker": "SPY", "date": date(1995, 9, 19), "action": "added"},
+        ]
+    )
+    with pytest.raises(DataQualityError) as exc_info:
+        NoDuplicateSp500EventsContract().check({"sp500": sp500})
+    message = str(exc_info.value)
+    assert "no_duplicate_sp500_events" in message
+    assert "SPY" in message
+    # Post-impl Low 3: assert the literal column key from to_dicts()
+    # output so the assertion does not accidentally match the prose
+    # "triple(s) in SP500" (which contains "count" as a substring via
+    # the docstring of `_format_violation_message`'s "found N").
+    assert "'count':" in message
+
+
+def test_no_duplicate_sp500_events_dispatched_via_runner_when_sp500_present(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Full M3 superset bundle runs Contract 6 as part of _DEFAULT_CONTRACTS;
+    the per-contract pass log includes the contract name.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    with caplog.at_level(logging.INFO, logger="pit_backtest.data.contracts"):
+        SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+    passed_messages = [
+        record.message
+        for record in caplog.records
+        if "passed" in record.message and "no_duplicate_sp500_events" in record.message
+    ]
+    assert len(passed_messages) == 1
+
+
+def test_aggregated_message_sorts_duplicate_event_before_resolution_failure() -> None:
+    """When both Contract 5 (event-resolution) and Contract 6 (dedup) fail,
+    alphabetical sort in the runner places no_duplicate_sp500_events
+    BEFORE sp500_events_resolve_to_unique_tickers_row in the message.
+    This is the user-message ordering that Plan-reviewer Medium 7 pinned
+    as the intended PR 5b semantic.
+    """
+
+    class _StubSource:
+        bundle_name = "stub"
+        available_tables = frozenset({"sp500", "tickers"})
+
+        def get_table(self, name: str) -> pl.LazyFrame:
+            if name == "sp500":
+                # Duplicate + unknown ticker so BOTH SP500 contracts fail.
+                return pl.LazyFrame(
+                    [
+                        {"ticker": "DUP", "date": date(2020, 1, 1), "action": "added"},
+                        {"ticker": "DUP", "date": date(2020, 1, 1), "action": "added"},
+                        {"ticker": "ABSENT", "date": date(2020, 6, 1), "action": "added"},
+                    ]
+                )
+            # Empty tickers so the absent-ticker fails Contract 5.
+            return pl.LazyFrame(
+                schema={
+                    "ticker": pl.String, "permaticker": pl.Int64,
+                    "firstpricedate": pl.Date, "lastpricedate": pl.Date,
+                },
+            )
+
+    with pytest.raises(DataQualityError) as exc_info:
+        run_data_quality_contracts(_StubSource())  # type: ignore[arg-type]
+    message = str(exc_info.value)
+    assert "no_duplicate_sp500_events" in message
+    assert "sp500_events_resolve_to_unique_tickers_row" in message
+    idx_dup = message.index("no_duplicate_sp500_events")
+    idx_resolve = message.index("sp500_events_resolve_to_unique_tickers_row")
+    assert idx_dup < idx_resolve
