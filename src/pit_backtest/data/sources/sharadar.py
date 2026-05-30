@@ -58,6 +58,15 @@ _TABLE_FILENAMES = {
     "sp500": _SP500_FILENAME,
 }
 
+# SF1 PIT (point-in-time) dimensions per ADR 0003 architecture sketch +
+# docs/methodology/dataset_versioning.md. "ARQ" = as-reported quarterly,
+# "ART" = as-reported trailing-twelve-month, "ARY" = as-reported yearly.
+# Sharadar's restated counterparts MRQ / MRT / MRY are explicitly rejected
+# at the read_sf1_arq boundary; the dimension column may also be uppercase
+# variants ("Arq", "arq") in vendor exports, so the reader normalizes input
+# to uppercase before membership check.
+_PIT_SF1_DIMENSIONS: frozenset[str] = frozenset({"ARQ", "ART", "ARY"})
+
 
 class SharadarDataSource(PitDataSource):
     """v1 implementation of PitDataSource backed by Sharadar parquet snapshots."""
@@ -213,10 +222,134 @@ class SharadarDataSource(PitDataSource):
 
         return df
 
+    def read_tickers(
+        self,
+        *,
+        ticker: str | None = None,
+        permaticker: int | None = None,
+        active_at: date | datetime | None = None,
+    ) -> pl.DataFrame:
+        """M3 PR 1: load Sharadar TICKERS rows for resolver / universe wiring.
+
+        Returns a Polars frame with the documented column subset:
+        permaticker, ticker, name, exchange, isdelisted, firstpricedate,
+        lastpricedate, firstquarter, lastquarter, cusip. The four date
+        columns are cast to pl.Date BEFORE filtering per project rule 12
+        (the M1 hotfix at fix/adapter-date-filter-and-pandas-pin).
+
+        Args:
+          ticker: optional ticker filter.
+          permaticker: optional permaticker filter (the AssetId carrier).
+          active_at: when set, returns only rows whose
+            [firstpricedate, lastpricedate] interval contains active_at,
+            treating null lastpricedate as right-unbounded (active through
+            now). Matches the resolver interval convention.
+
+        Sorted by (permaticker, firstpricedate) for determinism.
+        """
+        lf = self.get_table("tickers").with_columns(
+            pl.col("firstpricedate").cast(pl.Date),
+            pl.col("lastpricedate").cast(pl.Date),
+            pl.col("firstquarter").cast(pl.Date),
+            pl.col("lastquarter").cast(pl.Date),
+        )
+        if ticker is not None:
+            lf = lf.filter(pl.col("ticker") == ticker)
+        if permaticker is not None:
+            lf = lf.filter(pl.col("permaticker") == permaticker)
+        if active_at is not None:
+            active_at_date = _to_date(active_at)
+            lf = lf.filter(
+                (pl.col("firstpricedate") <= active_at_date)
+                & (
+                    pl.col("lastpricedate").is_null()
+                    | (pl.col("lastpricedate") >= active_at_date)
+                )
+            )
+
+        df = lf.select(
+            pl.col("permaticker").cast(pl.Int64),
+            pl.col("ticker"),
+            pl.col("name"),
+            pl.col("exchange"),
+            pl.col("isdelisted"),
+            pl.col("firstpricedate"),
+            pl.col("lastpricedate"),
+            pl.col("firstquarter"),
+            pl.col("lastquarter"),
+            pl.col("cusip"),
+        ).sort(["permaticker", "firstpricedate"]).collect()
+
+        return df
+
+    def read_sf1_arq(
+        self,
+        *,
+        ticker: str | None = None,
+        datekey_start: date | datetime | None = None,
+        datekey_end: date | datetime | None = None,
+        dimension: str = "ARQ",
+    ) -> pl.DataFrame:
+        """M3 PR 1: load Sharadar SF1 fundamentals filtered to a PIT dimension.
+
+        Per docs/methodology/dataset_versioning.md and ADR 0003 architecture
+        sketch, only the as-reported dimensions ARQ / ART / ARY are PIT.
+        Sharadar's restated counterparts MRQ / MRT / MRY are explicitly
+        rejected at this boundary; the engine never reads them.
+
+        Args:
+          ticker: optional ticker filter (string at M3 PR 1; per-asset
+            wiring lands when get_fundamental does in a subsequent M3 PR).
+          datekey_start: lower bound on datekey (SEC submission date;
+            this is the available_dt for SF1 records).
+          datekey_end: upper bound on datekey.
+          dimension: PIT flavor; case-insensitive input is normalized to
+            uppercase before membership check. Defaults to ARQ.
+
+        Returns the full SF1 column set unchanged after the dimension and
+        date filters. Per-field columns (revenue, netinc, eps, sharesbas,
+        etc.) flow through unchanged; per-row Decimal coercion happens
+        when get_fundamental wires in.
+
+        Sorted by (ticker, datekey, calendardate) for determinism. The
+        column-order of the returned frame is the vendor parquet order;
+        callers that need a specific column order should select explicitly.
+
+        Raises:
+          ValueError: when dimension (after uppercase normalization) is
+            not in _PIT_SF1_DIMENSIONS.
+        """
+        dimension_norm = dimension.upper()
+        if dimension_norm not in _PIT_SF1_DIMENSIONS:
+            raise ValueError(
+                f"SF1 dimension {dimension!r} is not PIT; accepted: "
+                f"{sorted(_PIT_SF1_DIMENSIONS)}. "
+                f"Restated dimensions (MRQ / MRT / MRY) are rejected at load "
+                f"per docs/methodology/dataset_versioning.md."
+            )
+
+        lf = self.get_table("sf1").with_columns(
+            pl.col("calendardate").cast(pl.Date),
+            pl.col("datekey").cast(pl.Date),
+            pl.col("reportperiod").cast(pl.Date),
+        ).filter(pl.col("dimension") == dimension_norm)
+        if ticker is not None:
+            lf = lf.filter(pl.col("ticker") == ticker)
+        if datekey_start is not None:
+            lf = lf.filter(pl.col("datekey") >= _to_date(datekey_start))
+        if datekey_end is not None:
+            lf = lf.filter(pl.col("datekey") <= _to_date(datekey_end))
+
+        df = lf.sort(["ticker", "datekey", "calendardate"]).collect()
+        return df
+
     # ----- Full PitDataSource protocol (M3 work) -----
-    # The per-row methods below require IdentifierResolver (M3) for the
-    # AssetId -> ticker lookup. M1 demos drive the data via the convenience
-    # methods above.
+    # The per-row methods below require IdentifierResolver (M3 PR 1 above)
+    # and the corporate-action discriminated union dispatch (M3 PR 2). M1
+    # demos drive the data via the M1 convenience methods (read_sep_prices,
+    # read_actions_dividends). The M3 PR 1 additions (read_tickers,
+    # read_sf1_arq) are the low-level building blocks; get_fundamental and
+    # the other per-row methods wire in subsequent M3 PRs.
 
     def get_price(
         self,

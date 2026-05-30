@@ -82,6 +82,14 @@ Scope: dual-timestamp records (`period_end_dt`, `available_dt`); Sharadar SF1 AR
 
 Acceptance: `IsMemberAt(t)` demo shows the 2010 vs current S&P 500 count + survivor count + CAGR delta consistent with published studies; split/dividend/delisting/spin-off test fixtures pass; reads gate on `available_dt <= simulation_dt`; data quality contracts fail loudly at ingest; SF1-vs-SEP resolution enforced; 20-year PIT backtest fits in 16 GB.
 
+Progress:
+- **PR 1 shipped (data layer foundation)**: `SharadarPermatickerResolver` real implementation backed by Sharadar TICKERS with multi-match raise-on-ambiguity policy; `SharadarDataSource.read_tickers(...)` and `read_sf1_arq(...)` low-level Polars readers with cast-before-filter contract and PIT dimension rejection (MRQ / MRT / MRY); `LookaheadLeakError` + `assert_not_lookahead(available_dt, simulation_dt, *, context, period_end_dt=None)` helper in `src/pit_backtest/data/contracts.py` that subsequent M3 PRs call at the entry of every per-row PitDataSource method. Per-row PitDataSource stubs unchanged. 39 new tests across `test_contracts.py` (new), `test_resolver.py` (new), and `test_sharadar_adapter.py` (extended). Plan + Plan-reviewer + post-impl reviewer ran per project rule 2; no new ADR (architecture locked by ADRs 0001 + 0002 + 0003).
+- **PR 2 pending**: `get_fundamental` per-row method wiring (consumes the resolver + SF1 reader); corporate actions discriminated union dispatch (splits, cash dividends, delistings, spin-offs as cash); Decimal at the Order/Fill boundary for fundamental and cash-flow records.
+- **PR 3 pending**: `SharadarSP500Universe` real implementation with `is_member`, `members_at`, `membership_spells`; `IsMemberAt(t)` demo with 2010 vs current S&P 500 count + survivor count + CAGR delta.
+- **PR 4 pending**: data quality contracts (5 invariants per `src/pit_backtest/data/contracts.py` Protocol surface); SF1-vs-SEP authoritative-source resolution; data freshness check at startup per ADR 0003 decision 16.
+- **NEXT_BAR_OPEN deferred-fill mechanism (council pending)** per ADR 0009 lock #4: spawn 4-member council (Realist / Quant / Builder / Growth) + Verifier to settle the Order plumbing vs deferred-orders queue trade-off.
+- **Distinct policy-time vs matcher-time MarketStateLookup snapshots (council pending)** per ADR 0011 lock #6: spawn 4-member council to settle the BarLoop ctor surface (two cost models) vs the shifted-dt lookup approach for tolerance enforcement reactivation.
+
 ### M4 (weeks 8-9): validation infrastructure
 
 Goal: LdP ch.14 scorecard as default analytics. CPCV with path distributions. Trial registry feeds DSR.

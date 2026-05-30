@@ -10,7 +10,7 @@ No real Sharadar data required; the test runs in CI.
 from __future__ import annotations
 
 import hashlib
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -43,29 +43,151 @@ _ACTIONS_ROWS = [
     {"ticker": "SPY", "date": date(2024, 3, 15), "action": "split", "value": 1.0},
 ]
 
+# M3 PR 1: synthetic TICKERS rows covering the resolver edge cases:
+# permaticker=100 SPY active-through-now; permaticker=200 AGG active-through-now;
+# permaticker=300 OLDCO delisted 2014-12-31.
+_TICKERS_ROWS = [
+    {
+        "permaticker": 100,
+        "ticker": "SPY",
+        "name": "SPDR S&P 500 ETF Trust",
+        "exchange": "NYSEARCA",
+        "isdelisted": "N",
+        "firstpricedate": date(1993, 1, 22),
+        "lastpricedate": None,
+        "firstquarter": date(1993, 3, 31),
+        "lastquarter": date(2026, 3, 31),
+        "cusip": "78462F103",
+    },
+    {
+        "permaticker": 200,
+        "ticker": "AGG",
+        "name": "iShares Core US Aggregate Bond ETF",
+        "exchange": "NYSEARCA",
+        "isdelisted": "N",
+        "firstpricedate": date(2003, 9, 22),
+        "lastpricedate": None,
+        "firstquarter": date(2003, 9, 30),
+        "lastquarter": date(2026, 3, 31),
+        "cusip": "464287226",
+    },
+    {
+        "permaticker": 300,
+        "ticker": "OLDCO",
+        "name": "Old Company Inc",
+        "exchange": "NASDAQ",
+        "isdelisted": "Y",
+        "firstpricedate": date(2010, 1, 4),
+        "lastpricedate": date(2014, 12, 31),
+        "firstquarter": date(2010, 3, 31),
+        "lastquarter": date(2014, 12, 31),
+        "cusip": "OLDC00001",
+    },
+]
 
-def _write_synthetic_bundle(tmp_path: Path, bundle_name: str = "sharadar_2026-05-28") -> Path:
-    """Build a synthetic Sharadar bundle: SEP + ACTIONS parquet + manifest.
+# M3 PR 1: synthetic SF1 rows covering ARQ, ART, ARY (PIT) plus MRQ
+# (restated, must be rejected). The reader filters by `dimension` column;
+# the rejection test passes `dimension="MRQ"` at the read call.
+_SF1_ROWS = [
+    {
+        "ticker": "SPY",
+        "dimension": "ARQ",
+        "calendardate": date(2024, 3, 31),
+        "datekey": date(2024, 4, 15),
+        "reportperiod": date(2024, 3, 31),
+        "lastupdated": date(2024, 4, 16),
+        "revenue": 1000.0,
+        "netinc": 100.0,
+    },
+    {
+        "ticker": "SPY",
+        "dimension": "ARQ",
+        "calendardate": date(2023, 12, 31),
+        "datekey": date(2024, 1, 15),
+        "reportperiod": date(2023, 12, 31),
+        "lastupdated": date(2024, 1, 16),
+        "revenue": 950.0,
+        "netinc": 95.0,
+    },
+    {
+        "ticker": "SPY",
+        "dimension": "ART",
+        "calendardate": date(2024, 3, 31),
+        "datekey": date(2024, 4, 15),
+        "reportperiod": date(2024, 3, 31),
+        "lastupdated": date(2024, 4, 16),
+        "revenue": 3900.0,
+        "netinc": 390.0,
+    },
+    {
+        "ticker": "SPY",
+        "dimension": "ARY",
+        "calendardate": date(2023, 12, 31),
+        "datekey": date(2024, 3, 1),
+        "reportperiod": date(2023, 12, 31),
+        "lastupdated": date(2024, 3, 2),
+        "revenue": 3850.0,
+        "netinc": 380.0,
+    },
+    {
+        "ticker": "SPY",
+        "dimension": "MRQ",
+        "calendardate": date(2024, 3, 31),
+        "datekey": date(2024, 4, 15),
+        "reportperiod": date(2024, 3, 31),
+        "lastupdated": date(2026, 5, 1),
+        "revenue": 1005.0,  # restated value; differs from ARQ
+        "netinc": 102.0,
+    },
+]
+
+
+def _write_synthetic_bundle(
+    tmp_path: Path,
+    bundle_name: str = "sharadar_2026-05-28",
+    tables: tuple[str, ...] = ("sep", "actions"),
+) -> Path:
+    """Build a synthetic Sharadar bundle and the manifest entry.
 
     Returns the snapshots_root (the parent of the bundle directory).
+
+    Per Plan-reviewer Medium 8: M1 tests pass the default ("sep","actions")
+    so their existing assertions about manifest contents continue to hold;
+    M3 tests pass ("sep","actions","tickers","sf1") so the new readers
+    have parquet files with manifest-verified SHA256s. The manifest only
+    lists files this helper wrote; `verify_bundle` does not check for
+    extra files in the bundle dir, so a four-table bundle is a strict
+    superset that the two-table M1 tests can still load.
     """
     snapshots_root = tmp_path / "snapshots"
     bundle_dir = snapshots_root / bundle_name
     bundle_dir.mkdir(parents=True)
 
-    sep_df = pl.DataFrame(_SEP_ROWS)
-    sep_path = bundle_dir / "sep.parquet"
-    sep_df.write_parquet(sep_path)
+    table_data: dict[str, list[dict[str, object]]] = {
+        "sep": _SEP_ROWS,
+        "actions": _ACTIONS_ROWS,
+        "tickers": _TICKERS_ROWS,
+        "sf1": _SF1_ROWS,
+    }
 
-    actions_df = pl.DataFrame(_ACTIONS_ROWS)
-    actions_path = bundle_dir / "actions.parquet"
-    actions_df.write_parquet(actions_path)
+    file_lines: list[str] = []
+    for table in tables:
+        if table not in table_data:
+            raise ValueError(
+                f"unknown table {table!r}; available: {sorted(table_data)}"
+            )
+        rows = table_data[table]
+        df = pl.DataFrame(rows)
+        path = bundle_dir / f"{table}.parquet"
+        df.write_parquet(path)
+        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        size = path.stat().st_size
+        file_lines.append(
+            f'"{table}.parquet" = {{ sha256 = "{sha}", '
+            f"size_bytes = {size}, row_count = {len(rows)} }}"
+        )
 
-    sep_sha = hashlib.sha256(sep_path.read_bytes()).hexdigest()
-    sep_size = sep_path.stat().st_size
-    actions_sha = hashlib.sha256(actions_path.read_bytes()).hexdigest()
-    actions_size = actions_path.stat().st_size
-
+    files_block = "\n".join(file_lines)
     manifest_content = f"""
 [snapshots.{bundle_name}]
 source = "sharadar"
@@ -73,8 +195,7 @@ pull_date = 2026-05-28
 notes = "synthetic fixture for tests"
 
 [snapshots.{bundle_name}.files]
-"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {sep_size}, row_count = {len(_SEP_ROWS)} }}
-"actions.parquet" = {{ sha256 = "{actions_sha}", size_bytes = {actions_size}, row_count = {len(_ACTIONS_ROWS)} }}
+{files_block}
 """
     (snapshots_root / "manifest.toml").write_text(manifest_content, encoding="utf-8")
 
@@ -464,3 +585,236 @@ pull_date = 2026-05-29
         f"actions narrow-window query returned {dividends_narrow.height} "
         f"rows; expected 1"
     )
+
+
+# ============================================================
+# M3 PR 1: TICKERS and SF1 ARQ reader tests
+# ============================================================
+
+_M3_TABLES = ("sep", "actions", "tickers", "sf1")
+
+
+def test_read_tickers_returns_full_column_set(tmp_path: Path) -> None:
+    """read_tickers returns the documented column subset with pl.Date
+    dtype on the four date columns.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_tickers()
+    assert df.height == 3
+    assert df.columns == [
+        "permaticker",
+        "ticker",
+        "name",
+        "exchange",
+        "isdelisted",
+        "firstpricedate",
+        "lastpricedate",
+        "firstquarter",
+        "lastquarter",
+        "cusip",
+    ]
+    assert df.schema["firstpricedate"] == pl.Date
+    assert df.schema["lastpricedate"] == pl.Date
+    assert df.schema["firstquarter"] == pl.Date
+    assert df.schema["lastquarter"] == pl.Date
+
+
+def test_read_tickers_filters_by_ticker(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    spy = adapter.read_tickers(ticker="SPY")
+    assert spy.height == 1
+    assert spy["permaticker"][0] == 100
+
+
+def test_read_tickers_filters_by_permaticker(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    oldco = adapter.read_tickers(permaticker=300)
+    assert oldco.height == 1
+    assert oldco["ticker"][0] == "OLDCO"
+
+
+def test_read_tickers_filters_by_active_at_includes_null_lastpricedate(
+    tmp_path: Path,
+) -> None:
+    """active_at=2026-01-01: SPY (NULL lastpricedate, active) and AGG
+    (NULL lastpricedate, active) are included; OLDCO (lastpricedate
+    2014-12-31) is excluded.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    active_2026 = adapter.read_tickers(active_at=date(2026, 1, 1))
+    tickers = sorted(active_2026["ticker"].to_list())
+    assert tickers == ["AGG", "SPY"]
+
+
+def test_read_tickers_active_at_includes_delisted_within_interval(
+    tmp_path: Path,
+) -> None:
+    """active_at=2012-06-01 includes OLDCO (interval 2010-01-04 to
+    2014-12-31) and excludes neither SPY nor AGG.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    active_2012 = adapter.read_tickers(active_at=date(2012, 6, 1))
+    tickers = sorted(active_2012["ticker"].to_list())
+    assert tickers == ["AGG", "OLDCO", "SPY"]
+
+
+def test_read_tickers_sorted_by_permaticker_then_firstpricedate(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_tickers()
+    assert df["permaticker"].to_list() == [100, 200, 300]
+
+
+def test_read_sf1_arq_filters_to_arq_dimension_by_default(tmp_path: Path) -> None:
+    """The default dimension is ARQ; ART, ARY, MRQ rows are excluded."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sf1_arq(ticker="SPY")
+    assert df.height == 2
+    assert set(df["dimension"].to_list()) == {"ARQ"}
+
+
+def test_read_sf1_arq_explicit_art_dimension_returns_art_rows(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sf1_arq(ticker="SPY", dimension="ART")
+    assert df.height == 1
+    assert df["dimension"][0] == "ART"
+
+
+def test_read_sf1_arq_explicit_ary_dimension_returns_ary_rows(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sf1_arq(ticker="SPY", dimension="ARY")
+    assert df.height == 1
+    assert df["dimension"][0] == "ARY"
+
+
+def test_read_sf1_arq_dimension_input_is_case_normalized(tmp_path: Path) -> None:
+    """Per Plan-reviewer High 5: dimension input is normalized to
+    uppercase before membership check. 'arq', 'Arq', 'ARQ' all behave
+    identically.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    lower = adapter.read_sf1_arq(ticker="SPY", dimension="arq")
+    mixed = adapter.read_sf1_arq(ticker="SPY", dimension="Arq")
+    upper = adapter.read_sf1_arq(ticker="SPY", dimension="ARQ")
+    assert lower.height == upper.height == mixed.height == 2
+
+
+def test_read_sf1_arq_rejects_mrq_dimension(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with pytest.raises(ValueError) as exc_info:
+        adapter.read_sf1_arq(ticker="SPY", dimension="MRQ")
+    assert "not PIT" in str(exc_info.value)
+    assert "['ARQ', 'ART', 'ARY']" in str(exc_info.value)
+
+
+def test_read_sf1_arq_rejects_mrt_dimension(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with pytest.raises(ValueError):
+        adapter.read_sf1_arq(ticker="SPY", dimension="MRT")
+
+
+def test_read_sf1_arq_rejects_mry_dimension(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with pytest.raises(ValueError):
+        adapter.read_sf1_arq(ticker="SPY", dimension="MRY")
+
+
+def test_read_sf1_arq_rejects_unknown_dimension(tmp_path: Path) -> None:
+    """A typo like 'ARTM' is rejected with the accepted set surfaced."""
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    with pytest.raises(ValueError):
+        adapter.read_sf1_arq(ticker="SPY", dimension="ARTM")
+
+
+def test_read_sf1_arq_filters_by_datekey_range(tmp_path: Path) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    # Only the 2024-04-15 ARQ row is within the range.
+    df = adapter.read_sf1_arq(
+        ticker="SPY",
+        datekey_start=date(2024, 4, 1),
+        datekey_end=date(2024, 4, 30),
+    )
+    assert df.height == 1
+    assert df["datekey"][0] == date(2024, 4, 15)
+    assert df["calendardate"][0] == date(2024, 3, 31)
+
+
+def test_read_sf1_arq_returns_pl_date_columns(tmp_path: Path) -> None:
+    """Per project rule 12 the cast-before-filter contract: SF1's three
+    date columns (calendardate, datekey, reportperiod) come back as pl.Date.
+    """
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sf1_arq(ticker="SPY")
+    assert df.schema["calendardate"] == pl.Date
+    assert df.schema["datekey"] == pl.Date
+    assert df.schema["reportperiod"] == pl.Date
+
+
+def test_read_sf1_arq_sorted_by_ticker_then_datekey_then_calendardate(
+    tmp_path: Path,
+) -> None:
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_sf1_arq(ticker="SPY")
+    # ARQ rows only; sorted by datekey ascending.
+    datekeys = df["datekey"].to_list()
+    assert datekeys == [date(2024, 1, 15), date(2024, 4, 15)]
+
+
+def test_resolver_from_sharadar_data_source_uses_manifest_verified_tickers(
+    tmp_path: Path,
+) -> None:
+    """Per Plan-reviewer Critical 1: production resolver path constructs
+    from a SharadarDataSource so the snapshot SHA256 commitment in
+    dataset_versioning.md is the vintage gate. This test exercises that
+    code path end-to-end.
+    """
+    from pit_backtest.data.records import AssetId
+    from pit_backtest.data.resolver import SharadarPermatickerResolver
+
+    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    resolver = SharadarPermatickerResolver(adapter)
+    assert resolver.resolve_ticker("SPY", datetime(2024, 1, 1, 16, 0)) == AssetId(100)
+    assert resolver.resolve_ticker("AGG", datetime(2024, 1, 1, 16, 0)) == AssetId(200)
+    assert resolver.resolve_ticker("OLDCO", datetime(2012, 6, 1, 16, 0)) == AssetId(300)
+    assert resolver.get_ticker(AssetId(100), datetime(2024, 1, 1, 16, 0)) == "SPY"
