@@ -25,8 +25,23 @@ from pit_backtest.data.sources.sharadar import SharadarDataSource
 # value mirrors the docs/methodology/total_return_reconstruction.md Worked
 # Example B (SPY Q1 2024 ex-dividend $1.7715 on 2024-03-15). The non-SPY
 # row exercises the per-ticker filter.
+# M3 PR 5a: IPO-window SEP bars (one per TICKERS firstpricedate) so the
+# FirstPriceWithinFiveDaysContract passes when the bundle ships TICKERS.
+# Exposed as a module-level constant so inline tests can include them in
+# their own bundles without copying.
+_IPO_WINDOW_SEP_ROWS: list[dict[str, object]] = [
+    {"ticker": "SPY", "date": date(1993, 1, 22), "open": 43.97, "high": 43.97, "low": 43.75, "close": 43.94, "closeunadj": 43.94, "volume": 1_003_200},
+    {"ticker": "AGG", "date": date(2003, 9, 26), "open": 100.10, "high": 100.20, "low": 100.05, "close": 100.15, "closeunadj": 100.15, "volume": 50_000},
+    {"ticker": "OLDCO", "date": date(2010, 1, 4), "open": 9.50, "high": 9.60, "low": 9.45, "close": 9.55, "closeunadj": 9.55, "volume": 80_000},
+    {"ticker": "DLST", "date": date(2015, 1, 5), "open": 25.10, "high": 25.40, "low": 25.00, "close": 25.30, "closeunadj": 25.30, "volume": 50_000},
+]
+
+
 _SEP_ROWS = [
-    # SPY rows
+    # M3 PR 5a: IPO-window bars (defined above) prepended so the
+    # FirstPriceWithinFiveDaysContract passes on the M3_TABLES superset.
+    *_IPO_WINDOW_SEP_ROWS,
+    # SPY rows for the Q1 2024 TR demo and the per-row get_price tests.
     {"ticker": "SPY", "date": date(2024, 3, 13), "open": 515.00, "high": 518.00, "low": 514.00, "close": 517.51, "closeunadj": 517.51, "volume": 80_000_000},
     {"ticker": "SPY", "date": date(2024, 3, 14), "open": 517.00, "high": 518.50, "low": 516.50, "close": 517.51, "closeunadj": 517.51, "volume": 70_000_000},
     {"ticker": "SPY", "date": date(2024, 3, 15), "open": 517.95, "high": 518.43, "low": 510.27, "close": 512.85, "closeunadj": 512.85, "volume": 92_750_000},
@@ -277,24 +292,32 @@ def test_adapter_construction_fails_on_tampered_file(tmp_path: Path) -> None:
 
 
 def test_read_sep_prices_filters_by_ticker(tmp_path: Path) -> None:
-    """read_sep_prices returns only the rows for the requested ticker, sorted by dt."""
+    """read_sep_prices returns only the rows for the requested ticker, sorted by dt.
+
+    Per M3 PR 5a the fixture also carries IPO-window SEP rows (one per
+    TICKERS firstpricedate) so the FirstPriceWithinFiveDaysContract
+    passes at __init__; this test pins the resulting SPY row inventory
+    at 5 (4 Q1 2024 rows plus the 1993-01-22 IPO row) and AGG at 2
+    (the 2003-09-26 IPO row plus the 2024-03-15 row).
+    """
     snapshots_root = _write_synthetic_bundle(tmp_path)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     spy = adapter.read_sep_prices(ticker="SPY")
-    assert spy.height == 4  # 4 SPY rows
+    assert spy.height == 5  # 1 IPO row + 4 Q1 2024 rows
     assert spy["dt"].to_list() == [
+        date(1993, 1, 22),
         date(2024, 3, 13),
         date(2024, 3, 14),
         date(2024, 3, 15),
         date(2024, 3, 18),
     ]
-    assert spy["close"][2] == pytest.approx(512.85)
-    assert spy["closeunadj"][2] == pytest.approx(512.85)
+    assert spy["close"][3] == pytest.approx(512.85)
+    assert spy["closeunadj"][3] == pytest.approx(512.85)
 
     agg = adapter.read_sep_prices(ticker="AGG")
-    assert agg.height == 1
-    assert agg["dt"][0] == date(2024, 3, 15)
+    assert agg.height == 2  # IPO row + 2024-03-15 row
+    assert agg["dt"].to_list() == [date(2003, 9, 26), date(2024, 3, 15)]
 
 
 def test_read_sep_prices_filters_by_date_range(tmp_path: Path) -> None:
@@ -1007,7 +1030,11 @@ def test_get_price_multi_row_collision_raises_value_error(
     bundle_dir = snapshots_root / "sharadar_multirow"
     bundle_dir.mkdir(parents=True)
 
+    # M3 PR 5a: prepend IPO-window SEP rows so the
+    # FirstPriceWithinFiveDaysContract passes at __init__. The duplicate
+    # row remains the focus of the test; the IPO rows are bookkeeping.
     sep_dup_rows = [
+        *_IPO_WINDOW_SEP_ROWS,
         {
             "ticker": "SPY", "date": date(2024, 3, 15),
             "open": 517.95, "high": 518.43, "low": 510.27,
@@ -1701,6 +1728,12 @@ def test_get_cash_flows_sort_ordinal_dividend_before_delisting_same_dt(
     bundle_dir.mkdir(parents=True)
 
     sep_rows = [
+        # M3 PR 5a: IPO-window SEP row so the first-price contract passes.
+        {
+            "ticker": "X", "date": date(2010, 1, 4),
+            "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.0,
+            "closeunadj": 10.0, "volume": 5000,
+        },
         {
             "ticker": "X", "date": date(2020, 6, 30),
             "open": 5.0, "high": 5.5, "low": 4.8, "close": 5.0,
@@ -1739,7 +1772,7 @@ source = "sharadar"
 pull_date = 2026-05-30
 
 [snapshots.sharadar_sortord.files]
-"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = 1 }}
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = {len(sep_rows)} }}
 "actions.parquet" = {{ sha256 = "{actions_sha}", size_bytes = {(bundle_dir / "actions.parquet").stat().st_size}, row_count = 1 }}
 "tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {(bundle_dir / "tickers.parquet").stat().st_size}, row_count = 1 }}
 """
@@ -1807,7 +1840,16 @@ def test_get_delisting_missing_sep_row_raises_delisting_data_quality_error(
     bundle_dir = snapshots_root / "sharadar_dqissue"
     bundle_dir.mkdir(parents=True)
 
-    sep_rows: list[dict[str, object]] = []  # No SEP rows at all.
+    # M3 PR 5a: a single SEP row at firstpricedate so the
+    # FirstPriceWithinFiveDaysContract passes at __init__; the test's
+    # point is the MISSING row at lastpricedate, not at firstpricedate.
+    sep_rows: list[dict[str, object]] = [
+        {
+            "ticker": "MISSING", "date": date(2010, 1, 4),
+            "open": 15.0, "high": 15.5, "low": 14.8, "close": 15.0,
+            "closeunadj": 15.0, "volume": 2000,
+        },
+    ]
     tickers_rows = [
         {
             "permaticker": 500,
@@ -1822,17 +1864,7 @@ def test_get_delisting_missing_sep_row_raises_delisting_data_quality_error(
             "cusip": "M00000001",
         },
     ]
-    # Empty parquet with the right schema; Polars needs the schema for an
-    # empty frame to round-trip via parquet.
-    sep_df = pl.DataFrame(
-        sep_rows,
-        schema={
-            "ticker": pl.String, "date": pl.Date,
-            "open": pl.Float64, "high": pl.Float64, "low": pl.Float64,
-            "close": pl.Float64, "closeunadj": pl.Float64, "volume": pl.Int64,
-        },
-    )
-    sep_df.write_parquet(bundle_dir / "sep.parquet")
+    pl.DataFrame(sep_rows).write_parquet(bundle_dir / "sep.parquet")
     pl.DataFrame(tickers_rows).write_parquet(bundle_dir / "tickers.parquet")
 
     sep_sha = hashlib.sha256((bundle_dir / "sep.parquet").read_bytes()).hexdigest()
@@ -1843,7 +1875,7 @@ source = "sharadar"
 pull_date = 2026-05-30
 
 [snapshots.sharadar_dqissue.files]
-"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = 0 }}
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = {len(sep_rows)} }}
 "tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {(bundle_dir / "tickers.parquet").stat().st_size}, row_count = 1 }}
 """
     (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
@@ -1870,6 +1902,13 @@ def test_get_delisting_decimal_precision_on_non_clean_closeunadj(
     bundle_dir.mkdir(parents=True)
 
     sep_rows = [
+        # M3 PR 5a: IPO-window SEP row so the first-price contract passes.
+        {
+            "ticker": "PR",
+            "date": date(2010, 1, 4),
+            "open": 50.0, "high": 50.5, "low": 49.8, "close": 50.0,
+            "closeunadj": 50.0, "volume": 1000,
+        },
         {
             "ticker": "PR",
             "date": date(2018, 6, 30),
@@ -1903,7 +1942,7 @@ source = "sharadar"
 pull_date = 2026-05-30
 
 [snapshots.sharadar_precdelisting.files]
-"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = 1 }}
+"sep.parquet" = {{ sha256 = "{sep_sha}", size_bytes = {(bundle_dir / "sep.parquet").stat().st_size}, row_count = {len(sep_rows)} }}
 "tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {(bundle_dir / "tickers.parquet").stat().st_size}, row_count = 1 }}
 """
     (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
