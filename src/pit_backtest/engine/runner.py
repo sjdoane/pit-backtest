@@ -90,7 +90,21 @@ class Runner:
         cv_splitter: CPCVSplitter,
         bar_loop_factory: Callable[[], BarLoop],
     ) -> BacktestPathDistribution[BacktestResult]:
-        raise NotImplementedError("M4 deliverable")
+        # Deferred to M5 per the M4 PR 5 scope decision (ADR 0003 amendment
+        # footer). The stubbed signature is underspecified: it takes no
+        # `observations`/`label_horizons` (so it cannot call
+        # `cv_splitter.split()`) and a no-arg `bar_loop_factory` that cannot
+        # be parameterized per train/test split. A CPCV path also requires
+        # fit/predict strategy semantics the constant-weight BarLoop lacks;
+        # those arrive with the M5 momentum study. The M4 CPCV acceptance
+        # (N=6 k=2 -> 5 paths as BacktestPathDistribution) is already met by
+        # CPCVSplitter.expected_path_count() + path_assignments() + the
+        # BacktestPathDistribution container.
+        raise NotImplementedError(
+            "Runner.run_cpcv is deferred to M5: the orchestration body needs "
+            "the per-split fit/predict strategy semantics the M5 momentum "
+            "study defines. See the ADR 0003 M4 PR 5 amendment footer."
+        )
 
     def run_sweep(
         self,
