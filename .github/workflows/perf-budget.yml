@@ -1,15 +1,20 @@
-# Perf-budget workflow (M2 PR D Phase 0).
+# Perf-budget workflow (M2 PR D Phase 1; GATED).
 #
 # Per ADR 0012 lock #3 the trigger is every PR; ubuntu-latest only
 # (no Windows matrix; cross-platform reproducibility is disavowed per
 # ADR 0001 decision 18); pinned runner image SHA; actions/cache@v4
 # keyed on uv.lock + pyproject.toml; paths: filter excludes docs.
 #
-# Per ADR 0012 lock #6 the bootstrap state is acceptable: when
-# .bench-baseline.json has n_runs=0, the workflow emits a warning and
-# exits 0. The Phase 1 follow-up PR after this PR merges runs the
-# workflow once on main via workflow_dispatch, commits the empirical
-# baseline, and flips bench/compare.py to --phase-1-gate.
+# Per ADR 0012 lock #2 Phase 1 ships an empirical baseline in
+# .bench-baseline.json (7-run median + stdev on main HEAD 293a2ad,
+# runner image ubuntu24-20260525.161.1) and passes --phase-1-gate to
+# bench/compare.py so a regression beyond max(20%, 3 * sigma) exits 1
+# and fails the build.
+#
+# Per ADR 0012 lock #6 the bootstrap state remains a valid fallback:
+# if .bench-baseline.json is reverted to n_runs=0, bench/compare.py
+# emits a warning and exits 0 even with --phase-1-gate. This preserves
+# the forward-revert path back to Phase 0.
 #
 # Per ADR 0012 lock #6 a PR with the label `perf-budget-skip` bypasses
 # the workflow entirely via the `if:` guard on the perf job.
@@ -32,7 +37,7 @@ permissions:
 
 jobs:
   perf:
-    name: M2 SPY 20y synthetic bench (Phase 0; warning-only)
+    name: 'M2 SPY 20y synthetic bench (Phase 1; gated at max(20%, 3 * sigma))'
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'perf-budget-skip') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -81,11 +86,12 @@ jobs:
             --runs 7 --warmup 1 --output current.json
           cat current.json
 
-      - name: Compare against committed baseline
+      - name: Compare against committed baseline (Phase 1; gated)
         run: |
           uv run --link-mode=copy --no-sync python -m pit_backtest.bench.compare \
             --current current.json --baseline .bench-baseline.json \
-            --threshold-pct 20.0 --threshold-sigma 3.0
+            --threshold-pct 20.0 --threshold-sigma 3.0 \
+            --phase-1-gate
 
       - name: Upload current run as artifact
         uses: actions/upload-artifact@v4
