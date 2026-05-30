@@ -136,7 +136,7 @@ Anyone reproducing a result must:
 4. If the SHA256 matches: their snapshot is bit-identical to the original; the test passes.
 5. If the SHA256 does not match: vendor data has shifted; the test fails with a diagnostic. This is the correct failure mode.
 
-CI does not have access to the Sharadar API. CI runs only the tests that ship fixtures inline (the toy three-day fixture; the Bailey-LdP DSR=0.971 fixture; the corp-action test fixtures in M3). The M1 SPY reconciliation runs locally before any PR merges to `main` and the PR description includes the line `M1 SPY reconciliation: PASS (delta = X.XX bps annualized, snapshot = sharadar_YYYY-MM-DD)` or an equivalent FAIL line.
+CI does not have access to the Sharadar API. CI runs only the tests that ship fixtures inline (the toy three-day fixture; the Bailey-LdP DSR=0.766 fixture per ADR 0013; the corp-action test fixtures in M3). The M1 SPY reconciliation runs locally before any PR merges to `main` and the PR description includes the line `M1 SPY reconciliation: PASS (delta = X.XX bps annualized, snapshot = sharadar_YYYY-MM-DD)` or an equivalent FAIL line.
 
 This is acknowledged as a CI gap, made explicit here so it does not surprise a reviewer. The v1.1 backlog includes Git LFS or cloud-storage integration to lift the reconciliation gate into CI.
 

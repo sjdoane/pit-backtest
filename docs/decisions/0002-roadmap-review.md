@@ -111,7 +111,7 @@ The total scope of v1 is large; the four-week timeline assumes focused part-time
 - Result `confidence_tier` enum: `single_run_pre_specified`, `walk_forward_validated`, `cpcv_with_dsr_correction`, `sweep_selected_no_correction`. The render path refuses to emit a report containing a raw SR without an accompanying PSR or DSR unless the confidence tier is explicitly `single_run_pre_specified` with N=1.
 
 **Acceptance criteria**:
-1. The PSR/DSR/MinTRL implementations match the numerical examples in the Bailey-LdP papers (the Bailey-LdP 2014 example: SR_hat=1.5, T=60 months, gamma_3=-0.5, gamma_4=5, N=30, V[{SR_n}]=0.4, produces DSR=0.971).
+1. The PSR/DSR/MinTRL implementations match the numerical examples in the Bailey-LdP papers (the Bailey-LdP 2014 example: SR_hat=1.5, T=60 months, gamma_3=-0.5, gamma_4=5, N=30, V[{SR_n}]=0.4, produces DSR=0.766 per [ADR 0013](0013-psr-dsr-mintrl-public-api-and-bailey-ldp-2014-pin-correction.md); the original ADR text stated 0.971 derived from incorrect inverse-normal quantile values in `docs/research/sources/methodology-backtest-overfitting.md` corrected by ADR 0013).
 2. A CPCV run on a deterministic dataset with N=6, k=2 produces 5 paths and a Sharpe distribution; the result type is `BacktestPathDistribution`, not a scalar.
 3. The trial registry persists across process restarts (SQLite-backed) and supports concurrent writes from parallel sweep runs.
 4. A render call with a raw SR and no PSR/DSR raises an error unless the `single_run_pre_specified` tier is set.
@@ -367,7 +367,7 @@ Acceptance criteria:
 Scope: `analytics.sharpe` (PSR, DSR, MinTRL); `analytics.drawdown`; `analytics.concentration` (HHI); `analytics.scorecard` (full LdP ch.14 Markdown); `validation.cv` with `PurgedKFoldSplitter`, `WalkForwardSplitter`, `CPCVSplitter`; `validation.trial_registry` (SQLite WAL, single-machine concurrent); `confidence_tier` enum with render-path enforcement; `docs/TESTING.md` written.
 
 Acceptance criteria:
-1. PSR/DSR/MinTRL implementations match the Bailey-LdP 2014 numerical example: SR_hat=1.5, T=60 months, gamma_3=-0.5, gamma_4=5, N=30, V[{SR_n}]=0.4, DSR=0.971 (within 1e-3).
+1. PSR/DSR/MinTRL implementations match the Bailey-LdP 2014 numerical example: SR_hat=1.5, T=60 months, gamma_3=-0.5, gamma_4=5, N=30, V[{SR_n}]=0.4, DSR=0.766 (within 1e-3) per [ADR 0013](0013-psr-dsr-mintrl-public-api-and-bailey-ldp-2014-pin-correction.md); the original ADR text stated 0.971 derived from incorrect inverse-normal quantile values corrected by ADR 0013.
 2. CPCV with N=6, k=2 on a deterministic dataset produces 5 paths and a `BacktestPathDistribution`.
 3. Walk-forward (train 2005-2015, test 2016-2024) produces a single-path result; the result type is comparable to the CPCV path-distribution at phi=1.
 4. Trial registry persists across process restart; two parallel `pytest -xvs` runs produce a consistent registry.
