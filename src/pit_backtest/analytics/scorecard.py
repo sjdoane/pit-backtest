@@ -37,6 +37,10 @@ class RunsAndDrawdowns(BaseModel):
     model_config = _SCORECARD_CONFIG
     max_drawdown: float
     drawdown_duration: DrawdownDurationReport
+    # longest_winning_run / longest_losing_run are the longest consecutive
+    # run of positive / negative per-bar returns (a 0.0 return bar breaks
+    # both runs). Defined here so v1.1 does not silently redefine them as
+    # up-trades or up-days.
     longest_winning_run: int
     longest_losing_run: int
 
@@ -80,7 +84,116 @@ class Scorecard(BaseModel):
     attribution: Attribution
 
     def to_markdown(self) -> str:
-        raise NotImplementedError("M4 deliverable")
+        """Render the six-section LdP chapter 14 scorecard as Markdown.
+
+        Pure render: returns a `str`, no file IO, no wall-clock. `None`
+        risk-adjusted statistics render as `n/a`; the censored-drawdown
+        flag is surfaced explicitly per the LdP honesty convention.
+        """
+        gen = self.general
+        perf = self.performance
+        rad = self.runs_and_drawdowns
+        ddr = rad.drawdown_duration
+        shortfall = self.implementation_shortfall
+        risk = self.risk_adjusted
+
+        def _pct(value: float) -> str:
+            return f"{value * 100:.2f}%"
+
+        def _opt(value: float | int | None, fmt: str) -> str:
+            return "n/a" if value is None else format(value, fmt)
+
+        trough = "n/a" if ddr.trough_dt is None else str(ddr.trough_dt)
+        censored = (
+            " (censored; still underwater at window end)"
+            if ddr.is_censored_at_end
+            else ""
+        )
+
+        lines: list[str] = []
+        lines.append("# Backtest Scorecard")
+        lines.append("")
+
+        lines.append("## General Characteristics")
+        lines.append("")
+        lines.append("| Field | Value |")
+        lines.append("| --- | --- |")
+        lines.append(f"| Universe | {gen.universe_id} |")
+        lines.append(f"| Window | {gen.start_dt} to {gen.end_dt} |")
+        lines.append(f"| Trading days | {gen.n_trading_days} |")
+        lines.append(f"| Assets | {gen.n_assets} |")
+        lines.append("")
+
+        lines.append("## Performance")
+        lines.append("")
+        lines.append("| Field | Value |")
+        lines.append("| --- | --- |")
+        lines.append(f"| Total return | {_pct(perf.total_return)} |")
+        lines.append(
+            f"| Annualized return | {_pct(perf.annualized_return)} |"
+        )
+        lines.append(
+            f"| Annualized volatility | {_pct(perf.annualized_volatility)} |"
+        )
+        lines.append("")
+
+        lines.append("## Runs and Drawdowns")
+        lines.append("")
+        lines.append("| Field | Value |")
+        lines.append("| --- | --- |")
+        lines.append(f"| Max drawdown | {_pct(rad.max_drawdown)} |")
+        lines.append(
+            f"| Longest drawdown | {ddr.days} bars{censored} |"
+        )
+        lines.append(f"| Peak date | {ddr.peak_dt} |")
+        lines.append(f"| Trough date | {trough} |")
+        lines.append(
+            f"| Longest winning run | {rad.longest_winning_run} bars |"
+        )
+        lines.append(
+            f"| Longest losing run | {rad.longest_losing_run} bars |"
+        )
+        lines.append("")
+
+        lines.append("## Implementation Shortfall")
+        lines.append("")
+        lines.append("| Field | Value |")
+        lines.append("| --- | --- |")
+        lines.append(
+            f"| Total commission | ${shortfall.total_commission:.2f} |"
+        )
+        lines.append(
+            f"| Total slippage | {shortfall.total_slippage_bps:.2f} bps |"
+        )
+        lines.append(
+            f"| Total temporary impact | "
+            f"{shortfall.total_temporary_impact_bps:.2f} bps |"
+        )
+        lines.append(
+            f"| Total permanent impact | "
+            f"{shortfall.total_permanent_impact_bps:.2f} bps |"
+        )
+        lines.append("")
+
+        lines.append("## Risk-Adjusted")
+        lines.append("")
+        lines.append("| Field | Value |")
+        lines.append("| --- | --- |")
+        lines.append(f"| Sharpe (per period) | {risk.sr_hat:.4f} |")
+        lines.append(f"| PSR | {_opt(risk.psr, '.4f')} |")
+        lines.append(f"| DSR | {_opt(risk.dsr, '.4f')} |")
+        lines.append(f"| MinTRL | {_opt(risk.min_trl, 'd')} |")
+        lines.append("")
+
+        lines.append("## Attribution")
+        lines.append("")
+        lines.append("| Year | Return |")
+        lines.append("| --- | --- |")
+        for year in sorted(self.attribution.by_year):
+            lines.append(f"| {year} | {_pct(self.attribution.by_year[year])} |")
+        lines.append("")
+
+        return "\n".join(lines)
 
 
 class RenderEnforcementError(ValueError):

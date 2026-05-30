@@ -95,7 +95,9 @@ Progress:
 - **NEXT_BAR_OPEN deferred-fill mechanism (council pending)** per ADR 0009 lock #4: spawn 4-member council (Realist / Quant / Builder / Growth) + Verifier to settle the Order plumbing vs deferred-orders queue trade-off.
 - **Distinct policy-time vs matcher-time MarketStateLookup snapshots (council pending)** per ADR 0011 lock #6: spawn 4-member council to settle the BarLoop ctor surface (two cost models) vs the shifted-dt lookup approach for tolerance enforcement reactivation.
 
-### M4 (weeks 8-9): validation infrastructure
+### M4 (weeks 8-9): validation infrastructure (SHIPPED 2026-05-30)
+
+**M4 SHIPPED.** All five M4 PRs are on main. The six ADR 0002 M4 acceptance criteria are met (PSR/DSR/MinTRL Bailey-LdP pin; CPCV N=6 k=2 = 5 paths as BacktestPathDistribution; trial registry survives concurrent writes; raw-SR render enforcement; walk-forward single path; full scorecard renders). `Runner.run_cpcv`'s orchestration body is deferred to M5 (the stubbed signature is underspecified and a CPCV path needs the fit/predict semantics the M5 momentum study introduces; the CPCV acceptance is met by the splitter + container). Next milestone: M5.
 
 Goal: LdP ch.14 scorecard as default analytics. CPCV with path distributions. Trial registry feeds DSR.
 
@@ -109,7 +111,8 @@ Progress:
 - **Prep PR 3a shipped (ADR 0015)**: `SupportsRichComparison` Protocol bound on `BacktestPathDistribution[T]`; `BacktestResult.__lt__` keyed on `sr_hat`; `Split.test_groups` 5th field; cv.py ADR-attribution fix at two sites. PR #35.
 - **PR 3b shipped (validation.cv splitter bodies)**: `PurgedKFoldSplitter` (LdP ch 7 + 12 purge + embargo; calendar-date purge predicate), `WalkForwardSplitter` (single-path baseline; length-only horizon validation), `CPCVSplitter` (`split` per combination + `expected_path_count` + `path_assignments` path-stitching map). CPCV N=6 k=2 = 5 paths pinned. 41 new tests. Splitter stubs all wired; `Runner.run_cpcv` still stubbed. PR #36.
 - **PR 4 shipped (validation.trial_registry)**: `TrialRegistry(db_path, naive_effective_n=1)` SQLite WAL-backed. `record(...)` + `effective_n_and_sr_variance(...)` returning `(n_effective, v_sr)` for DSR. naive method (PCA deferred to v1.1; structural NotImplementedError because the scalar schema lacks return-series). Concurrent-write acceptance test (two spawn processes x 50 trials -> 100 rows). Bailey-LdP 0.766 anchor reproduced through the registry. 27 new tests. ADR 0003 amendment footer reconciles the dec-21 default-method + PCA-threshold contradictions.
-- **Remaining M4**: `Runner.run_cpcv` body (consumes `CPCVSplitter` + `BacktestPathDistribution[BacktestResult]`); `analytics.scorecard.to_markdown()` (LdP ch 14 Markdown render); `confidence_tier` render-path enforcement wiring + the `TrialRegistry`-to-`dsr` scorecard plumbing; `docs/TESTING.md`.
+- **PR 5 shipped (result adapter + scorecard render + run_cpcv deferral + TESTING.md)**: `analytics/result_adapter.py::to_backtest_result` (ConstantWeightDemoResult -> BacktestResult; per-period sr_hat, non-excess gamma_4, record-then-query TrialRegistry for DSR, dataset_fingerprint = bundle name); `Scorecard.to_markdown()` (six-section LdP ch14 render with censored-drawdown marker); `Runner.run_cpcv` deferred to M5 with an ADR 0003 amendment footer; `docs/TESTING.md`. 23 new tests. **M4 SHIPPED.**
+- **Deferred to M5**: `Runner.run_cpcv` orchestration body (needs the fit/predict per-split strategy semantics the momentum study defines; redesigned signature lands in M5).
 
 ### M5 (week 10): worked momentum study and README reproducibility
 
