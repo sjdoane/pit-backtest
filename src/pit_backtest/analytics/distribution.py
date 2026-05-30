@@ -6,40 +6,63 @@ medians, and aggregation methods; an aggregate mean is intentionally
 NOT exposed because reporting `mean(per_path_sr)` as a scalar is the
 anti-pattern ADR 0001 dec 4 calls out.
 
-Implementation notes (per the M4 PR 2 Plan-reviewer):
-- **Medium 5**: TypeVar `T` is intentionally UNBOUNDED. The
-  Plan-reviewer rejected the original plan's `runtime_checkable
-  Protocol Comparable` as over-engineered; bounding to `float` was the
-  proposed alternative but the existing `engine/runner.py:92` stub
-  declares `run_cpcv -> BacktestPathDistribution[BacktestResult]` so a
-  `bound=float` would break the engine surface at mypy time. The
-  unbounded TypeVar matches the original scaffold's posture and defers
-  the sortability decision (per-path Sharpe scalars vs per-path
-  BacktestResult with `__lt__` defined vs an explicit `sort_key`
-  callable) to M4 PR 3 where `run_cpcv` ships its real body. The
-  runtime sort at `percentiles` raises `TypeError` if `T` lacks
-  `__lt__`; the caller's contract is to construct with a sortable `T`.
-- **Medium 6**: `__init__` raises on empty paths (consistent with the
-  codebase loud-failure discipline) rather than the prior warning-only
-  posture. Sparse `path_count < 30` continues to warn.
-- **High 2**: percentile algorithm is nearest-rank via `math.ceil`,
-  defended on first principles (deterministic across version bumps;
-  matches `scipy.stats.scoreatpercentile(interpolation_method='lower')`
+Implementation notes:
+- **TypeVar T (ADR 0015)**: `T` is bounded by the `SupportsRichComparison`
+  Protocol (structural; non-`runtime_checkable`). Any type with `__lt__`
+  defined satisfies it. `float` and `BacktestResult` (which gained
+  `__lt__` keyed on `sr_hat` per ADR 0015) both qualify. The M4 PR 2
+  prep-PR deferral of the bound is now resolved by introducing the
+  Protocol instead of `bound=float` (the original M4 PR 2 Plan-reviewer
+  Medium 5 alternative); `bound=float` would have broken the existing
+  `engine/runner.py:92` stub `run_cpcv -> BacktestPathDistribution[BacktestResult]`.
+- **Empty paths (M4 PR 2 Plan-reviewer Medium 6)**: `__init__` raises
+  on empty paths rather than warning. Sparse `path_count < 30`
+  continues to warn (the stability threshold from ADR 0001 reviewer
+  pass).
+- **Percentile algorithm (M4 PR 2 Plan-reviewer High 2)**: nearest-rank
+  via `math.ceil`, defended on first principles (deterministic across
+  version bumps; matches `scipy.stats.scoreatpercentile(interpolation_method='lower')`
   conservative-tail convention; no IEEE-754 interpolation noise at
-  small CPCV path counts). The original plan attributed nearest-rank
-  to "LdP 2018 ch. 13 convention"; grep verified zero such citation in
-  the methodology research note, so the rationale is rewritten here
-  rather than perpetuated.
+  small CPCV path counts).
 """
 
 from __future__ import annotations
 
 import math
 import warnings
-from typing import Final, Generic, TypeVar
+from typing import Any, Final, Generic, Protocol, TypeVar
 
 
-T = TypeVar("T")
+class SupportsRichComparison(Protocol):
+    """Structural type for objects supporting `<` comparison.
+
+    Per ADR 0015: bounds the `T` TypeVar on `BacktestPathDistribution`
+    so the `sorted(self._paths)` call in `percentiles` is mypy-provable
+    sortable. `float`, `int`, `Decimal`, and `BacktestResult` (which
+    defines `__lt__` keyed on `sr_hat`) all satisfy this Protocol
+    structurally.
+
+    The `other` parameter is typed `Any` approximating the
+    typeshed-style permissive shape; the actual typeshed defines
+    `SupportsRichComparison` as a `TypeAlias` over a contravariant
+    `SupportsDunderLT[Any] | SupportsDunderGT[Any]` (see
+    `mypy/typeshed/stdlib/_typeshed/__init__.pyi`). The flatter Protocol
+    declared here mypy-accepts `float`, `int`, `Decimal`, and
+    `BacktestResult` against the bound. `_typeshed` is stubs-only and
+    not importable at runtime, so the project ships its own Protocol.
+    Using `object` here would fail Protocol contravariance for `float`
+    (whose `__lt__` takes a narrower type than `object`).
+
+    NOT `runtime_checkable` (matches the M4 PR 2 Plan-reviewer Medium 5
+    rejection of an `isinstance`-gated `Comparable` Protocol); the
+    runtime sort raises `TypeError` from the stdlib if `T` is non-sortable,
+    which is the caller's contract to avoid.
+    """
+
+    def __lt__(self, other: Any, /) -> bool: ...
+
+
+T = TypeVar("T", bound=SupportsRichComparison)
 
 _MIN_STABLE_PATH_COUNT: Final[int] = 30
 
@@ -120,13 +143,10 @@ class BacktestPathDistribution(Generic[T]):
                 f"percentiles requires every value in [0, 100]; "
                 f"got out-of-range: {invalid}"
             )
-        # The unbounded TypeVar requires us to bypass mypy's sortable
-        # check here; the caller's contract is to construct with a
-        # sortable T. M4 PR 3 picks the per-path emission shape.
-        # TODO(M4 PR 3): when the per-path emission type is fixed, swap
-        # the unbounded TypeVar for either `bound=float` or a
-        # `bound=SupportsRichComparison` Protocol and remove this ignore.
-        sorted_paths = sorted(self._paths)  # type: ignore[type-var]
+        # Per ADR 0015 the TypeVar T is bounded by SupportsRichComparison
+        # so mypy proves sortability at this call site without an
+        # explicit ignore comment. The M4 PR 2 TODO(M4 PR 3) is resolved.
+        sorted_paths = sorted(self._paths)
         n = len(sorted_paths)
         result: dict[float, T] = {}
         for p in percentiles:

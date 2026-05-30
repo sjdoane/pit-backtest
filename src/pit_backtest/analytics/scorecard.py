@@ -94,6 +94,12 @@ class BacktestResult(BaseModel):
 
     Per ADR 0003 architecture: the render-path enforcement on raw SR
     without PSR/DSR fires here, in the Pydantic model validator.
+
+    Per ADR 0015: `__lt__` is defined on `sr_hat` so
+    `BacktestPathDistribution[BacktestResult].percentiles` can call
+    `sorted()` without a `type: ignore`. The ordering key matches the
+    LdP 2018 chapter 13 + 14 convention of per-path Sharpe as the
+    canonical CPCV path-ranking surface.
     """
 
     model_config = _SCORECARD_CONFIG
@@ -117,3 +123,8 @@ class BacktestResult(BaseModel):
                 "ConfidenceTier.SINGLE_RUN_PRE_SPECIFIED."
             )
         return self
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, BacktestResult):
+            return NotImplemented
+        return self.sr_hat < other.sr_hat

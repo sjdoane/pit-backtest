@@ -1,8 +1,11 @@
 """CVSplitter, PurgedKFoldSplitter, WalkForwardSplitter, CPCVSplitter.
 
 Per ADR 0001 decision 3: CPCV is primary; walk-forward is a CPCV
-configuration with one path. Per ADR 0003 decision 17: WalkForwardSplitter
-ships alongside as a sanity-check baseline.
+configuration with one path. Per ADR 0002 decision 17: WalkForwardSplitter
+ships alongside as a sanity-check baseline (the original stub mis-cited
+ADR 0003 decision 17; that decision is "Single-currency USD assumption"
+and ADR 0003 itself cross-references ADR 0002 dec 17 at line 583; the
+attribution was corrected by ADR 0015).
 """
 
 from __future__ import annotations
@@ -16,12 +19,35 @@ import polars as pl
 
 @attrs.frozen(slots=True)
 class Split:
-    """A single train/test split produced by a CVSplitter."""
+    """A single train/test split produced by a CVSplitter.
+
+    Per ADR 0015 the `test_groups` field carries the group indices that
+    the `test_indices` chunks came from, so the future
+    `Runner.run_cpcv` body can stitch per-fold test predictions into
+    per-path equity curves without re-deriving the group membership
+    from the Split's index sets.
+
+    Per-splitter semantics:
+      - `PurgedKFoldSplitter`: `test_groups` is a length-1 tuple
+        `(fold_index,)`.
+      - `WalkForwardSplitter`: `test_groups` is the empty tuple `()`
+        (single-window walk-forward has no group structure per ADR 0002
+        dec 17's "sanity-check baseline" framing).
+      - `CPCVSplitter`: `test_groups` is a length-`k_test` tuple of the
+        held-out group indices in ascending order (matching the
+        `sorted(itertools.combinations)` enumeration).
+
+    All five tuple fields are sorted ascending; `test_groups` ordering
+    is independently invariant (it is NOT a subset of test_indices) so
+    a regression that permutes the combination iteration order would
+    surface as a test_groups ordering failure.
+    """
 
     train_indices: tuple[int, ...]
     test_indices: tuple[int, ...]
     purged_indices: tuple[int, ...]
     embargo_indices: tuple[int, ...]
+    test_groups: tuple[int, ...]
 
 
 class CVSplitter(Protocol):
@@ -47,7 +73,7 @@ class PurgedKFoldSplitter(CVSplitter):
 
 
 class WalkForwardSplitter(CVSplitter):
-    """Single-path baseline; per ADR 0003 decision 17 catches a class of
+    """Single-path baseline; per ADR 0002 decision 17 catches a class of
     CPCV implementation bugs.
     """
 
