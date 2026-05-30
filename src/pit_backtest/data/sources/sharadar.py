@@ -26,14 +26,17 @@ structural lookahead protection.
 M3 PR 3 (#26): get_corporate_actions + get_cash_flows + get_delisting
 shipped via discriminated-union dispatch over the Sharadar ACTIONS
 string + TICKERS-derived delisting record.
-M3 PR 4 (this PR): members_at shipped via lazy `_sp500_universe`
-cached_property backed by `data.universe.SharadarSP500Universe`. v1
-universe_id allowlist is {"sp500"}; Russell 1000 and custom universes
-are v1.1 scope.
+M3 PR 4: members_at shipped via lazy `_sp500_universe` cached_property
+backed by `data.universe.SharadarSP500Universe`. v1 universe_id allowlist
+is {"sp500"}; Russell 1000 and custom universes are v1.1 scope.
 
-All per-row PitDataSource methods now have real bodies. M3 PR 5 lands
-the data quality contracts that gate ingest plus the IsMemberAt(t)
-demo per ADR 0002 acceptance criterion 1.
+M3 PR 5a (this PR): `__init__` now wires `check_snapshot_freshness` and
+`run_data_quality_contracts` per ADR 0002 dec 12 + ADR 0003 dec 16. The
+freshness check emits a WARNING at 30 days and a STALE-tagged WARNING at
+90 days; the contracts runner aggregates failures across the five
+invariants and raises `DataQualityError` on any. M1 SPY-only bundles do
+not ship TICKERS / SF1 / SP500 so the contracts that reference those
+tables skip with INFO logs; construction succeeds.
 """
 
 from __future__ import annotations
@@ -47,6 +50,10 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import polars as pl
 
+from pit_backtest.data.contracts import (
+    check_snapshot_freshness,
+    run_data_quality_contracts,
+)
 from pit_backtest.data.records import (
     AssetId,
     CashFlow,
@@ -315,6 +322,12 @@ class SharadarDataSource(PitDataSource):
         verify_bundle(snapshot_bundle, self._snapshots_root, self._manifest)
         self._bundle_dir = self._snapshots_root / snapshot_bundle
         self._lazy_cache: dict[str, pl.LazyFrame] = {}
+        # M3 PR 5a: ingest-time gates per ADR 0002 dec 12 + ADR 0003 dec 16.
+        # The freshness check runs first so an operator sees the WARNING
+        # even when a contract subsequently raises. Both helpers consume
+        # the manifest and the lazy cache that were initialized above.
+        check_snapshot_freshness(self.bundle_entry)
+        run_data_quality_contracts(self)
 
     @property
     def bundle_name(self) -> str:
@@ -323,6 +336,24 @@ class SharadarDataSource(PitDataSource):
     @property
     def bundle_entry(self) -> SnapshotBundleEntry:
         return self._manifest[self._bundle_name]
+
+    @cached_property
+    def available_tables(self) -> frozenset[str]:
+        """Set of Sharadar table names whose parquet files were declared in
+        the manifest for this bundle.
+
+        M3 PR 5a runner consumes this to skip contracts whose
+        `required_tables` are not all present (M1 SPY-only demos do not
+        ship TICKERS / SF1 / SP500 so the contracts that reference those
+        tables skip with an INFO log; the construction itself still
+        succeeds).
+        """
+        bundle_filenames = set(self.bundle_entry.files.keys())
+        return frozenset(
+            name
+            for name, filename in _TABLE_FILENAMES.items()
+            if filename in bundle_filenames
+        )
 
     @cached_property
     def _resolver(self) -> SharadarPermatickerResolver:
