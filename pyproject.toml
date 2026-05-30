@@ -101,6 +101,7 @@ env = [
 markers = [
     "kill_gate: tests that gate the M1 SPY reconciliation; failure ends the project per the kill-early rule",
     "snapshot: tests that require a Sharadar or SSGA snapshot; skipped in CI",
+    "dormant_until_m3: tests for contracts that are dormant at M2 per their ADR; M3 contributors must reckon with these markers before activating the contract (per ADR 0011 / cost-model tolerance dormancy)",
 ]
 filterwarnings = [
     "error",  # warnings are errors in tests; explicit allowlists below
