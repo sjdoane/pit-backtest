@@ -103,6 +103,14 @@ Scope: `analytics.sharpe` (PSR, DSR, MinTRL); `analytics.drawdown`; `analytics.c
 
 Acceptance: PSR/DSR/MinTRL match the Bailey-LdP 2014 numerical example (DSR=0.766 within 1e-3 per ADR 0013; the original 0.971 came from incorrect inverse-normal quantile values in the methodology doc, corrected by ADR 0013); CPCV N=6 k=2 produces 5 paths as `BacktestPathDistribution`; walk-forward produces a single-path result; trial registry survives concurrent writes; render with raw SR errors unless `confidence_tier=single_run_pre_specified` and N=1; full scorecard renders for SPY.
 
+Progress:
+- **PR 1 shipped (analytics.sharpe)**: PSR + DSR + MinTRL against ADR 0013 (prep PR #31 corrected the wrong 0.971 DSR pin to 0.766). No scipy; Phi via `math.erf`; Phi_inv via Acklam 1998. DSR acceptance pin 0.766 within 1e-3 reproduced. PR #32.
+- **PR 2 shipped (analytics.drawdown + concentration + distribution)**: `max_drawdown`, `drawdown_duration_report` (ADR 0014 `DrawdownDurationReport` record), `calmar_ratio` (21-bar floor per post-impl Medium 4), `hhi` (all-zero raises), `BacktestPathDistribution.percentiles/median/p10/p90` (nearest-rank). PR #34.
+- **Prep PR 3a shipped (ADR 0015)**: `SupportsRichComparison` Protocol bound on `BacktestPathDistribution[T]`; `BacktestResult.__lt__` keyed on `sr_hat`; `Split.test_groups` 5th field; cv.py ADR-attribution fix at two sites. PR #35.
+- **PR 3b shipped (validation.cv splitter bodies)**: `PurgedKFoldSplitter` (LdP ch 7 + 12 purge + embargo; calendar-date purge predicate), `WalkForwardSplitter` (single-path baseline; length-only horizon validation), `CPCVSplitter` (`split` per combination + `expected_path_count` + `path_assignments` path-stitching map). CPCV N=6 k=2 = 5 paths pinned. 40 new tests. Splitter stubs all wired; `Runner.run_cpcv` still stubbed.
+- **PR 4 (next): `validation.trial_registry`** (SQLite WAL, single-machine concurrent) feeding the DSR effective-N + SR-variance terms.
+- **Remaining M4**: `Runner.run_cpcv` body (consumes `CPCVSplitter` + `BacktestPathDistribution[BacktestResult]`); `analytics.scorecard.to_markdown()` (LdP ch 14 Markdown render); `confidence_tier` render-path enforcement wiring; `docs/TESTING.md`.
+
 ### M5 (week 10): worked momentum study and README reproducibility
 
 Goal: a concrete worked example demonstrating PIT discipline, cost realism, and CPCV validation on a single factor, with full reproducibility.
