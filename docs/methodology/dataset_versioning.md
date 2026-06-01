@@ -25,12 +25,12 @@ The v1 inventory is fixed by ADR 0001 decision 10. The sources, their roles, and
 | Sharadar ACTIONS | ACTIONS | Corporate events: dividends (per-share cash), splits (ratio), spin-offs, transfers, mergers. The dividend rows are the source of truth for the M1 SPY TR reconstruction (per docs/methodology/total_return_reconstruction.md the engine uses `closeunadj` + ACTIONS dividends, not SEP's back-adjusted `close`). | Event-driven; vendor updates same-day for U.S. equities |
 | Sharadar SF1 ARQ | SF1 (filtered to `dimension == "ARQ"`) | Point-in-time fundamentals (revenue, earnings, book value, shares outstanding) as originally reported | Quarterly per filing; vendor updates within 24h of SEC submission |
 | Sharadar TICKERS | TICKERS | Identifier history: `permaticker`, ticker, CUSIP, first/last price dates, delisting metadata | Daily |
-| Sharadar SP500 | SP500 | S&P 500 membership event log: add/drop events with effective dates | Event-driven; vendor updates within days of S&P announcement |
+| Sharadar SP500 | SP500 | S&P 500 membership. Four `action` types: `historical` (a quarterly point-in-time membership snapshot at each quarter-end) and `current` (the latest roster) are the PRIMARY membership source the universe reads; `added`/`removed` are the effective-date event log, validated as a cross-check (ADR 0017). The quarterly snapshots give membership at quarterly resolution (staleness 0 to ~92 days); the event log reaches back to 1957, deeper than the price era. | Event-driven; vendor updates within days of S&P announcement |
 | SSGA SPY | (CSV export from fund page) | SPY NAV TR for M1 reconciliation; SPY distributions history for the dividend table cross-check | Daily for NAV; per-distribution for dividends |
 
 Sharadar is the v1 source for all five equity tables. The five tables are pulled together as a single snapshot bundle on every refresh so that the dual-timestamp model (period_end_dt, available_dt) is internally consistent across tables at the pull moment. The SSGA SPY data is pulled separately and is required only for the M1 reconciliation harness.
 
-Documented gaps deferred to v1.1 per ADR 0001 decision 11: borrow availability and rate feed; full PIT S&P 500 reconstitution effective dates beyond what the SP500 event log captures.
+Documented gaps deferred to v1.1 per ADR 0001 decision 11: borrow availability and rate feed; reconstructing PIT S&P 500 membership at effective-date (rather than quarterly-snapshot) resolution by reconciling the snapshots with the `added`/`removed` event log (ADR 0017 decision 3).
 
 ## Pull procedure
 

@@ -740,7 +740,7 @@ class SharadarDataSource(PitDataSource):
 
         Mirrors the resolver pattern: M1/M2 demos that never call
         `members_at` pay nothing for the universe; per-row callers
-        amortize the event-log replay cost across every subsequent call.
+        amortize the snapshot-build cost across every subsequent call.
 
         The local import avoids any circularity at module-import time
         (`universe.py` TYPE_CHECKING-imports `SharadarDataSource`; the
@@ -977,9 +977,9 @@ class SharadarDataSource(PitDataSource):
         """PIT universe membership read.
 
         Dispatches by `universe_id`. v1 supports `"sp500"` only; the
-        Sharadar SP500 event log is replayed lazily via the
-        `_sp500_universe` cached_property. Other universes (Russell 1000,
-        custom) are v1.1 scope and extend the dispatch.
+        Sharadar SP500 quarterly membership snapshots back the lazy
+        `_sp500_universe` cached_property (ADR 0017). Other universes
+        (Russell 1000, custom) are v1.1 scope and extend the dispatch.
 
         Per Plan-reviewer Medium 8 the error format mirrors
         `get_table`: name the rejected universe_id, name the accepted
@@ -995,10 +995,11 @@ class SharadarDataSource(PitDataSource):
             sp500.parquet (propagates from the universe construction
             on first call; subsequent calls hit the cached_property
             and re-raise the FileNotFoundError instance).
-          UniverseValidationError: when the SP500 event log fails the
-            replay state machine (double-add, remove-without-add,
-            unknown action, resolver-unknown-ticker; see
-            `data/universe.py` for the locked failure-mode list).
+          UniverseValidationError: when a SP500 snapshot member ticker
+            does not resolve to exactly one AssetId (ticker absent from
+            TICKERS, or ticker reuse mapping to multiple permatickers; see
+            `data/universe.py` for the locked failure-mode list per ADR
+            0017).
         """
         if universe_id != "sp500":
             raise ValueError(

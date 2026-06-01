@@ -23,9 +23,13 @@ Hand computation:
   - Current cohort CAGR = 2.0 ** (1/14.9979) - 1 = 4.731% approx.
   - CAGR delta = +3.232 pp = +323.2 bps approx.
 
-The PR 5a data quality contracts run at `SharadarDataSource.__init__`;
-the fixture ships sep + actions + tickers + sp500 (no sf1) so contracts
-3 and 4 skip; contracts 1, 2, 5, 6 must pass on the rows below.
+Membership is expressed via the ADR 0017 snapshot model: a 2009-12-31
+`historical` snapshot for the PIT cohort and a 2025-01-03 `current`
+snapshot for the current cohort. The data quality contracts run at
+`SharadarDataSource.__init__`; the fixture ships sep + actions + tickers +
+sp500 (no sf1) so the two SF1 contracts skip; the five others (first-price,
+no-sep-after-delisting, snapshot-resolve, no-duplicate-sp500, and the
+added/removed cross-check) must pass on the rows below.
 """
 
 from __future__ import annotations
@@ -143,11 +147,16 @@ def _build_survivorship_bundle(tmp_path: Path) -> Path:
         },
     ]
 
+    # ADR 0017 snapshot model: membership comes from the historical/current
+    # snapshots. A 2009-12-31 snapshot holds the PIT cohort (SURV + DEAD); a
+    # 2025-01-03 current snapshot holds the current cohort (SURV + NEW; DEAD
+    # has dropped). No added/removed events, so the cross-check has nothing
+    # to reconcile.
     sp500_rows = [
-        {"ticker": "SURV", "date": date(2009, 12, 15), "action": "added"},
-        {"ticker": "DEAD", "date": date(2009, 12, 15), "action": "added"},
-        {"ticker": "DEAD", "date": date(2017, 6, 30), "action": "removed"},
-        {"ticker": "NEW", "date": date(2015, 3, 2), "action": "added"},
+        {"ticker": "SURV", "date": date(2009, 12, 31), "action": "historical"},
+        {"ticker": "DEAD", "date": date(2009, 12, 31), "action": "historical"},
+        {"ticker": "SURV", "date": _AS_OF_DATE, "action": "current"},
+        {"ticker": "NEW", "date": _AS_OF_DATE, "action": "current"},
     ]
 
     # Write parquets + manifest. Empty ACTIONS still needs a parquet
@@ -209,8 +218,8 @@ def test_survivorship_report_pit_count_against_synthetic_bundle(
     tmp_path: Path,
 ) -> None:
     report = _build_report(tmp_path)
-    # SURV (added 2009-12-15) + DEAD (added 2009-12-15) are SP500 members
-    # at 2010-01-04; NEW (added 2015-03-02) is not yet.
+    # The 2009-12-31 snapshot (the most recent on or before 2010-01-04)
+    # holds SURV + DEAD; NEW is not in it.
     assert report.pit_count == 2
 
 
@@ -218,8 +227,7 @@ def test_survivorship_report_current_count_against_synthetic_bundle(
     tmp_path: Path,
 ) -> None:
     report = _build_report(tmp_path)
-    # SURV (open-ended) + NEW (open-ended; added 2015-03-02) are SP500
-    # members at 2025-01-03; DEAD was removed 2017-06-30.
+    # The 2025-01-03 current snapshot holds SURV + NEW; DEAD has dropped.
     assert report.current_count == 2
 
 

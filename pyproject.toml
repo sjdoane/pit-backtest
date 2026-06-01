@@ -83,6 +83,18 @@ warn_unused_ignores = true
 warn_no_return = true
 warn_unreachable = true
 
+[[tool.mypy.overrides]]
+# matplotlib is an optional, auxiliary plotting dependency imported lazily
+# inside analytics/sensitivity.py::render_optional_plot (guarded by
+# try/except ImportError). It is not a declared core or extra dependency
+# and ships no type information mypy resolves, so under strict mode the
+# import is import-not-found whenever matplotlib is not installed. Ignoring
+# its missing imports keeps `mypy src/pit_backtest` green regardless of
+# whether the optional plotting dependency is present; the band table from
+# render_band_table, not the plot, is the canonical sensitivity artifact.
+module = ["matplotlib.*"]
+ignore_missing_imports = true
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true

@@ -124,6 +124,11 @@ Acceptance: momentum study Markdown report with the honest DSR conclusion (passi
 
 Fallback if week 10 ends without the full Markdown report: ship the CPCV fan chart plus a one-paragraph honest DSR conclusion in the README; the full report becomes a v1.1 polish item.
 
+M5 progress:
+- **ADR 0016 + M5 PR 1 shipped**: `run_cpcv` signature redesign + the CPCV-degeneracy-for-a-deterministic-factor finding + the stationary block-bootstrap path-uncertainty plan (ADR 0016); the JT1993 12-1 total-return momentum signal (`signal/momentum.py`, PR 1).
+- **M5 universe rework shipped (ADR 0017)**: `SharadarSP500Universe` reworked from event-replay to quarterly snapshots. The real Sharadar SP500 table publishes membership as 113 quarterly `historical` snapshots plus a `current` roster, not only an add/drop event log; the M3 replay crashed on the 57k snapshot rows. `members_at(t)` now returns the most-recent snapshot on or before `t`; members resolve by date-agnostic ticker string; `added`/`removed` are demoted to a raising cross-check contract (`_DEFAULT_CONTRACTS` 6 -> 7). Prerequisite for the PR 3 study: the survivorship-bias-free `sharadar_2026-05-31` bundle loads contract-clean and `members_at` returns ~500 across 2005-2024.
+- **Remaining**: PR 2 (`run_cpcv` body + `TopQuintileLongPolicy` + the block bootstrap + the real `PitView` BarLoop wiring, against ADR 0016); PR 3 (the worked study on the real bundle); PR 4 (`scripts/figures/` + `docs/METHODOLOGY.md` + M5 SHIPPED).
+
 ### v1.1 backlog (explicit)
 
 Deferred to v1.1 or later, tracked here so they do not get lost:
