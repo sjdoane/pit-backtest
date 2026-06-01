@@ -98,3 +98,62 @@ def stationary_block_bootstrap(
 ## Status
 
 Accepted. M5 PR 2 implements `Runner.run_cpcv`, `TopQuintileLongPolicy`, the real `PitView` BarLoop wiring, and `analytics/bootstrap.py::stationary_block_bootstrap` against the contract locked above. The M5 study (PR 3) composes them with PSR/DSR + the cost band + year-by-year into the honest momentum report. Revisiting any decision requires a superseding ADR.
+
+## Amendment 2026-06-01 (M5 PR 2c implementation)
+
+Recorded when implementing the `Runner.run_cpcv` body. The four ADR-locked
+positionals and the CPCV semantics (decisions 1 to 4) are unchanged; this
+amendment records the small additions the body required.
+
+1. Signature drift (keyword-only analytics parameters). The implemented
+   signature carries the four locked positionals (`cv_splitter`,
+   `observations`, `label_horizons`, `bar_loop_factory`) PLUS four keyword-only
+   parameters: `registry: TrialRegistry`, `strategy_family: str`,
+   `universe_id: str`, and `periods_per_year: int = 252`. Justified by
+   decision 3: the body feeds each stitched per-path equity curve to
+   `analytics.result_adapter.to_backtest_result`, which requires a registry
+   (the DSR record-then-query), a strategy family and universe id (the registry
+   partition keys), and a periods-per-year for the annualization. These were
+   not enumerable when decision 1 fixed the four-positional shape. Note that
+   `label_horizons` is validated by `cv_splitter.split` but does NOT affect the
+   deterministic-factor output (the embargo-invariance test proves this); it is
+   the purge/embargo input for the future ML per-combination-fit case
+   (decision 7), which `run_cpcv` does not run.
+
+2. Registry namespacing for the CPCV-path trials (resolves the Plan-reviewer
+   Critical 2). The phi reconstructed paths are byte-identical for a
+   deterministic factor (decision 4), so their `sr_hat` values are identical
+   and their within-family Sharpe variance `v_sr` is exactly 0. Were those path
+   trials recorded into the study's DSR family, a later query of that family
+   with `naive_effective_n > 1` would read a near-zero `v_sr` and INFLATE the
+   Deflated Sharpe Ratio (a smaller cross-sectional variance deflates less),
+   corrupting the study's headline honesty metric. `run_cpcv` therefore isolates
+   the path trials: it opens a derived sibling `TrialRegistry` over the SAME db
+   file as the passed registry (`TrialRegistry(registry.db_path,
+   naive_effective_n=1)`) and records each path under the namespaced family
+   `f"{strategy_family}::cpcv_paths"`. The forced `naive_effective_n=1`
+   degenerates the per-path DSR query to PSR and sidesteps the
+   single-trial-with-`naive>1` loud failure in `effective_n_and_sr_variance`;
+   the `::cpcv_paths` namespace keeps the study family's `(n_effective, v_sr)`
+   untouched (isolation is by `strategy_family`, since the path trials share the
+   study's `dataset_fingerprint`, which is `demo.sharadar_bundle`). A public
+   `TrialRegistry.db_path` property was added to support this.
+
+3. Helper promotions. The private contiguous-fold helper `_contiguous_folds`
+   was promoted to public `contiguous_folds` in `validation/cv.py` (the ADR and
+   PR spec both referred to it without the underscore), and a public
+   `CPCVSplitter.n_groups` property was added, so `run_cpcv` derives the N
+   per-group windows from the same source of truth the splitter uses internally
+   rather than re-implementing the remainder-front partition.
+
+4. Seam-cost honesty (zero-cost fixture scope). Decision 2's seam-cost artifact
+   (each per-group BarLoop re-enters from all-cash, charging a commission seam
+   that biases the CPCV path level below a contiguous run) is NOT demonstrated
+   in PR 2c: the unit tests wire the zero-cost `CloseFillMatchingEngine`, so the
+   only stitched-vs-contiguous difference is the omitted inter-group gap-day
+   bars, NOT a commission bias. The `_stitch_path` unit test pins the
+   running-level carry and the injected 0% seam return (the engine-agnostic
+   invariant). The commission seam artifact and the contiguous full-period level
+   reference are PR 3 deliverables against the real cost-bearing bundle, per the
+   decision 2 warning not to mistake (or manufacture) the CPCV-below-contiguous
+   gap.

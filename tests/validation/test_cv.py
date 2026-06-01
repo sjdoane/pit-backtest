@@ -25,7 +25,7 @@ from pit_backtest.validation.cv import (
     PurgedKFoldSplitter,
     Split,
     WalkForwardSplitter,
-    _contiguous_folds,
+    contiguous_folds,
 )
 
 
@@ -46,16 +46,16 @@ def _k_day_horizon(n: int, k: int) -> pl.Series:
     )
 
 
-# ----- _contiguous_folds convention (Plan-reviewer M2) -----
+# ----- contiguous_folds convention (Plan-reviewer M2) -----
 
 
 def test_contiguous_folds_even_division() -> None:
-    assert _contiguous_folds(20, 5) == ((0, 4), (4, 8), (8, 12), (12, 16), (16, 20))
+    assert contiguous_folds(20, 5) == ((0, 4), (4, 8), (8, 12), (12, 16), (16, 20))
 
 
 def test_contiguous_folds_remainder_front_matches_numpy_array_split() -> None:
     """n=11, k=3: numpy.array_split puts the larger chunks first."""
-    assert _contiguous_folds(11, 3) == ((0, 4), (4, 8), (8, 11))
+    assert contiguous_folds(11, 3) == ((0, 4), (4, 8), (8, 11))
 
 
 # ----- PurgedKFoldSplitter acceptance -----
@@ -390,6 +390,13 @@ def test_cpcv_expected_path_count_regression(
     off-by-floor-division regression is caught. phi = (k/N) * C(N,k).
     """
     assert CPCVSplitter(n_groups, k_test).expected_path_count() == expected
+
+
+def test_cpcv_n_groups_property() -> None:
+    """The public n_groups accessor reports N (Runner.run_cpcv reads it to
+    derive the per-group windows rather than re-deriving the partition)."""
+    assert CPCVSplitter(n_groups=6, k_test=2).n_groups == 6
+    assert CPCVSplitter(n_groups=4, k_test=3).n_groups == 4
 
 
 def test_cpcv_walk_forward_degenerate_equivalence_single_combination() -> None:

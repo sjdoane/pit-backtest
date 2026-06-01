@@ -147,7 +147,7 @@ def _require_label_horizons(
         )
 
 
-def _contiguous_folds(n_obs: int, k: int) -> tuple[tuple[int, int], ...]:
+def contiguous_folds(n_obs: int, k: int) -> tuple[tuple[int, int], ...]:
     """Partition range(n_obs) into k contiguous (start, end_exclusive) folds.
 
     Remainder-front convention matching `numpy.array_split`: the first
@@ -239,7 +239,7 @@ class PurgedKFoldSplitter(CVSplitter):
         dt_values = observations["dt"].to_list()
         horizon_values = label_horizons.to_list()
         embargo_count = _embargo_count(n_obs, self._embargo_pct)
-        folds = _contiguous_folds(n_obs, self._k)
+        folds = contiguous_folds(n_obs, self._k)
         all_indices = set(range(n_obs))
         for fold_idx, (start, end) in enumerate(folds):
             test_indices = set(range(start, end))
@@ -375,6 +375,15 @@ class CPCVSplitter(CVSplitter):
         self._k_test = k_test
         self._embargo_pct = embargo_pct
 
+    @property
+    def n_groups(self) -> int:
+        """The number of contiguous groups N the timeline is partitioned into.
+
+        Exposed so `Runner.run_cpcv` reads N from the splitter (the source of
+        truth) rather than re-deriving it from `len(path_assignments()[0])`.
+        """
+        return self._n_groups
+
     def expected_path_count(self) -> int:
         """phi(N, k) = (k / N) * C(N, k), computed as integer division.
 
@@ -435,7 +444,7 @@ class CPCVSplitter(CVSplitter):
         dt_values = observations["dt"].to_list()
         horizon_values = label_horizons.to_list()
         embargo_count = _embargo_count(n_obs, self._embargo_pct)
-        groups = _contiguous_folds(n_obs, self._n_groups)
+        groups = contiguous_folds(n_obs, self._n_groups)
         all_indices = set(range(n_obs))
         for combo in _combinatorial_test_groups(self._n_groups, self._k_test):
             test_indices: set[int] = set()
