@@ -10,15 +10,20 @@ every per-row PitDataSource method calls at the top of its body. M3 PR 1
 shipped the helper standalone; M3 PRs 2 through 4 wired it through the
 per-row paths.
 
-Contracts (M3 PR 5a deliverable):
+Contracts (M3 PR 5a deliverable; contract 5 reframed and contract 7 added
+in the M5 snapshot-universe rework per ADR 0017):
 1. Every TICKERS row has a SEP price within 5 trading days of firstpricedate.
 2. No SEP bars exist after the delisted date.
 3. SF1 datekey is non-null for ARQ rows after 1990.
 4. No duplicate (ticker, datekey) pairs in SF1.
-5. Every SP500 event ticker resolves to exactly one TICKERS row whose
-   [firstpricedate, lastpricedate] interval contains the event date.
+5. Every SP500 snapshot member ticker resolves to exactly one TICKERS
+   permaticker (ADR 0017; the snapshot universe resolves members by ticker
+   string, so this asserts the uniqueness that makes that resolution safe).
+6. No duplicate (ticker, date, action) triples in SP500.
+7. The SP500 add/drop event log reconciles with the membership snapshots
+   within the SEP price-coverage window (ADR 0017 cross-check).
 
-`run_data_quality_contracts` collects all failures across the five
+`run_data_quality_contracts` collects all failures across the seven
 contracts and raises one aggregated `DataQualityError` listing them in
 alphabetical order by contract name (operators grep on the name; a
 deterministic message is load-bearing for log-pattern alerts).
@@ -36,6 +41,7 @@ not in the future relative to any period_end_dt in the same frame. v1.1.
 from __future__ import annotations
 
 import logging
+from bisect import bisect_left
 from datetime import date, datetime, time, timedelta
 from functools import cache as _functools_cache
 from typing import TYPE_CHECKING, Callable, Protocol
@@ -292,7 +298,23 @@ class FirstPriceWithinFiveDaysContract:
         )
         sep = frames["sep"].with_columns(pl.col("date").cast(pl.Date))
 
-        candidates = tickers.filter(pl.col("firstpricedate").is_not_null())
+        # Coverage-window refinement (M5 data-quality PR): validate only
+        # TICKERS rows whose firstpricedate falls within the SEP price
+        # coverage. A name whose firstpricedate precedes the earliest SEP
+        # bar (it began trading before the pulled window, or delisted
+        # before it) legitimately has no SEP price at firstpricedate, so
+        # the five-trading-day coverage check is not applicable. Real
+        # Sharadar bundles carry an SP500 membership history (back to 1957)
+        # far deeper than the SEP price history; the original contract
+        # assumed the two coincided, which only synthetic fixtures satisfy.
+        sep_min_date = sep.get_column("date").min()
+        if sep_min_date is None:
+            return  # empty SEP; nothing to validate against
+
+        candidates = tickers.filter(
+            pl.col("firstpricedate").is_not_null()
+            & (pl.col("firstpricedate") >= sep_min_date)
+        )
         if candidates.height == 0:
             return
 
@@ -484,86 +506,92 @@ class NoDuplicateTickerDatekeyInSf1Contract:
             )
 
 
-class Sp500EventsResolveToUniqueTickersRowContract:
-    """Every SP500 event ticker resolves to exactly one TICKERS row whose
-    [firstpricedate, lastpricedate] interval contains the event date
-    (ADR 0002 dec 12 invariant 5, tightened per Plan-reviewer High 4).
+class Sp500SnapshotMembersResolveContract:
+    """Every SP500 snapshot member ticker resolves to exactly one TICKERS
+    permaticker (ADR 0002 dec 12 invariant 5, reframed for the snapshot
+    universe per ADR 0017).
 
-    The plain-English invariant "every SP500 member has a TICKERS row"
-    sounds like ticker-string coverage, but the bug class that actually
-    bites is ticker reuse across permatickers: a ticker "FOO" added 1998
-    plus a ticker "FOO" added 2015 with TICKERS only carrying the 2015
-    permaticker. A naive anti-join on ticker string passes; the universe
-    replay state machine then crashes on the 1998 event with
-    `UniverseValidationError`. This contract uses the event-date-respecting
-    join so the bug class is caught at ingest.
+    The v1 `SharadarSP500Universe` (ADR 0017) reads membership from the
+    `historical` and `current` snapshot rows and resolves each member
+    ticker to an AssetId via the resolver's DATE-AGNOSTIC
+    `resolve_ticker_unique`. The invariant that makes that resolution safe
+    is: each distinct snapshot ticker maps to exactly one TICKERS
+    permaticker. This contract asserts it at ingest.
 
-    Violations include both:
-    - match_count == 0: no TICKERS row covers the event date (the bug
-      class above).
-    - match_count > 1: ticker reuse where the event date falls in two
-      TICKERS intervals (a vendor data-quality bug we refuse to silently
-      resolve to one of the two permatickers).
+    Violations:
+    - n_permatickers == 0: the snapshot member ticker has no TICKERS row the
+      resolver would index (no row at all, or only NULL-firstpricedate rows,
+      which the resolver drops); the universe would raise
+      `UniverseValidationError`. Common cause: SP500 and TICKERS bundles
+      pulled at different vintages.
+    - n_permatickers > 1: the ticker string maps to more than one
+      permaticker (genuine ticker reuse the universe cannot silently
+      disambiguate).
 
-    Companion contract: `NoDuplicateSp500EventsContract` (PR 5b) covers
-    the SP500 (ticker, date, action) uniqueness invariant separately.
-    Without that companion a duplicate event row inflates match_count
-    here and the resulting failure message wrongly attributes the cause
-    to TICKERS-vs-SP500 ambiguity; with the companion, the duplicate
-    surfaces as its own named violation. Both contracts run by default
-    via `_DEFAULT_CONTRACTS`; alphabetical sort in the runner places
-    `no_duplicate_sp500_events` before this contract in aggregated
-    messages so the duplicate surfaces first when both fail.
+    Deliberately NOT a violation: a snapshot whose quarter-end date sits a
+    few trading days outside the member's [firstpricedate, lastpricedate]
+    price interval (spin-offs trading when-issued just before their first
+    regular-way bar; acquisition targets whose last bar precedes the
+    quarter-end removal). Those members resolve to exactly one permaticker;
+    only a date-interval-contains check would fail, and the snapshot model
+    resolves by ticker string precisely so it does not. The uniqueness
+    assertion is the guard, so this tolerance is checked, not silent
+    masking. The date-interval-contains form this contract used before ADR
+    0017 (and its SEP price-coverage window) is intentionally retired for
+    snapshot members; the add/drop EVENT log, where price-window coverage
+    matters, is validated separately by
+    `Sp500AddedRemovedCrossCheckContract`. `FirstPriceWithinFiveDaysContract`
+    keeps its own coverage-window refinement; that is an independent change.
+
+    Companion contract: `NoDuplicateSp500EventsContract` covers the SP500
+    (ticker, date, action) uniqueness invariant. Alphabetical sort in the
+    runner places `no_duplicate_sp500_events` before this contract in
+    aggregated messages.
     """
 
-    name = "sp500_events_resolve_to_unique_tickers_row"
+    name = "sp500_snapshot_members_resolve_to_unique_ticker"
     required_tables = frozenset({"sp500", "tickers"})
 
     def check(self, frames: dict[str, pl.DataFrame]) -> None:
         sp500 = frames["sp500"].with_columns(pl.col("date").cast(pl.Date))
-        tickers = frames["tickers"].with_columns(
-            pl.col("firstpricedate").cast(pl.Date),
-            pl.col("lastpricedate").cast(pl.Date),
+        snapshot_members = (
+            sp500.filter(pl.col("action").is_in(["historical", "current"]))
+            .select("ticker")
+            .unique()
         )
+        if snapshot_members.height == 0:
+            return  # no snapshot rows (e.g. event-log-only synthetic bundle)
 
-        joined = sp500.join(
-            tickers.select("ticker", "permaticker", "firstpricedate", "lastpricedate"),
-            on="ticker",
-            how="left",
-        ).with_columns(
-            (
-                pl.col("permaticker").is_not_null()
-                & (
-                    pl.col("firstpricedate").is_null()
-                    | (pl.col("firstpricedate") <= pl.col("date"))
-                )
-                & (
-                    pl.col("lastpricedate").is_null()
-                    | (pl.col("date") <= pl.col("lastpricedate"))
-                )
-            ).alias("_in_interval")
+        # Distinct permatickers per ticker string, date-agnostic: this is
+        # the exact resolution the snapshot universe performs. The resolver
+        # drops NULL-firstpricedate TICKERS rows from its index
+        # (`resolver.py` `_build_indexes`), so this count must too; otherwise
+        # a snapshot member whose only TICKERS row has a NULL firstpricedate
+        # would pass here (count == 1) yet raise UniverseValidationError at
+        # the first members_at. Matching the filter keeps the contract and
+        # the resolver on exactly one resolution invariant (ADR 0017 dec 2).
+        permaticker_counts = (
+            frames["tickers"]
+            .filter(pl.col("firstpricedate").is_not_null())
+            .group_by("ticker")
+            .agg(pl.col("permaticker").n_unique().alias("n_permatickers"))
         )
-        match_counts = joined.group_by(["ticker", "date", "action"]).agg(
-            pl.col("_in_interval").sum().alias("match_count")
-        )
-        violations = (
-            match_counts.filter(pl.col("match_count") != 1)
-            .select(
-                "ticker",
-                pl.col("date").alias("event_date"),
-                "action",
-                pl.col("match_count").cast(pl.Int64),
-            )
-            .sort(["event_date", "ticker", "action"])
-        )
+        joined = snapshot_members.join(
+            permaticker_counts, on="ticker", how="left"
+        ).with_columns(pl.col("n_permatickers").fill_null(0))
+        violations = joined.filter(pl.col("n_permatickers") != 1).sort("ticker")
         if violations.height > 0:
+            sample = violations.select(
+                "ticker", pl.col("n_permatickers").cast(pl.Int64)
+            )
             raise DataQualityError(
                 _format_violation_message(
                     self.name,
                     violations.height,
-                    violations,
-                    "SP500 event(s) that do not resolve to exactly one "
-                    "TICKERS row at the event date (match_count != 1)",
+                    sample,
+                    "SP500 snapshot member ticker(s) that do not resolve to "
+                    "exactly one TICKERS permaticker (n_permatickers != 1; "
+                    "0 = ticker absent from TICKERS, >1 = ticker reuse)",
                 )
             )
 
@@ -573,16 +601,17 @@ class NoDuplicateSp500EventsContract:
     (ADR 0002 dec 12 invariant 6; PR 5b structural fix per PR 5a
     post-impl Medium 2).
 
-    Bug class caught: a vendor pull that double-writes an SP500 event
-    row. Without this contract, the duplicate manifests inside
-    `Sp500EventsResolveToUniqueTickersRowContract` as a match_count
-    of 2+ that the error message frames as ticker reuse, masking the
-    real cause. The dedicated contract surfaces the duplicate as its
-    own named violation so log-pattern alerts attribute the failure
-    to the SP500 table rather than to TICKERS-vs-SP500 ambiguity.
+    Bug class caught: a vendor pull that double-writes an SP500 row. The
+    grouping key is the (ticker, date, action) TRIPLE, so the same ticker
+    legitimately appearing in many `historical` snapshots at DIFFERENT
+    quarter-end dates is expected and not a duplicate (ADR 0017 makes the
+    quarterly snapshots the primary membership source, so a long-tenured
+    member contributes one `historical` row per quarter-end, about 100
+    rows over the price era). Only a repeated identical triple is a
+    violation.
 
     Alphabetical sort in `run_data_quality_contracts` places this
-    contract's name before `sp500_events_resolve_to_unique_tickers_row`
+    contract's name before `sp500_snapshot_members_resolve_to_unique_ticker`
     in any aggregated message, so when both fail the operator sees the
     duplicate-event diagnosis first.
     """
@@ -609,20 +638,158 @@ class NoDuplicateSp500EventsContract:
             )
 
 
+class Sp500AddedRemovedCrossCheckContract:
+    """The SP500 add/drop event log reconciles with the membership snapshots
+    within the SEP price-coverage window (ADR 0017 cross-check).
+
+    ADR 0017 makes the quarterly `historical`/`current` snapshots the
+    primary membership source and demotes the `added`/`removed` event log
+    to this cross-check: a genuine consistency check between the two
+    membership representations Sharadar ships, not a decorative log. For
+    each event whose date falls in the SEP window [min, max] (the deep
+    pre-price-era history reaches 1957 and cannot be reconciled against
+    price-era snapshots, so it is out of scope), let S be the first
+    snapshot on or after the event date:
+
+    - removed(ticker, d): consistent if `ticker` is ABSENT from snapshot S,
+      OR an offsetting added(ticker, d') exists with d < d' <= S (the name
+      left then rejoined within the inter-snapshot window).
+    - added(ticker, d): consistent if `ticker` is PRESENT in snapshot S, OR
+      an offsetting removed(ticker, d') exists with d < d' <= S (the name
+      joined then left within the window, e.g. a brief spin-off later
+      merged away).
+
+    A residual is a real disagreement between the two representations: the
+    event log says a name left but the next snapshot still lists it (with no
+    rejoin), or says a name joined but the next snapshot omits it (with no
+    offsetting exit). Both are surfaced. The within-window offsetting-event
+    exemption is what keeps legitimate intra-quarter churn (a name added and
+    removed inside a single quarter, hence absent from the bracketing
+    snapshots) from being a false failure; it is a principled exemption, not
+    masking. On the real 2026-05-31 bundle the residual is zero.
+
+    `sep` is required for the price-coverage window. Events after the latest
+    snapshot cannot be reconciled and are skipped.
+    """
+
+    name = "sp500_added_removed_consistent_with_snapshots"
+    required_tables = frozenset({"sp500", "sep"})
+
+    def check(self, frames: dict[str, pl.DataFrame]) -> None:
+        sp500 = frames["sp500"].with_columns(pl.col("date").cast(pl.Date))
+        sep = frames["sep"].with_columns(pl.col("date").cast(pl.Date))
+        sep_min = sep.get_column("date").min()
+        sep_max = sep.get_column("date").max()
+        if sep_min is None or sep_max is None:
+            return  # empty SEP; no window to reconcile against
+
+        snapshots = sp500.filter(
+            pl.col("action").is_in(["historical", "current"])
+        )
+        snapshot_dates = sorted(snapshots.get_column("date").unique().to_list())
+        if not snapshot_dates:
+            return  # no snapshots to reconcile the event log against
+
+        members_by_date: dict[date, set[str]] = {}
+        for row in snapshots.select("ticker", "date").iter_rows(named=True):
+            members_by_date.setdefault(row["date"], set()).add(row["ticker"])
+
+        events = sp500.filter(
+            pl.col("action").is_in(["added", "removed"])
+            & (pl.col("date") >= sep_min)
+            & (pl.col("date") <= sep_max)
+        ).select("ticker", "date", "action")
+        if events.height == 0:
+            return
+
+        # Per-ticker event dates for the offsetting-event lookup.
+        events_by_ticker: dict[str, list[tuple[date, str]]] = {}
+        for row in events.iter_rows(named=True):
+            events_by_ticker.setdefault(row["ticker"], []).append(
+                (row["date"], row["action"])
+            )
+
+        violations: list[dict[str, object]] = []
+        for row in events.sort(["date", "ticker", "action"]).iter_rows(named=True):
+            ticker = row["ticker"]
+            event_date = row["date"]
+            action = row["action"]
+            # First snapshot on or after the event date (inclusive: an event
+            # effective on a quarter-end is reflected in that snapshot).
+            snap_index = bisect_left(snapshot_dates, event_date)
+            if snap_index >= len(snapshot_dates):
+                continue  # event after the last snapshot; not reconcilable
+            next_snapshot = snapshot_dates[snap_index]
+            present_next = ticker in members_by_date[next_snapshot]
+            if action == "removed":
+                if not present_next:
+                    continue  # left and gone: consistent
+                offset = any(
+                    other_action == "added"
+                    and event_date < other_date <= next_snapshot
+                    for other_date, other_action in events_by_ticker.get(ticker, ())
+                )
+                if not offset:
+                    violations.append(
+                        {
+                            "ticker": ticker,
+                            "event_date": event_date,
+                            "action": action,
+                            "inconsistency": "removed but still in next snapshot",
+                        }
+                    )
+            else:  # added
+                if present_next:
+                    continue  # joined and present: consistent
+                offset = any(
+                    other_action == "removed"
+                    and event_date < other_date <= next_snapshot
+                    for other_date, other_action in events_by_ticker.get(ticker, ())
+                )
+                if not offset:
+                    violations.append(
+                        {
+                            "ticker": ticker,
+                            "event_date": event_date,
+                            "action": action,
+                            "inconsistency": "added but absent from next snapshot",
+                        }
+                    )
+        if violations:
+            sample = pl.DataFrame(
+                sorted(
+                    violations,
+                    key=lambda v: (v["event_date"], v["ticker"], v["action"]),
+                )
+            )
+            raise DataQualityError(
+                _format_violation_message(
+                    self.name,
+                    len(violations),
+                    sample,
+                    "SP500 add/drop event(s) inconsistent with the membership "
+                    "snapshots within the SEP window (after the within-quarter "
+                    "offsetting-event exemption)",
+                )
+            )
+
+
 # Locked iteration order matches the dataset_versioning.md enumeration so
-# the canonical contract sequence is grep-able. M3 PR 5b appends the
-# NoDuplicateSp500EventsContract last (position 6); aggregated failure
-# messages are sorted alphabetically by name at the runner so the tuple
-# position only affects per-contract pass/INFO order, not user-visible
-# error ordering. Subsequent PRs that want to pass a custom subset call
-# `run_data_quality_contracts(source, contracts=(MyContract(),))`.
+# the canonical contract sequence is grep-able. The M5 snapshot rework
+# (ADR 0017) reframes position 5 (now Sp500SnapshotMembersResolveContract)
+# and appends Sp500AddedRemovedCrossCheckContract last (position 7).
+# Aggregated failure messages are sorted alphabetically by name at the
+# runner so the tuple position only affects per-contract pass/INFO order,
+# not user-visible error ordering. Subsequent PRs that want to pass a
+# custom subset call `run_data_quality_contracts(source, contracts=(...,))`.
 _DEFAULT_CONTRACTS: tuple[DataQualityContract, ...] = (
     FirstPriceWithinFiveDaysContract(),
     NoSepBarsAfterDelistingContract(),
     Sf1DatekeyNonNullAfter1990Contract(),
     NoDuplicateTickerDatekeyInSf1Contract(),
-    Sp500EventsResolveToUniqueTickersRowContract(),
+    Sp500SnapshotMembersResolveContract(),
     NoDuplicateSp500EventsContract(),
+    Sp500AddedRemovedCrossCheckContract(),
 )
 
 
@@ -645,7 +812,7 @@ def run_data_quality_contracts(
 
     Per-table cache: each required table collects exactly once across the
     contracts that need it. Shared-table inventory at v1: TICKERS by
-    contracts 1, 2, 5; SEP by 1, 2; SF1 by 3, 4; SP500 by 5 only.
+    contracts 1, 2, 5; SEP by 1, 2, 7; SF1 by 3, 4; SP500 by 5, 6, 7.
 
     Args:
       source: a SharadarDataSource (we read `available_tables`,

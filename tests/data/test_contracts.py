@@ -40,7 +40,8 @@ from pit_backtest.data.contracts import (
     NoDuplicateTickerDatekeyInSf1Contract,
     NoSepBarsAfterDelistingContract,
     Sf1DatekeyNonNullAfter1990Contract,
-    Sp500EventsResolveToUniqueTickersRowContract,
+    Sp500AddedRemovedCrossCheckContract,
+    Sp500SnapshotMembersResolveContract,
     _nth_trading_day_after,
     assert_not_lookahead,
     check_snapshot_freshness,
@@ -273,12 +274,24 @@ def test_first_price_within_five_days_passes_on_clean_bundle() -> None:
 def test_first_price_within_five_days_fails_when_sep_missing_first_bar() -> None:
     """A TICKERS row whose ticker is absent from SEP within the
     [firstpricedate, +5 trading days] window raises with the offending
-    permaticker + ticker + firstpricedate surfaced.
+    permaticker + ticker + firstpricedate surfaced. The SEP frame carries a
+    bar for a DIFFERENT ticker on GHOST's firstpricedate so the coverage
+    window is non-empty (firstpricedate >= min(SEP date)) and GHOST is a
+    candidate; GHOST itself has no in-window bar.
     """
     tickers = _tickers_frame_with_one_row(
         permaticker=42, ticker="GHOST", firstpricedate=date(2024, 4, 2)
     )
-    sep = _empty_sep_frame()
+    sep = pl.DataFrame(
+        [
+            {
+                "ticker": "OTHER",
+                "date": date(2024, 4, 2),  # establishes the SEP coverage window
+                "open": 10.0, "high": 10.0, "low": 10.0,
+                "close": 10.0, "closeunadj": 10.0, "volume": 100,
+            }
+        ]
+    )
     with pytest.raises(DataQualityError) as exc_info:
         FirstPriceWithinFiveDaysContract().check({"tickers": tickers, "sep": sep})
     message = str(exc_info.value)
@@ -288,6 +301,43 @@ def test_first_price_within_five_days_fails_when_sep_missing_first_bar() -> None
     # `.to_dicts()` surfaces dates via their `repr()` (`datetime.date(2024, 4, 2)`)
     # rather than ISO format; assert against the literal repr.
     assert "datetime.date(2024, 4, 2)" in message
+
+
+def test_first_price_within_five_days_skips_firstpricedate_before_sep_coverage() -> None:
+    """Coverage-window refinement (M5 data-quality WIP): a TICKERS row whose
+    firstpricedate precedes the earliest SEP bar began trading before the
+    pulled window, so the five-day coverage check is not applicable and the
+    row is skipped rather than flagged. Real Sharadar bundles carry SP500
+    history far deeper than the SEP price feed; only synthetic fixtures had
+    the two coincide.
+    """
+    tickers = _tickers_frame_with_one_row(
+        permaticker=42, ticker="DEEP", firstpricedate=date(1990, 1, 2)
+    )
+    sep = pl.DataFrame(
+        [
+            {
+                "ticker": "OTHER",
+                "date": date(2004, 1, 2),  # SEP coverage starts well after 1990
+                "open": 10.0, "high": 10.0, "low": 10.0,
+                "close": 10.0, "closeunadj": 10.0, "volume": 100,
+            }
+        ]
+    )
+    # No raise: DEEP's firstpricedate is outside (before) SEP coverage.
+    FirstPriceWithinFiveDaysContract().check({"tickers": tickers, "sep": sep})
+
+
+def test_first_price_within_five_days_empty_sep_is_skipped() -> None:
+    """An empty SEP table has no coverage window to validate against, so the
+    contract returns without raising (the bundle would fail other contracts
+    first; this guards the min(SEP)-is-None branch)."""
+    tickers = _tickers_frame_with_one_row(
+        permaticker=42, ticker="GHOST", firstpricedate=date(2024, 4, 2)
+    )
+    FirstPriceWithinFiveDaysContract().check(
+        {"tickers": tickers, "sep": _empty_sep_frame()}
+    )
 
 
 def test_first_price_within_five_days_with_sep_row_inside_window_passes() -> None:
@@ -539,96 +589,193 @@ def test_no_duplicate_ticker_datekey_in_sf1_dimension_discriminates_duplicates()
     NoDuplicateTickerDatekeyInSf1Contract().check({"sf1": sf1})
 
 
-# ----- Contract 5: Sp500EventsResolveToUniqueTickersRowContract -----
+# ----- Contract 5: Sp500SnapshotMembersResolveContract (ADR 0017) -----
 
 
-def test_sp500_events_resolve_to_unique_tickers_row_passes_on_clean_bundle() -> None:
-    """The shared fixture's SP500 events all resolve cleanly: SPY 1995-09-19
-    is inside SPY's TICKERS interval (1993-01-22, open); AGG 2010-06-15
-    and AGG 2015-12-31 are inside AGG's TICKERS interval (2003-09-22, open).
-    """
+def test_sp500_snapshot_members_resolve_passes_on_clean_bundle() -> None:
+    """The shared fixture's snapshot members (SPY, AGG) each resolve to
+    exactly one TICKERS permaticker."""
     frames = {
         "sp500": pl.DataFrame(_SP500_ROWS),
         "tickers": pl.DataFrame(_TICKERS_ROWS),
     }
-    Sp500EventsResolveToUniqueTickersRowContract().check(frames)
+    Sp500SnapshotMembersResolveContract().check(frames)
 
 
-def test_sp500_events_resolve_to_unique_tickers_row_fails_when_event_ticker_missing_from_tickers() -> None:
-    """The SP500-coverage bug class: an event-log ticker with no TICKERS
-    row at all (or none whose interval contains the event date) raises.
-    """
+def test_sp500_snapshot_member_absent_from_tickers_fails() -> None:
+    """A snapshot member ticker with no TICKERS row (n_permatickers == 0)."""
     sp500 = pl.DataFrame(
-        [{"ticker": "ABSENT", "date": date(2010, 1, 1), "action": "added"}]
+        [{"ticker": "ABSENT", "date": date(2010, 12, 31), "action": "historical"}]
     )
     tickers = pl.DataFrame(_TICKERS_ROWS)
     with pytest.raises(DataQualityError) as exc_info:
-        Sp500EventsResolveToUniqueTickersRowContract().check(
+        Sp500SnapshotMembersResolveContract().check(
             {"sp500": sp500, "tickers": tickers}
         )
     message = str(exc_info.value)
-    assert "sp500_events_resolve_to_unique_tickers_row" in message
+    assert "sp500_snapshot_members_resolve_to_unique_ticker" in message
     assert "ABSENT" in message
 
 
-def test_sp500_events_resolve_to_unique_tickers_row_fails_on_ticker_reuse_multi_match() -> None:
-    """The Plan-reviewer High 4 reframing: a ticker string with two
-    TICKERS rows whose intervals both contain the event date is a
-    vendor bug (we cannot resolve which permaticker the event references).
-    """
+def test_sp500_snapshot_member_ticker_reuse_fails() -> None:
+    """A snapshot member ticker mapping to two distinct permatickers
+    (n_permatickers > 1) is the ticker-reuse bug the universe cannot
+    silently disambiguate."""
     sp500 = pl.DataFrame(
-        [{"ticker": "REUSE", "date": date(2010, 6, 15), "action": "added"}]
+        [{"ticker": "REUSE", "date": date(2010, 12, 31), "action": "historical"}]
     )
     tickers = pl.DataFrame(
-        [
-            {
-                "permaticker": 800, "ticker": "REUSE",
-                "name": "First Issue", "exchange": "NYSE", "isdelisted": "N",
-                "firstpricedate": date(2005, 1, 1), "lastpricedate": None,
-                "firstquarter": date(2005, 3, 31), "lastquarter": None,
-                "cusip": "REUSE0001",
-            },
-            {
-                "permaticker": 801, "ticker": "REUSE",
-                "name": "Second Issue", "exchange": "NASDAQ", "isdelisted": "N",
-                "firstpricedate": date(2009, 1, 1), "lastpricedate": None,
-                "firstquarter": date(2009, 3, 31), "lastquarter": None,
-                "cusip": "REUSE0002",
-            },
-        ]
+        {
+            "ticker": ["REUSE", "REUSE"],
+            "permaticker": [800, 801],
+            "firstpricedate": [date(2000, 1, 3), date(2009, 1, 5)],
+        }
     )
     with pytest.raises(DataQualityError) as exc_info:
-        Sp500EventsResolveToUniqueTickersRowContract().check(
+        Sp500SnapshotMembersResolveContract().check(
             {"sp500": sp500, "tickers": tickers}
         )
     message = str(exc_info.value)
     assert "REUSE" in message
-    assert "match_count" in message
+    assert "n_permatickers" in message
 
 
-def test_sp500_events_resolve_to_unique_tickers_row_event_outside_interval_fails() -> None:
-    """An SP500 event date outside any TICKERS row's
-    [firstpricedate, lastpricedate] interval is a no-match case.
-    """
+def test_sp500_snapshot_member_with_null_firstpricedate_fails() -> None:
+    """A snapshot member whose only TICKERS row has a NULL firstpricedate is
+    dropped from the resolver index, so the universe would raise at
+    members_at. The contract matches that filter (post-impl review Medium 1):
+    such a member counts as n_permatickers == 0 and fails the gate rather
+    than passing and deferring the failure to first use."""
     sp500 = pl.DataFrame(
-        [{"ticker": "EARLY", "date": date(2000, 1, 1), "action": "added"}]
+        [{"ticker": "SHELL", "date": date(2010, 12, 31), "action": "historical"}]
     )
     tickers = pl.DataFrame(
+        {
+            "ticker": ["SHELL"],
+            "permaticker": [950],
+            "firstpricedate": [None],
+        },
+        schema={
+            "ticker": pl.String,
+            "permaticker": pl.Int64,
+            "firstpricedate": pl.Date,
+        },
+    )
+    with pytest.raises(DataQualityError) as exc_info:
+        Sp500SnapshotMembersResolveContract().check(
+            {"sp500": sp500, "tickers": tickers}
+        )
+    assert "SHELL" in str(exc_info.value)
+
+
+def test_sp500_snapshot_member_boundary_date_outside_price_interval_passes() -> None:
+    """ADR 0017 no-masking-but-tolerant regression: a snapshot whose date
+    sits a few days outside the member's price interval (a spin-off listed
+    just before its first regular-way bar, mirroring TDC 2007-09-30 vs
+    firstprice 2007-10-02) still PASSES, because resolution is by ticker
+    string and the member maps to exactly one permaticker. Only added/removed
+    EVENT-vs-snapshot consistency uses dates (the cross-check contract)."""
+    sp500 = pl.DataFrame(
+        [{"ticker": "TDC", "date": date(2007, 9, 30), "action": "historical"}]
+    )
+    tickers = pl.DataFrame(
+        {
+            "ticker": ["TDC"],
+            "permaticker": [700],
+            # firstpricedate AFTER the snapshot date; would fail a
+            # date-interval-contains check, passes ticker-string resolution.
+            "firstpricedate": [date(2007, 10, 2)],
+            "lastpricedate": [None],
+        }
+    )
+    # No raise.
+    Sp500SnapshotMembersResolveContract().check({"sp500": sp500, "tickers": tickers})
+
+
+# ----- Contract 7: Sp500AddedRemovedCrossCheckContract (ADR 0017) -----
+
+
+def _xcheck_sep(dates: list[date]) -> pl.DataFrame:
+    """Minimal SEP frame (the cross-check reads only `date` for the window)."""
+    return pl.DataFrame({"date": dates})
+
+
+def test_sp500_added_removed_cross_check_passes_on_clean_bundle() -> None:
+    """The shared fixture's add/drop events reconcile with its snapshots."""
+    frames = {
+        "sp500": pl.DataFrame(_SP500_ROWS),
+        "sep": _xcheck_sep([date(1994, 1, 3), date(2024, 3, 18)]),
+    }
+    Sp500AddedRemovedCrossCheckContract().check(frames)
+
+
+def test_sp500_added_removed_cross_check_fails_on_removed_still_present() -> None:
+    """A `removed` event whose ticker is still in the next snapshot, with no
+    re-add, is a real disagreement between the two representations."""
+    sp500 = pl.DataFrame(
         [
-            {
-                "permaticker": 900, "ticker": "EARLY",
-                "name": "Early Co", "exchange": "NYSE", "isdelisted": "N",
-                "firstpricedate": date(2010, 1, 4), "lastpricedate": None,
-                "firstquarter": date(2010, 3, 31), "lastquarter": None,
-                "cusip": "EARLY0001",
-            }
+            {"ticker": "FOO", "date": date(2010, 3, 31), "action": "historical"},
+            {"ticker": "FOO", "date": date(2010, 6, 30), "action": "historical"},
+            {"ticker": "FOO", "date": date(2010, 5, 1), "action": "removed"},
         ]
     )
     with pytest.raises(DataQualityError) as exc_info:
-        Sp500EventsResolveToUniqueTickersRowContract().check(
-            {"sp500": sp500, "tickers": tickers}
+        Sp500AddedRemovedCrossCheckContract().check(
+            {"sp500": sp500, "sep": _xcheck_sep([date(2010, 1, 1), date(2010, 12, 31)])}
         )
-    assert "EARLY" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "sp500_added_removed_consistent_with_snapshots" in message
+    assert "FOO" in message
+
+
+def test_sp500_added_removed_cross_check_fails_on_added_absent() -> None:
+    """An `added` event whose ticker is absent from the next snapshot, with
+    no offsetting removal, is a real disagreement."""
+    sp500 = pl.DataFrame(
+        [
+            {"ticker": "FOO", "date": date(2010, 3, 31), "action": "historical"},
+            {"ticker": "FOO", "date": date(2010, 6, 30), "action": "historical"},
+            {"ticker": "BAR", "date": date(2010, 5, 1), "action": "added"},
+        ]
+    )
+    with pytest.raises(DataQualityError) as exc_info:
+        Sp500AddedRemovedCrossCheckContract().check(
+            {"sp500": sp500, "sep": _xcheck_sep([date(2010, 1, 1), date(2010, 12, 31)])}
+        )
+    assert "BAR" in str(exc_info.value)
+
+
+def test_sp500_added_removed_cross_check_within_quarter_churn_passes() -> None:
+    """A ticker added then removed inside one inter-snapshot window (so
+    absent from both bracketing snapshots) is exempted, not a violation
+    (the SOLS/BMS intra-quarter-churn pattern from the real bundle)."""
+    sp500 = pl.DataFrame(
+        [
+            {"ticker": "FOO", "date": date(2010, 3, 31), "action": "historical"},
+            {"ticker": "FOO", "date": date(2010, 6, 30), "action": "historical"},
+            {"ticker": "BAR", "date": date(2010, 4, 15), "action": "added"},
+            {"ticker": "BAR", "date": date(2010, 5, 20), "action": "removed"},
+        ]
+    )
+    # No raise: the added BAR is offset by the removed BAR within the window.
+    Sp500AddedRemovedCrossCheckContract().check(
+        {"sp500": sp500, "sep": _xcheck_sep([date(2010, 1, 1), date(2010, 12, 31)])}
+    )
+
+
+def test_sp500_added_removed_cross_check_events_outside_sep_window_skipped() -> None:
+    """Events outside the SEP price window (e.g. pre-price-era adds) are not
+    reconciled and never raise."""
+    sp500 = pl.DataFrame(
+        [
+            {"ticker": "FOO", "date": date(2010, 3, 31), "action": "historical"},
+            # Pre-window add for a ticker never in a snapshot; out of scope.
+            {"ticker": "OLD", "date": date(1990, 1, 1), "action": "added"},
+        ]
+    )
+    Sp500AddedRemovedCrossCheckContract().check(
+        {"sp500": sp500, "sep": _xcheck_sep([date(2004, 1, 2), date(2024, 3, 18)])}
+    )
 
 
 # ----- Runner aggregation -----
@@ -644,7 +791,7 @@ def test_runner_all_pass_logs_pass_message(
     with caplog.at_level(logging.INFO, logger="pit_backtest.data.contracts"):
         SharadarDataSource("sharadar_2026-05-28", snapshots_root)
     assert any(
-        "all 6 data quality contracts passed" in record.message
+        "all 7 data quality contracts passed" in record.message
         for record in caplog.records
     )
 
@@ -652,22 +799,23 @@ def test_runner_all_pass_logs_pass_message(
 def test_runner_one_failing_contract_raises_with_name(
     tmp_path: Path,
 ) -> None:
-    """An SP500 row referencing a ticker that has no TICKERS coverage at
-    the event date trips Contract 5 only; the other 4 pass; the
-    aggregated error names the failing contract.
+    """An SP500 snapshot listing a ticker that has no TICKERS row trips the
+    snapshot-resolve contract only; the other 6 pass; the aggregated error
+    names the failing contract.
     """
-    # Build an inline M3 bundle where SP500 references a ticker absent
-    # from TICKERS so Contract 5 fails.
+    # Build an inline M3 bundle where an SP500 snapshot references a ticker
+    # absent from TICKERS so the snapshot-resolve contract fails. No
+    # added/removed events, so the cross-check has nothing to reconcile.
     bundle_name = "sharadar_runner_one_fail"
     snapshots_root = tmp_path / "snapshots"
     bundle_dir = snapshots_root / bundle_name
     bundle_dir.mkdir(parents=True)
 
     bad_sp500 = [
-        # Valid SPY 1995-09-19 (matches shared fixture).
-        {"ticker": "SPY", "date": date(1995, 9, 19), "action": "added"},
+        # Valid SPY snapshot member (resolves to AssetId 100).
+        {"ticker": "SPY", "date": date(2010, 12, 31), "action": "historical"},
         # Invalid: ABSENT has no TICKERS row.
-        {"ticker": "ABSENT", "date": date(2010, 1, 1), "action": "added"},
+        {"ticker": "ABSENT", "date": date(2010, 12, 31), "action": "historical"},
     ]
 
     tables: dict[str, list[dict[str, object]]] = {
@@ -702,14 +850,16 @@ pull_date = 2026-05-28
     with pytest.raises(DataQualityError) as exc_info:
         SharadarDataSource(bundle_name, snapshots_root)
     message = str(exc_info.value)
-    assert "sp500_events_resolve_to_unique_tickers_row" in message
+    assert "sp500_snapshot_members_resolve_to_unique_ticker" in message
     assert "ABSENT" in message
-    # The other 4 contracts passed; their names must NOT be in the
+    # The other 6 contracts passed; their names must NOT be in the
     # aggregated message.
     assert "tickers_first_price_within_five_days" not in message
     assert "no_sep_bars_after_delisting" not in message
     assert "sf1_datekey_non_null_after_1990" not in message
     assert "no_duplicate_ticker_datekey_in_sf1" not in message
+    assert "no_duplicate_sp500_events" not in message
+    assert "sp500_added_removed_consistent_with_snapshots" not in message
 
 
 def test_runner_aggregated_message_sorts_failing_contracts_by_name() -> None:
@@ -767,7 +917,7 @@ def test_runner_aggregated_message_sorts_failing_contracts_by_name() -> None:
 def test_runner_skips_contracts_whose_required_tables_are_absent(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Default _write_synthetic_bundle ships SEP + ACTIONS only. All five
+    """Default _write_synthetic_bundle ships SEP + ACTIONS only. All seven
     contracts require at least one table beyond that pair; the runner
     skips each with an INFO log; construction succeeds.
     """
@@ -779,13 +929,18 @@ def test_runner_skips_contracts_whose_required_tables_are_absent(
         for record in caplog.records
         if "skipping data quality contract" in record.message
     ]
-    # All 5 contracts skipped.
+    # All 7 contracts skipped.
     assert any("tickers_first_price_within_five_days" in m for m in skipped_names)
     assert any("no_sep_bars_after_delisting" in m for m in skipped_names)
     assert any("sf1_datekey_non_null_after_1990" in m for m in skipped_names)
     assert any("no_duplicate_ticker_datekey_in_sf1" in m for m in skipped_names)
     assert any(
-        "sp500_events_resolve_to_unique_tickers_row" in m
+        "sp500_snapshot_members_resolve_to_unique_ticker" in m
+        for m in skipped_names
+    )
+    assert any("no_duplicate_sp500_events" in m for m in skipped_names)
+    assert any(
+        "sp500_added_removed_consistent_with_snapshots" in m
         for m in skipped_names
     )
 
@@ -899,7 +1054,7 @@ def test_sharadar_data_source_init_runs_contracts_on_full_m3_bundle(
     with caplog.at_level(logging.INFO, logger="pit_backtest.data.contracts"):
         SharadarDataSource("sharadar_2026-05-28", snapshots_root)
     assert any(
-        "all 6 data quality contracts passed" in record.message
+        "all 7 data quality contracts passed" in record.message
         for record in caplog.records
     )
 
@@ -919,7 +1074,7 @@ def test_sharadar_data_source_init_skips_contracts_on_m1_two_table_bundle(
         for record in caplog.records
         if "skipping data quality contract" in record.message
     ]
-    assert len(skipped) == 6
+    assert len(skipped) == 7
 
 
 def test_sharadar_data_source_init_freshness_warns_loudly_on_stale_bundle(
@@ -1064,11 +1219,11 @@ def test_no_duplicate_sp500_events_dispatched_via_runner_when_sp500_present(
 
 
 def test_aggregated_message_sorts_duplicate_event_before_resolution_failure() -> None:
-    """When both Contract 5 (event-resolution) and Contract 6 (dedup) fail,
+    """When both the snapshot-resolve contract and the dedup contract fail,
     alphabetical sort in the runner places no_duplicate_sp500_events
-    BEFORE sp500_events_resolve_to_unique_tickers_row in the message.
+    BEFORE sp500_snapshot_members_resolve_to_unique_ticker in the message.
     This is the user-message ordering that Plan-reviewer Medium 7 pinned
-    as the intended PR 5b semantic.
+    as the intended PR 5b semantic (ADR 0017 keeps the ordering).
     """
 
     class _StubSource:
@@ -1077,15 +1232,16 @@ def test_aggregated_message_sorts_duplicate_event_before_resolution_failure() ->
 
         def get_table(self, name: str) -> pl.LazyFrame:
             if name == "sp500":
-                # Duplicate + unknown ticker so BOTH SP500 contracts fail.
+                # Duplicate snapshot row + unknown snapshot member so BOTH
+                # SP500 contracts (dedup + snapshot-resolve) fail.
                 return pl.LazyFrame(
                     [
-                        {"ticker": "DUP", "date": date(2020, 1, 1), "action": "added"},
-                        {"ticker": "DUP", "date": date(2020, 1, 1), "action": "added"},
-                        {"ticker": "ABSENT", "date": date(2020, 6, 1), "action": "added"},
+                        {"ticker": "DUP", "date": date(2020, 3, 31), "action": "historical"},
+                        {"ticker": "DUP", "date": date(2020, 3, 31), "action": "historical"},
+                        {"ticker": "ABSENT", "date": date(2020, 6, 30), "action": "historical"},
                     ]
                 )
-            # Empty tickers so the absent-ticker fails Contract 5.
+            # Empty tickers so the snapshot members fail to resolve.
             return pl.LazyFrame(
                 schema={
                     "ticker": pl.String, "permaticker": pl.Int64,
@@ -1097,7 +1253,7 @@ def test_aggregated_message_sorts_duplicate_event_before_resolution_failure() ->
         run_data_quality_contracts(_StubSource())  # type: ignore[arg-type]
     message = str(exc_info.value)
     assert "no_duplicate_sp500_events" in message
-    assert "sp500_events_resolve_to_unique_tickers_row" in message
+    assert "sp500_snapshot_members_resolve_to_unique_ticker" in message
     idx_dup = message.index("no_duplicate_sp500_events")
-    idx_resolve = message.index("sp500_events_resolve_to_unique_tickers_row")
+    idx_resolve = message.index("sp500_snapshot_members_resolve_to_unique_ticker")
     assert idx_dup < idx_resolve

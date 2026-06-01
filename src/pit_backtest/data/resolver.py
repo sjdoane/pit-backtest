@@ -52,6 +52,28 @@ class IdentifierResolver(Protocol):
         """
         ...
 
+    def resolve_ticker_unique(self, ticker: str) -> AssetId:
+        """Return the single AssetId that ever owned this ticker string.
+
+        Date-agnostic resolution for snapshot membership (ADR 0017). A
+        quarterly index-membership snapshot can list a ticker whose SEP
+        price interval sits a few trading days off the quarter-end (a
+        spin-off trading when-issued just before its first regular-way
+        bar, or an acquisition target whose last bar precedes the
+        quarter-end removal by a day), so the date-gated `resolve_ticker`
+        would raise `TickerNotFoundError` on a legitimate member. This
+        variant resolves by ticker string alone and raises only on genuine
+        ambiguity (the same ticker string mapped to more than one
+        permaticker, i.e. ticker reuse).
+
+        Raises:
+          TickerNotFoundError: the ticker string is not in the index.
+          ValueError: the ticker string maps to more than one permaticker
+            (ticker reuse; refuse to silently pick one, per ADR 0001
+            decision 2 spirit).
+        """
+        ...
+
     def get_ticker(self, asset_id: AssetId, dt: datetime) -> str:
         """Return the ticker an asset was trading under at dt.
 
@@ -221,6 +243,28 @@ class SharadarPermatickerResolver:
                 f"Vendor data quality issue; refuse to silently pick one."
             )
         return matches[0][2]
+
+    def resolve_ticker_unique(self, ticker: str) -> AssetId:
+        histories = self._ticker_history.get(ticker)
+        if histories is None:
+            raise TickerNotFoundError(
+                f"ticker {ticker!r} not in resolver index "
+                f"(date-agnostic unique resolution for snapshot membership)"
+            )
+        # `histories` carries (first, last, permaticker) tuples in
+        # firstpricedate order. Date-agnostic resolution takes the distinct
+        # permaticker; exactly one is the clean case (no ticker reuse). The
+        # first entry's permaticker is the deterministic choice; we then
+        # confirm every other entry agrees rather than iterating a set.
+        first_permaticker = histories[0][2]
+        if any(permaticker != first_permaticker for _, _, permaticker in histories):
+            distinct = sorted({int(permaticker) for _, _, permaticker in histories})
+            raise ValueError(
+                f"ticker {ticker!r} maps to multiple permatickers {distinct}; "
+                f"date-agnostic resolution cannot pick one. Vendor ticker "
+                f"reuse; resolve via resolve_ticker(dt) with an explicit date."
+            )
+        return first_permaticker
 
     def get_ticker(self, asset_id: AssetId, dt: datetime) -> str:
         lookup_date = dt.date() if isinstance(dt, datetime) else dt

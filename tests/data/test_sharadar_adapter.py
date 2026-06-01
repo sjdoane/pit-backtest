@@ -128,23 +128,37 @@ _TICKERS_ROWS = [
     },
 ]
 
-# M3 PR 4: Sharadar SP500 event-log rows. Per Plan-reviewer Critical 1
-# the shared fixture uses SIMPLE intervals (no add-remove-add) so the
-# story does not conflate SP500 membership with TICKERS lifecycle.
-# Multi-interval testing happens in inline bundles in test_universe.py.
+# M3 PR 4 / ADR 0017: Sharadar SP500 rows. The real table publishes
+# membership as quarterly `historical` snapshots plus a `current` roster
+# (the primary source the universe reads), with an `added`/`removed` event
+# log (the cross-check). This shared fixture mirrors that shape so the
+# synthetic bundle exercises the snapshot universe AND all three SP500
+# contracts (resolve, no-duplicate, added/removed cross-check).
 #
-# Schema per docs/methodology/dataset_versioning.md:28 and
-# docs/research/sources/methodology-point-in-time.md: (ticker, date, action).
-# No name / contraticker pass-throughs at v1 (Plan-reviewer High 1
-# corrected the original plan's hallucinated extras).
+# Snapshot timeline (SPY = AssetId(100), AGG = AssetId(200)):
+#   1995-12-31 historical: SPY
+#   2010-12-31 historical: SPY, AGG     (AGG joins)
+#   2013-12-31 historical: SPY, AGG     (AGG still a member)
+#   2015-12-31 historical: SPY          (AGG dropped)
+#   2026-05-30 current:    SPY          (SPY is a current member)
+# So SPY has an open-ended spell from 1995-12-31; AGG a closed spell
+# 2010-12-31..2013-12-31. The event log reconciles with the snapshots
+# (SPY added 1995-09-19 -> in the 1995-12-31 snapshot; AGG added
+# 2010-06-15 -> in 2010-12-31; AGG removed 2015-12-31 -> absent from the
+# 2015-12-31 snapshot), so the cross-check passes.
+#
+# Schema is (ticker, date, action) per dataset_versioning.md; no name /
+# contraticker pass-throughs at v1 (the universe and contracts read those
+# columns only when present on the real bundle).
 _SP500_ROWS = [
-    # SPY added 1995-09-19 (open-ended; AssetId(100) per _TICKERS_ROWS row 1).
-    # Date chosen after SPY's TICKERS firstpricedate of 1993-01-22 so the
-    # resolver successfully maps ticker -> AssetId at the event date.
+    {"ticker": "SPY", "date": date(1995, 12, 31), "action": "historical"},
+    {"ticker": "SPY", "date": date(2010, 12, 31), "action": "historical"},
+    {"ticker": "AGG", "date": date(2010, 12, 31), "action": "historical"},
+    {"ticker": "SPY", "date": date(2013, 12, 31), "action": "historical"},
+    {"ticker": "AGG", "date": date(2013, 12, 31), "action": "historical"},
+    {"ticker": "SPY", "date": date(2015, 12, 31), "action": "historical"},
+    {"ticker": "SPY", "date": date(2026, 5, 30), "action": "current"},
     {"ticker": "SPY", "date": date(1995, 9, 19), "action": "added"},
-    # AGG added 2010 removed 2015 (closed interval; AssetId(200) per
-    # _TICKERS_ROWS row 2; AGG never delisted from TICKERS so "membership
-    # ended in 2015" is purely an SP500 event, not a TICKERS lifecycle event).
     {"ticker": "AGG", "date": date(2010, 6, 15), "action": "added"},
     {"ticker": "AGG", "date": date(2015, 12, 31), "action": "removed"},
 ]
@@ -2068,9 +2082,11 @@ def test_members_at_sp500_after_agg_removed_excludes_agg(
     assert members == [AssetId(100)]
 
 
-def test_members_at_sp500_before_any_add_returns_empty_list(
+def test_members_at_sp500_before_first_snapshot_returns_empty_list(
     tmp_path: Path,
 ) -> None:
+    """A query date before the earliest snapshot (1995-12-31) has no as-of
+    snapshot, so membership is empty (ADR 0017)."""
     snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
@@ -2111,54 +2127,44 @@ def test_members_at_sp500_only_bundle_missing_sp500_propagates_file_not_found(
     assert "sp500.parquet" in str(exc_info.value)
 
 
-def test_sharadar_sp500_universe_is_member_on_added_date_returns_true(
+def test_sharadar_sp500_universe_is_member_during_snapshot_run_returns_true(
     tmp_path: Path,
 ) -> None:
-    """Added date is the FIRST day of membership."""
+    """AGG is in the 2010-12-31 and 2013-12-31 snapshots, so it is a member
+    at any date whose as-of snapshot is one of those (ADR 0017)."""
     snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     universe = adapter._sp500_universe
-    assert universe.is_member(AssetId(200), datetime(2010, 6, 15, 16, 0)) is True
+    assert universe.is_member(AssetId(200), datetime(2011, 6, 1, 16, 0)) is True
+    assert universe.is_member(AssetId(200), datetime(2014, 6, 1, 16, 0)) is True
 
 
-def test_sharadar_sp500_universe_is_member_on_removed_date_returns_true(
+def test_sharadar_sp500_universe_is_member_after_snapshot_drop_returns_false(
     tmp_path: Path,
 ) -> None:
-    """Removed date is the LAST day of membership (inclusive)."""
+    """AGG is absent from the 2015-12-31 snapshot, so a later as-of date
+    resolves to a snapshot without it."""
     snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     universe = adapter._sp500_universe
     assert (
-        universe.is_member(AssetId(200), datetime(2015, 12, 31, 16, 0))
-        is True
+        universe.is_member(AssetId(200), datetime(2016, 1, 1, 16, 0)) is False
     )
 
 
-def test_sharadar_sp500_universe_is_member_day_after_removed_returns_false(
+def test_sharadar_sp500_universe_is_member_before_snapshot_join_returns_false(
     tmp_path: Path,
 ) -> None:
+    """Before AGG appears in any snapshot the as-of snapshot is 1995-12-31
+    (SPY only), so AGG is not a member."""
     snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     universe = adapter._sp500_universe
     assert (
-        universe.is_member(AssetId(200), datetime(2016, 1, 1, 16, 0))
-        is False
-    )
-
-
-def test_sharadar_sp500_universe_is_member_day_before_added_returns_false(
-    tmp_path: Path,
-) -> None:
-    snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
-    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
-
-    universe = adapter._sp500_universe
-    assert (
-        universe.is_member(AssetId(200), datetime(2010, 6, 14, 16, 0))
-        is False
+        universe.is_member(AssetId(200), datetime(2010, 6, 14, 16, 0)) is False
     )
 
 
@@ -2178,25 +2184,30 @@ def test_sharadar_sp500_universe_is_member_unknown_asset_returns_false(
 def test_sharadar_sp500_universe_membership_spells_open_ended_returns_none(
     tmp_path: Path,
 ) -> None:
-    """SPY added 1995-09-19 with no removed; spells return that pair."""
+    """SPY is in every snapshot through the current roster, so its spell
+    runs from the first snapshot date and is open-ended (ADR 0017): the
+    boundaries are quarter-end snapshot dates, not event dates."""
     snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     universe = adapter._sp500_universe
     spells = universe.membership_spells(AssetId(100))
-    assert spells == [(datetime(1995, 9, 19, 16, 0), None)]
+    assert spells == [(datetime(1995, 12, 31, 16, 0), None)]
 
 
 def test_sharadar_sp500_universe_membership_spells_closed_interval(
     tmp_path: Path,
 ) -> None:
+    """AGG is present in the 2010-12-31 and 2013-12-31 snapshots and absent
+    thereafter, so its spell is the closed run between those quarter-ends
+    (ADR 0017): a quarterly-resolution interval, not the event dates."""
     snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     universe = adapter._sp500_universe
     spells = universe.membership_spells(AssetId(200))
     assert spells == [
-        (datetime(2010, 6, 15, 16, 0), datetime(2015, 12, 31, 16, 0)),
+        (datetime(2010, 12, 31, 16, 0), datetime(2013, 12, 31, 16, 0)),
     ]
 
 
@@ -2227,15 +2238,16 @@ def test_sharadar_sp500_universe_members_at_sorted_by_int_value(
 def test_sharadar_sp500_universe_repr_surfaces_index_sizes(
     tmp_path: Path,
 ) -> None:
-    """Per Plan-reviewer Low 9: __repr__ surfaces asset and interval counts."""
+    """Per Plan-reviewer Low 9: __repr__ surfaces snapshot and member counts."""
     snapshots_root = _write_synthetic_bundle(tmp_path, tables=_M3_TABLES)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     universe = adapter._sp500_universe
     repr_str = repr(universe)
-    # SPY (1 interval) + AGG (1 closed interval) = 2 assets, 2 intervals
-    assert "assets=2" in repr_str
-    assert "intervals=2" in repr_str
+    # 5 snapshot dates (1995/2010/2013/2015 historical + 2026 current);
+    # member_rows = SPY x5 + AGG x2 = 7.
+    assert "snapshots=5" in repr_str
+    assert "member_rows=7" in repr_str
     assert "sharadar_2026-05-28" in repr_str
 
 
@@ -2244,7 +2256,7 @@ def test_read_sp500_default_returns_all_events(tmp_path: Path) -> None:
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     df = adapter.read_sp500()
-    assert df.height == 3
+    assert df.height == 10  # 6 historical + 1 current + 3 add/drop events
     assert df.columns == ["ticker", "date", "action"]
     assert df.schema["date"] == pl.Date
 
@@ -2254,8 +2266,9 @@ def test_read_sp500_filters_by_ticker(tmp_path: Path) -> None:
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     df = adapter.read_sp500(ticker="AGG")
-    assert df.height == 2
-    assert set(df["action"].to_list()) == {"added", "removed"}
+    # AGG: 2 historical snapshots (2010-12-31, 2013-12-31) + added + removed.
+    assert df.height == 4
+    assert set(df["action"].to_list()) == {"historical", "added", "removed"}
 
 
 def test_read_sp500_filters_by_action(tmp_path: Path) -> None:
@@ -2274,9 +2287,12 @@ def test_read_sp500_filters_by_date_range(tmp_path: Path) -> None:
     df = adapter.read_sp500(
         start_dt=date(2010, 1, 1), end_dt=date(2015, 12, 31)
     )
-    # AGG added 2010-06-15 + AGG removed 2015-12-31; SPY 1990 excluded.
-    assert df.height == 2
-    assert set(df["ticker"].to_list()) == {"AGG"}
+    # In-window rows: AGG added 2010-06-15; historical 2010-12-31 (SPY+AGG);
+    # historical 2013-12-31 (SPY+AGG); historical 2015-12-31 (SPY); AGG
+    # removed 2015-12-31. The pre-window 1995 rows and the 2026 current row
+    # are excluded.
+    assert df.height == 7
+    assert set(df["ticker"].to_list()) == {"SPY", "AGG"}
 
 
 def test_read_sp500_sorted_by_date_action_ticker(tmp_path: Path) -> None:
@@ -2284,18 +2300,27 @@ def test_read_sp500_sorted_by_date_action_ticker(tmp_path: Path) -> None:
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     df = adapter.read_sp500()
-    dates = df["date"].to_list()
-    assert dates == [date(1995, 9, 19), date(2010, 6, 15), date(2015, 12, 31)]
+    # The reader sorts ascending; assert the (date, action, ticker) triples
+    # are monotonic rather than pinning the full mixed-fixture sequence.
+    triples = list(
+        zip(
+            df["date"].to_list(),
+            df["action"].to_list(),
+            df["ticker"].to_list(),
+        )
+    )
+    assert triples == sorted(triples)
 
 
 def test_members_at_pit_discipline_excludes_future_added_via_inline_bundle(
     tmp_path: Path,
 ) -> None:
-    """Structural PIT regression per project rule 2D.
+    """Structural PIT regression per project rule 2D (ADR 0017).
 
-    Inline bundle with an "added" event in 2026 for a synthetic ticker.
-    members_at(2010-06-15) must NOT include the future-added asset;
-    is_member at the same date must return False.
+    Inline bundle with a FUTURE 2026 snapshot listing AGG. members_at in
+    2012 must resolve to the 2010 snapshot (SPY only) and must NOT honor
+    the future snapshot; the future snapshot does apply once queried after
+    its date.
     """
     import hashlib
 
@@ -2304,10 +2329,11 @@ def test_members_at_pit_discipline_excludes_future_added_via_inline_bundle(
     bundle_dir.mkdir(parents=True)
 
     sp500_rows = [
-        # SPY added after its TICKERS firstpricedate (1993-01-22).
-        {"ticker": "SPY", "date": date(1995, 9, 19), "action": "added"},
-        # Future event the engine must NOT honor at 2010.
-        {"ticker": "AGG", "date": date(2026, 1, 1), "action": "added"},
+        # A 2010 snapshot with SPY only.
+        {"ticker": "SPY", "date": date(2010, 12, 31), "action": "historical"},
+        # A FUTURE 2026 snapshot adding AGG; must not affect a 2012 query.
+        {"ticker": "SPY", "date": date(2026, 3, 31), "action": "historical"},
+        {"ticker": "AGG", "date": date(2026, 3, 31), "action": "historical"},
     ]
     tickers_rows = list(_TICKERS_ROWS)
 
@@ -2326,21 +2352,24 @@ source = "sharadar"
 pull_date = 2026-05-30
 
 [snapshots.sharadar_pit.files]
-"sp500.parquet" = {{ sha256 = "{sp500_sha}", size_bytes = {(bundle_dir / 'sp500.parquet').stat().st_size}, row_count = 2 }}
+"sp500.parquet" = {{ sha256 = "{sp500_sha}", size_bytes = {(bundle_dir / 'sp500.parquet').stat().st_size}, row_count = {len(sp500_rows)} }}
 "tickers.parquet" = {{ sha256 = "{tickers_sha}", size_bytes = {(bundle_dir / 'tickers.parquet').stat().st_size}, row_count = {len(tickers_rows)} }}
 """
     (snapshots_root / "manifest.toml").write_text(manifest, encoding="utf-8")
     adapter = SharadarDataSource("sharadar_pit", snapshots_root)
 
-    members_2010 = adapter.members_at("sp500", datetime(2010, 6, 15, 16, 0))
-    assert AssetId(100) in members_2010  # SPY (added 1990) IS a member
-    assert AssetId(200) not in members_2010  # AGG (added 2026) is NOT
+    members_2012 = adapter.members_at("sp500", datetime(2012, 6, 15, 16, 0))
+    assert AssetId(100) in members_2012  # SPY (2010 snapshot) IS a member
+    assert AssetId(200) not in members_2012  # AGG (future snapshot) is NOT
     assert (
         adapter._sp500_universe.is_member(
-            AssetId(200), datetime(2010, 6, 15, 16, 0)
+            AssetId(200), datetime(2012, 6, 15, 16, 0)
         )
         is False
     )
+    # The future snapshot DOES apply once the query date reaches it.
+    members_2026 = adapter.members_at("sp500", datetime(2026, 6, 15, 16, 0))
+    assert AssetId(200) in members_2026
 
 
 # ============================================================================

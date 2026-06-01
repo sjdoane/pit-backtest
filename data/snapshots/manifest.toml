@@ -36,3 +36,14 @@ pull_date = 2026-05-29
 [snapshots.sharadar_2026-05-29.files]
 "actions.parquet" = { sha256 = "ce30dfb33d5a7fbb7142eff632d3140734b0e9233b27365ff0c448dbbbdebe35", size_bytes = 7940, row_count = 388 }
 "sep.parquet" = { sha256 = "b3502a2d787b1bb203afd1e62da107bf889dbcaf3f4049c54782c2d0a3132d49", size_bytes = 472940, row_count = 18204 }
+
+[snapshots.sharadar_2026-05-31]
+source = "sharadar"
+pull_date = 2026-05-31
+
+[snapshots.sharadar_2026-05-31.files]
+"actions.parquet" = { sha256 = "18123999096839a3d057788db821a0b25cd5be1d9618bfe4dc206a257cdb5959", size_bytes = 512252, row_count = 65151 }
+"sep.parquet" = { sha256 = "faef6a05379b63aaadc56e1f619f815c61eb0ce9652e2599b68e24ec07e6527b", size_bytes = 89863667, row_count = 4179215 }
+"sf1.parquet" = { sha256 = "3abd5ff78650a8ee71b41f20cc801e9a429aedef9d8e95d9de965eefaf075c83", size_bytes = 20541869, row_count = 69191 }
+"sp500.parquet" = { sha256 = "3a5969ae50331046f234926c1d58f38bfa9c715ab78d7e40cb8d424684f2490d", size_bytes = 113149, row_count = 59158 }
+"tickers.parquet" = { sha256 = "7470efb8b0a67eb440b88a618f5bd541ea72e0d640ed8c166c01b0eddbe83388", size_bytes = 90747, row_count = 1173 }
