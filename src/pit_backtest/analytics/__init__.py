@@ -5,6 +5,7 @@ ADR 0001 decision 4, raw Sharpe shown alone is a configuration error; the
 render path enforces this via the ConfidenceTier check on BacktestResult.
 """
 
+from pit_backtest.analytics.bootstrap import stationary_block_bootstrap
 from pit_backtest.analytics.concentration import hhi
 from pit_backtest.analytics.distribution import BacktestPathDistribution
 from pit_backtest.analytics.drawdown import (
@@ -25,4 +26,5 @@ __all__ = [
     "max_drawdown",
     "min_trl",
     "psr",
+    "stationary_block_bootstrap",
 ]
