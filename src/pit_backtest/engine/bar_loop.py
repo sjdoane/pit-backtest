@@ -65,7 +65,7 @@ from __future__ import annotations
 import time
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Mapping
+from typing import Callable, Mapping
 
 import polars as pl
 
@@ -74,7 +74,9 @@ from pit_backtest.data.sources.base import ImpactedPriceSource
 from pit_backtest.data.sources.sharadar import SharadarDataSource
 from pit_backtest.data.universe import Universe
 from pit_backtest.engine.constant_weight_result import ConstantWeightDemoResult
-from pit_backtest.engine.m1_demo import asset_id_to_ticker
+from pit_backtest.engine.m1_demo import (
+    asset_id_to_ticker as _default_asset_id_to_ticker,
+)
 from pit_backtest.engine.state import PortfolioState
 from pit_backtest.execution.clock import TestClock
 from pit_backtest.execution.cost.base import Direction, PreTradeCostEstimator
@@ -94,11 +96,15 @@ _log = get_logger(__name__)
 
 
 class _NoopPitView:
-    """Stand-in PitView for M1.
+    """Stand-in PitView for the constant-weight signal.
 
     The constant-weight Signal does not consult historical data; pit_view
-    is a no-op. M3's signals (e.g., Momentum12_1Signal) will receive a
-    real PitView from BarLoop that enforces available_dt < dt.
+    is a no-op. It stays the BarLoop default (`use_real_pit_view=False`) so
+    the M1/M2 demos pay nothing and the SPY/AGG/GLD bundles that lack a
+    TICKERS table do not need one. History-consuming signals (e.g.,
+    Momentum12_1Signal) set `use_real_pit_view=True`; the BarLoop then
+    rebuilds a real per-bar PitView via `_build_pit_view` that slices each
+    served table to available_dt < the bar date (ADR 0016 M5 PR 2b).
     """
 
     def __call__(self, table_name: str) -> pl.LazyFrame:
@@ -148,6 +154,8 @@ class BarLoop:
         cost_estimator: PreTradeCostEstimator | None = None,
         apply_permanent_impact_to_valuation: bool = True,
         enable_timing: bool = False,
+        use_real_pit_view: bool = False,
+        asset_id_to_ticker: Callable[[AssetId], str] | None = None,
     ) -> None:
         self._data_source = data_source
         self._universe = universe
@@ -155,6 +163,17 @@ class BarLoop:
         self._policy = policy
         self._matching_engine = matching_engine
         self._clock = clock
+        # AssetId -> ticker resolver. Default is the M1 demo's three-name map
+        # (SPY/AGG/GLD), which keeps the constant-weight reconciliation
+        # byte-identical; the M5 momentum study injects a resolver-backed
+        # callable so the BarLoop can run an S&P 500 universe. Replacing the
+        # M1 hardcoded map by an injected callable (rather than rewriting the
+        # loop to a dynamic universe) is the surgical fix per ADR 0016 PR 2b.
+        self._asset_id_to_ticker: Callable[[AssetId], str] = (
+            asset_id_to_ticker
+            if asset_id_to_ticker is not None
+            else _default_asset_id_to_ticker
+        )
         self._tickers = tuple(sorted(tickers))
         self._initial_capital = float(initial_capital)
         self._state = PortfolioState(
@@ -163,7 +182,13 @@ class BarLoop:
             initial_capital=float(initial_capital),
             realized_pnl=0.0,
         )
-        self._pit_view = _NoopPitView()
+        # PitView wiring. The M1/M2 constant-weight signal ignores pit_view,
+        # so the default is the no-op stand-in (and the M1 SPY/AGG/GLD bundles
+        # lack a TICKERS table the real view would need). The M5 momentum
+        # study sets use_real_pit_view=True; run() then rebuilds a real
+        # per-bar PitView before each signal.compute call (ADR 0016 PR 2b).
+        self._use_real_pit_view = use_real_pit_view
+        self._pit_view: PitView = _NoopPitView()
         self._cost_estimator: PreTradeCostEstimator
         if cost_estimator is None:
             self._cost_estimator = _NoopCostEstimator()
@@ -231,7 +256,7 @@ class BarLoop:
         prices_by_asset: dict[AssetId, pl.DataFrame] = {}
         dividends_by_asset: dict[AssetId, pl.DataFrame] = {}
         for ticker in self._tickers:
-            ticker_str = asset_id_to_ticker(ticker)
+            ticker_str = self._asset_id_to_ticker(ticker)
             prices_by_asset[ticker] = self._data_source.read_sep_prices(
                 ticker=ticker_str, start_dt=start_dt, end_dt=end_dt
             )
@@ -287,7 +312,9 @@ class BarLoop:
         _log.info(
             "bar_loop_begin",
             extra={
-                "tickers": ",".join(asset_id_to_ticker(t) for t in self._tickers),
+                "tickers": ",".join(
+                    self._asset_id_to_ticker(t) for t in self._tickers
+                ),
                 "start_dt": start_dt.isoformat(),
                 "end_dt": end_dt.isoformat(),
                 "initial_capital": f"{self._initial_capital:.2f}",
@@ -336,6 +363,14 @@ class BarLoop:
                 if key in price_at:
                     prices_today[ticker] = price_at[key]
 
+            # Rebuild the per-bar PitView for signals that consume history
+            # (ADR 0016 PR 2b). The closure captures bar_dt and slices each
+            # served table to available_dt < bar_dt (strict). The no-op
+            # stand-in is kept for the constant-weight signal that ignores
+            # pit_view, so the M1/M2 demos pay nothing.
+            if self._use_real_pit_view:
+                self._pit_view = self._build_pit_view(bar_dt)
+
             # Step 4: signal.
             if self._enable_timing:
                 _t_step = time.perf_counter()
@@ -375,7 +410,10 @@ class BarLoop:
                     if qty == 0.0:
                         continue
                     order = Order(
-                        order_id=f"{bar_dt.isoformat()}_{asset_id_to_ticker(ticker)}",
+                        order_id=(
+                            f"{bar_dt.isoformat()}_"
+                            f"{self._asset_id_to_ticker(ticker)}"
+                        ),
                         asset_id=ticker,
                         quantity=Decimal(repr(qty)),
                         fill_price_model=FillPriceModel.CLOSE,
@@ -466,7 +504,7 @@ class BarLoop:
             equity_curve=equity_curve,
             n_trading_days=len(trading_days_in_window),
             n_rebalances=n_rebalances,
-            tickers=tuple(asset_id_to_ticker(t) for t in self._tickers),
+            tickers=tuple(self._asset_id_to_ticker(t) for t in self._tickers),
             start_dt=start_dt,
             end_dt=end_dt,
             confidence_tier=ConfidenceTier.SINGLE_RUN_PRE_SPECIFIED,
@@ -548,3 +586,67 @@ class BarLoop:
             volume=raw_volume,
             prior_close=prior_close_d,
         )
+
+    def _build_pit_view(self, bar_dt: date) -> PitView:
+        """Build the per-bar PitView the M5 momentum signal consumes.
+
+        Serves three tables, each sliced to available_dt < bar_dt (strict),
+        matching `signal/base.py`'s "available_dt < dt" contract and what
+        `Momentum12_1Signal.compute` reads:
+        - `sep`: the SEP `date` (the bar date) is the available_dt; aliased to
+          `dt` and cast to `pl.Date`; carries `closeunadj` + `ticker`.
+        - `actions`: the ACTIONS `date` (the ex-date) is the available_dt;
+          served as the RAW vendor columns `ticker`/`date`/`action`/`value`
+          (NOT the `read_actions_dividends` ex_date/amount projection).
+        - `tickers`: identifier reference data with no per-row available_dt,
+          so it is served as the full table (the signal's own
+          firstpricedate <= dt <= lastpricedate interval test is the gate).
+          `firstpricedate` and `lastpricedate` MUST be cast to `pl.Date`: the
+          real bundle stores them as Datetime[ns], and the signal's row
+          iteration compares them to a `date`, which would raise TypeError on
+          a datetime (a real-bundle defect synthetic fixtures with pl.Date
+          columns would mask).
+
+        Cast every date column to `pl.Date` BEFORE the `< bar_dt` filter
+        (project rule 12; the silent-empty Datetime[ns]-vs-date trap). The
+        closure is rebuilt per bar (Determinism Requirement 3); it captures
+        `bar_dt` by value.
+        """
+        sep_lf = self._data_source.get_table("sep").with_columns(
+            pl.col("date").cast(pl.Date)
+        )
+        actions_lf = self._data_source.get_table("actions").with_columns(
+            pl.col("date").cast(pl.Date)
+        )
+        tickers_lf = self._data_source.get_table("tickers").with_columns(
+            pl.col("firstpricedate").cast(pl.Date),
+            pl.col("lastpricedate").cast(pl.Date),
+        )
+
+        def pit_view(table_name: str) -> pl.LazyFrame:
+            if table_name == "sep":
+                return sep_lf.filter(pl.col("date") < bar_dt).select(
+                    pl.col("date").alias("dt"),
+                    pl.col("closeunadj").cast(pl.Float64),
+                    pl.col("ticker"),
+                )
+            if table_name == "actions":
+                return actions_lf.filter(pl.col("date") < bar_dt).select(
+                    pl.col("ticker"),
+                    pl.col("date"),
+                    pl.col("action"),
+                    pl.col("value").cast(pl.Float64),
+                )
+            if table_name == "tickers":
+                return tickers_lf.select(
+                    pl.col("permaticker").cast(pl.Int64),
+                    pl.col("ticker"),
+                    pl.col("firstpricedate"),
+                    pl.col("lastpricedate"),
+                )
+            raise KeyError(
+                f"unknown pit_view table {table_name!r}; the momentum signal "
+                f"consumes only 'sep', 'actions', 'tickers'"
+            )
+
+        return pit_view
