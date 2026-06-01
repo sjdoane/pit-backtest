@@ -251,19 +251,6 @@ def test_runner_construction_with_default_workers() -> None:
     assert runner._num_workers is None
 
 
-def test_run_cpcv_deferred_to_m5() -> None:
-    """Per the M4 PR 5 scope decision (ADR 0003 amendment footer) run_cpcv
-    is deferred to M5: the orchestration body needs the per-split
-    fit/predict strategy semantics the M5 momentum study defines, and the
-    stubbed signature is underspecified (no observations/label_horizons,
-    no-arg factory). The M4 CPCV acceptance is met by the splitter +
-    container, not this body.
-    """
-    runner = Runner()
-    with pytest.raises(NotImplementedError, match="M5"):
-        runner.run_cpcv(cv_splitter=None, bar_loop_factory=None)  # type: ignore[arg-type]
-
-
 # ----- Picklability of the factory + recipe -----
 
 

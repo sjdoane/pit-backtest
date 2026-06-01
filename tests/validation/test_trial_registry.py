@@ -49,6 +49,15 @@ def _record_n(
 # ----- record + roundtrip -----
 
 
+def test_db_path_property_roundtrips(tmp_path: Path) -> None:
+    """The db_path accessor returns the backing file, so Runner.run_cpcv can
+    open a naive=1 sibling registry over the same db for its isolated
+    CPCV-path sub-family."""
+    db = tmp_path / "x.db"
+    registry = TrialRegistry(db, naive_effective_n=3)
+    assert registry.db_path == db
+
+
 def test_record_returns_positive_trial_id(tmp_path: Path) -> None:
     registry = TrialRegistry(tmp_path / "r.db")
     trial_id = registry.record(

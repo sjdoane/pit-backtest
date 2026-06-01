@@ -102,6 +102,17 @@ class TrialRegistry:
             )
             conn.commit()
 
+    @property
+    def db_path(self) -> Path:
+        """The SQLite file backing this registry.
+
+        Exposed so a derived sibling registry can be opened over the SAME db
+        file: `Runner.run_cpcv` isolates its phi-identical CPCV-path trials
+        into a `::cpcv_paths` sub-family at naive_effective_n=1 over this same
+        file, keeping the study family's (n_effective, v_sr) untouched.
+        """
+        return self._db_path
+
     def _connect(self) -> sqlite3.Connection:
         """Open a fresh connection with the WAL + busy-timeout pragmas.
 
