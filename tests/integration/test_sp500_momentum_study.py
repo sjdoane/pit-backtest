@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import os
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from examples.sp500_momentum_study import (
+    _CPCV_N_GROUPS,
     MomentumStudyRecipe,
     build_ever_member_union,
+    compute_cost_surfaces,
     compute_momentum_study_report,
     momentum_rebalance_dates,
 )
@@ -104,6 +107,56 @@ def test_momentum_study_short_window() -> None:
     # window strictly larger than any single-rebalance member count).
     assert 495 <= report.member_count_min <= report.member_count_max <= 515
     assert report.union_size >= report.member_count_max
+
+
+def test_cost_surfaces_short_window() -> None:
+    """The PR 3c cost surfaces wire against the real bundle over a short window
+    (~5 min, measured): the eta-sensitivity band has one entry per eta and is
+    monotone-decreasing in eta (the temporary-impact term scales with eta, so more
+    impact -> lower PnL), and the commission-only seam decomposition shows
+    commission only subtracts (positive drags) with a positive genuine N-1
+    phantom re-entry commission.
+
+    The RAW contiguous-minus-stitched level gap is intentionally NOT asserted
+    positive: the real-data measurement shows it is dominated by the omitted
+    inter-group gap-day market moves (the PR 3c finding that corrects ADR 0016
+    dec 2), so the test pins the cleanly isolated commission quantities, not the
+    confounded level gap.
+    """
+    _source, universe = _source_and_universe()
+    recipe = _recipe_for(universe, date(2015, 1, 2), date(2015, 12, 31))
+    # contiguous_folds needs >= 1 rebalance per group for the seam stitch.
+    assert len(recipe.rebalance_dates) >= _CPCV_N_GROUPS
+
+    eta_grid = (Decimal("0.05"), Decimal("0.142"), Decimal("0.30"))
+    cost = compute_cost_surfaces(
+        recipe,
+        eta_grid=eta_grid,
+        central_eta=Decimal("0.142"),
+        n_groups=_CPCV_N_GROUPS,
+        workers=3,
+    )
+
+    # Band: one entry per eta, rendered with the uniform-liquidity caveat, and
+    # strictly monotone-decreasing in eta (deterministic: higher eta = more
+    # temporary impact = lower final PnL).
+    assert set(cost.band_final_pnl.keys()) == set(eta_grid)
+    pnls = [cost.band_final_pnl[eta] for eta in eta_grid]
+    assert all(higher > lower for higher, lower in zip(pnls, pnls[1:]))
+    assert "Cost sensitivity" in cost.markdown
+    assert "uniform-liquidity" in cost.markdown
+
+    # Seam: commission only subtracts (positive drags), and the genuine N-1
+    # re-entry commission is positive (N all-cash entries vs 1).
+    seam = cost.seam
+    assert seam.n_groups == _CPCV_N_GROUPS
+    assert seam.contiguous_commission_drag > 0.0
+    assert seam.stitched_commission_drag > 0.0
+    assert seam.phantom_reentry_commission > 0.0
+    # The naive level gap is dominated by omitted gap-day market moves, NOT
+    # commission (the PR 3c finding): commission is a small fraction of it.
+    assert abs(seam.contiguous_commission_drag) < abs(seam.zero_cost_level_gap)
+    assert "CPCV seam cost" in cost.markdown
 
 
 @pytest.mark.skipif(
