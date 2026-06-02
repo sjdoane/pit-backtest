@@ -579,7 +579,10 @@ class SharadarDataSource(PitDataSource):
 
         Returns a Polars frame with the documented column subset:
         permaticker, ticker, name, exchange, isdelisted, firstpricedate,
-        lastpricedate, firstquarter, lastquarter, cusip. The four date
+        lastpricedate, firstquarter, lastquarter, and cusip WHEN the source
+        vintage carries it (older pulls ship a singular `cusip`; the 2026-05-31
+        Premium pull ships a plural `cusips` list and no `cusip`, so the column
+        is selected conditionally and omitted when absent). The four date
         columns are cast to pl.Date BEFORE filtering per project rule 12
         (the M1 hotfix at fix/adapter-date-filter-and-pandas-pin).
 
@@ -613,7 +616,7 @@ class SharadarDataSource(PitDataSource):
                 )
             )
 
-        df = lf.select(
+        select_cols = [
             pl.col("permaticker").cast(pl.Int64),
             pl.col("ticker"),
             pl.col("name"),
@@ -623,10 +626,22 @@ class SharadarDataSource(PitDataSource):
             pl.col("lastpricedate"),
             pl.col("firstquarter"),
             pl.col("lastquarter"),
-            pl.col("cusip"),
-        ).sort(["permaticker", "firstpricedate"]).collect()
+        ]
+        # `cusip` is vestigial here (no engine consumer reads it; it is surfaced
+        # only for human inspection). Sharadar vintages differ: older pulls ship
+        # a singular `cusip` string column, while the 2026-05-31 Premium pull
+        # ships a plural `cusips` list column and no `cusip`. Select `cusip` only
+        # when the source schema actually carries it, so read_tickers works
+        # across vintages instead of raising ColumnNotFoundError on the newer
+        # schema. Callers depend only on ticker/permaticker/date columns.
+        if "cusip" in lf.collect_schema().names():
+            select_cols.append(pl.col("cusip"))
 
-        return df
+        return (
+            lf.select(select_cols)
+            .sort(["permaticker", "firstpricedate"])
+            .collect()
+        )
 
     def read_sf1_arq(
         self,

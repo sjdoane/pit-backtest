@@ -55,6 +55,7 @@ import attrs
 import polars as pl
 
 from pit_backtest.analytics.bootstrap import stationary_block_bootstrap
+from pit_backtest.analytics.concentration import hhi
 from pit_backtest.analytics.result_adapter import to_backtest_result
 from pit_backtest.analytics.scorecard import BacktestResult
 from pit_backtest.analytics.sensitivity import SensitivityBand
@@ -469,6 +470,7 @@ class MomentumStudyReport:
     bootstrap_sharpe_p50: float
     bootstrap_sharpe_p95: float
     n_bootstrap: int
+    pnl_concentration_hhi: float
     markdown: str
 
 
@@ -556,6 +558,11 @@ def compute_momentum_study_report(
         _percentile(boot_sharpes, 95.0),
     )
 
+    # 4. HHI concentration of the monthly dollar-PnL contributions (ADR 0002
+    #    M5 acceptance criterion 1). This is the realized-PnL temporal
+    #    concentration, NOT a cross-sectional position-weight index.
+    pnl_hhi = _pnl_concentration_hhi(contig.equity_curve, rebalance_dates)
+
     report = MomentumStudyReport(
         result=result,
         n_rebalances=contig.n_rebalances,
@@ -573,9 +580,33 @@ def compute_momentum_study_report(
         bootstrap_sharpe_p50=p50,
         bootstrap_sharpe_p95=p95,
         n_bootstrap=n_bootstrap,
+        pnl_concentration_hhi=pnl_hhi,
         markdown="",
     )
     return attrs.evolve(report, markdown=render_study_markdown(report))
+
+
+def _pnl_concentration_hhi(
+    equity_curve: pl.DataFrame, rebalance_dates: tuple[date, ...]
+) -> float:
+    """HHI of the monthly dollar-PnL contributions (temporal concentration).
+
+    Per `analytics.concentration.hhi` the index is `sum(w_i^2)` with
+    `w_i = |pnl_i| / sum(|pnl_j|)` over the monthly PnL contributions (the
+    rebalance-to-rebalance NAV changes), so it lives in [1/N, 1]: near 1/N the
+    realized PnL is spread evenly across the months, near 1 it is concentrated
+    in a few. This is the ADR 0002 criterion-1 HHI on the realized return
+    stream; it is NOT a cross-sectional position-weight index (the book is
+    equal-weight by construction, so its weight HHI is mechanically 1/n_held).
+    """
+    at_rebalance = (
+        equity_curve.filter(pl.col("dt").is_in(list(rebalance_dates))).sort("dt")
+    )
+    navs = [float(v) for v in at_rebalance["nav"].to_list()]
+    pnl = [navs[i] - navs[i - 1] for i in range(1, len(navs))]
+    if not pnl:
+        return 0.0
+    return hhi(pl.Series("pnl", pnl))
 
 
 def _sharpe(returns: list[float]) -> float:
@@ -657,6 +688,20 @@ def render_study_markdown(report: MomentumStudyReport) -> str:
         f"This nonparametric path surface COMPLEMENTS the parametric PSR/DSR "
         f"(they are different uncertainty objects, ADR 0016 dec 6); with "
         f"{r.n_monthly_returns} monthly observations the fan is statistically thin."
+    )
+    lines.append("")
+    lines.append("## Concentration (HHI)")
+    lines.append("")
+    lines.append(
+        f"The Herfindahl-Hirschman index of the monthly dollar-PnL contributions "
+        f"is {r.pnl_concentration_hhi:.4f} (range [1/{r.n_monthly_returns}="
+        f"{1.0 / r.n_monthly_returns:.4f}, 1]); near the floor means the realized "
+        f"PnL is spread evenly across the {r.n_monthly_returns} months rather than "
+        f"earned in a few. This is the TEMPORAL PnL concentration on the realized "
+        f"return stream (ADR 0002 criterion 1), not a cross-sectional "
+        f"position-weight index: the book is equal-weight within the top quintile, "
+        f"so its position-weight HHI is mechanically 1/n_held (the diversification "
+        f"floor for that holding count)."
     )
     lines.append("")
     lines.append("## Honest DSR conclusion")

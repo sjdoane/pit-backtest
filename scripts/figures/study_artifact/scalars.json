@@ -1,0 +1,17 @@
+{
+  "annualized_return": 0.06857220190696722,
+  "annualized_volatility": 0.20305185505591047,
+  "block_length": 7.0,
+  "dsr": 0.9713186009945509,
+  "max_drawdown": 0.5974222400638369,
+  "n_monthly_returns": 239,
+  "n_rebalances": 240,
+  "pnl_concentration_hhi": 0.008501001634513844,
+  "psr": 0.9713186009945509,
+  "realized_monthly_sharpe": 0.13735092294556442,
+  "sharpe_per_period": 0.026995670905332707,
+  "total_return": 2.741031059585325,
+  "union_size": 930,
+  "window_end": "2024-12-31",
+  "window_start": "2005-01-31"
+}

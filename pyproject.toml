@@ -34,6 +34,14 @@ dev = [
     "mypy==1.13.0",
     "ruff==0.7.4",
 ]
+figures = [
+    # matplotlib is render-only: it produces the README PNGs from the committed
+    # study artifact (scripts/figures/regenerate.py) and is NEVER imported by the
+    # engine or the determinism-gated backtest path. Loose pin (like the dataops
+    # pyarrow) because nothing determinism-critical depends on the plotting
+    # version; the artifact JSON, not the PNG bytes, is the audited contract.
+    "matplotlib>=3.8,<4",
+]
 dataops = [
     "nasdaq-data-link==1.0.4",
     # pyarrow is required by polars.from_pandas() when pandas frames have

@@ -239,6 +239,7 @@ def _write_synthetic_bundle(
     tmp_path: Path,
     bundle_name: str = "sharadar_2026-05-28",
     tables: tuple[str, ...] = ("sep", "actions"),
+    tickers_rows: list[dict[str, object]] | None = None,
 ) -> Path:
     """Build a synthetic Sharadar bundle and the manifest entry.
 
@@ -259,7 +260,7 @@ def _write_synthetic_bundle(
     table_data: dict[str, list[dict[str, object]]] = {
         "sep": _SEP_ROWS,
         "actions": _ACTIONS_ROWS,
-        "tickers": _TICKERS_ROWS,
+        "tickers": _TICKERS_ROWS if tickers_rows is None else tickers_rows,
         "sf1": _SF1_ROWS,
         "sp500": _SP500_ROWS,
     }
@@ -722,6 +723,31 @@ def test_read_tickers_returns_full_column_set(tmp_path: Path) -> None:
     assert df.schema["lastpricedate"] == pl.Date
     assert df.schema["firstquarter"] == pl.Date
     assert df.schema["lastquarter"] == pl.Date
+
+
+def test_read_tickers_omits_cusip_when_absent(tmp_path: Path) -> None:
+    """read_tickers tolerates a TICKERS vintage that ships no `cusip` column.
+
+    The 2026-05-31 Sharadar Premium pull exposes a plural `cusips` list column
+    and no singular `cusip`; before the conditional-select fix read_tickers
+    raised ColumnNotFoundError on that schema, which silently broke the
+    survivorship study (its ticker resolution reads read_tickers). `cusip` is
+    vestigial here (no engine consumer reads it), so it is now selected only
+    when present and omitted otherwise.
+    """
+    no_cusip_rows = [
+        {k: v for k, v in row.items() if k != "cusip"} for row in _TICKERS_ROWS
+    ]
+    snapshots_root = _write_synthetic_bundle(
+        tmp_path, tables=_M3_TABLES, tickers_rows=no_cusip_rows
+    )
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    df = adapter.read_tickers()
+    assert "cusip" not in df.columns
+    # The load-bearing columns are still present and the call did not raise.
+    for col in ("permaticker", "ticker", "firstpricedate", "lastpricedate"):
+        assert col in df.columns
 
 
 def test_read_tickers_filters_by_ticker(tmp_path: Path) -> None:
