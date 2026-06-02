@@ -128,6 +128,85 @@ def unadjusted_close(prices: pl.DataFrame, dt: datetime) -> Decimal:
     raise NotImplementedError("M1 day 3 deliverable (used by SEP adapter point lookup)")
 
 
+def split_adjusted_prices_and_dividends(
+    prices: pl.DataFrame,
+    splits: pl.DataFrame,
+    dividends: pl.DataFrame,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Divide as-traded prices + dividends by the cumulative in-window split factor.
+
+    The single source of truth for the point-in-time split adjustment shared by
+    `Momentum12_1Signal` and the survivorship study. Sharadar's `closeunadj` is
+    the as-traded price, so on a split ex-date it jumps by the split ratio (a
+    1-for-10 REVERSE split decuples the nominal price). Left raw, a total-return
+    reconstruction reads that jump as a real gain, which is catastrophic for the
+    delisted/bankrupt names that reverse-split before delisting (their terminal
+    TR explodes to thousands of x and corrupts a buy-and-hold cohort mean).
+
+    At bar `dt` the cumulative factor is the product of the ratios of splits
+    whose ex-date is STRICTLY AFTER `dt`: pre-split bars are scaled down to the
+    latest share basis, while on or after an ex-date the price already reflects
+    that split so it is excluded (a split whose ex-date precedes or equals the
+    first bar contributes 1.0 everywhere, so passing the full in-window split set
+    is safe). Dividing `closeunadj` by the factor cancels the jump; each dividend
+    is divided by the factor at its ex-date (a BACKWARD `join_asof`, since the
+    factor is a step that only changes on a split ex-date, itself a trading day)
+    so the dividend sits on the same share basis as the adjusted price.
+
+    Parameters
+    ----------
+    prices
+        Frame with `dt` (pl.Date) and `closeunadj` (numeric). Returned adjusted
+        under the column name `close` that `reconstruct_total_return` reads.
+    splits
+        In-window split actions with `ex_date` (pl.Date) and `ratio` (float, the
+        split ratio, e.g. 2.0 for a 2-for-1 forward split, 0.1 for a 1-for-10
+        reverse split). May be empty (then the price adjustment is a no-op).
+    dividends
+        In-window dividends with `ex_date` (pl.Date) and `amount_per_share`
+        (float). May be empty.
+
+    Returns
+    -------
+    (adj_prices, adj_dividends)
+        adj_prices: `dt` (pl.Date), `close` (pl.Float64 = closeunadj / factor),
+        sorted by dt. adj_dividends: `ex_date` (pl.Date), `amount_per_share`
+        (pl.Float64 = amount / factor-at-ex_date). Both ready for
+        `reconstruct_total_return`.
+    """
+    prices = prices.sort("dt")
+    split_factor: pl.Expr = pl.lit(1.0)
+    for srow in splits.sort("ex_date").iter_rows(named=True):
+        ratio = float(srow["ratio"])
+        ex_date = srow["ex_date"]
+        split_factor = split_factor * (
+            pl.when(pl.col("dt") < ex_date).then(ratio).otherwise(1.0)
+        )
+
+    prices_adj = prices.with_columns(split_factor.alias("sf")).with_columns(
+        (pl.col("closeunadj") / pl.col("sf")).cast(pl.Float64).alias("close")
+    )
+    adj_prices = prices_adj.select(["dt", "close"])
+
+    adj_dividends = (
+        dividends.sort("ex_date")
+        .join_asof(
+            prices_adj.select(["dt", "sf"]).sort("dt"),
+            left_on="ex_date",
+            right_on="dt",
+            strategy="backward",
+        )
+        .with_columns(pl.col("sf").fill_null(1.0))
+        .select(
+            pl.col("ex_date"),
+            (pl.col("amount_per_share") / pl.col("sf"))
+            .cast(pl.Float64)
+            .alias("amount_per_share"),
+        )
+    )
+    return adj_prices, adj_dividends
+
+
 def reconstruct_total_return(
     prices: pl.DataFrame,
     dividends: pl.DataFrame,

@@ -39,7 +39,10 @@ from decimal import Decimal
 import polars as pl
 from dateutil.relativedelta import relativedelta  # type: ignore[import-untyped]
 
-from pit_backtest.data.adjustments import reconstruct_total_return
+from pit_backtest.data.adjustments import (
+    reconstruct_total_return,
+    split_adjusted_prices_and_dividends,
+)
 from pit_backtest.data.records import AssetId
 from pit_backtest.data.universe import Universe
 from pit_backtest.signal.base import PitView, Signal
@@ -158,59 +161,23 @@ def _momentum_score_for_ticker(
         & (pl.col("date") > t_start)
         & (pl.col("date") <= t_skip)
     )
-    splits = (
-        ticker_actions.filter(pl.col("action") == "split")
-        .select(["date", "value"])
-        .sort("date")
+    splits = ticker_actions.filter(pl.col("action") == "split").select(
+        pl.col("date").alias("ex_date"),
+        pl.col("value").cast(pl.Float64).alias("ratio"),
+    )
+    dividends = ticker_actions.filter(pl.col("action") == "dividend").select(
+        pl.col("date").alias("ex_date"),
+        pl.col("value").cast(pl.Float64).alias("amount_per_share"),
     )
 
-    # Cumulative in-window split factor: at bar dt the factor is the product
-    # of ratios for splits whose ex-date is strictly AFTER dt (those splits
-    # have not yet hit the price at dt, so the pre-split price must be scaled
-    # down to the latest share basis). On/after an ex-date the price already
-    # reflects that split, so it is excluded.
-    split_factor: pl.Expr = pl.lit(1.0)
-    for srow in splits.iter_rows(named=True):
-        ratio = float(srow["value"])
-        split_date = srow["date"]
-        split_factor = split_factor * (
-            pl.when(pl.col("dt") < split_date).then(ratio).otherwise(1.0)
-        )
-
-    window_adj = window.with_columns(split_factor.alias("sf")).with_columns(
-        (pl.col("closeunadj") / pl.col("sf")).alias("close")
+    # Split-adjust the as-traded price + dividends over the window via the
+    # shared data.adjustments helper (single source of truth with the
+    # survivorship study). Omit the name if any adjusted close is non-positive.
+    adj_prices, adj_dividends = split_adjusted_prices_and_dividends(
+        window, splits, dividends
     )
-    adj_prices = window_adj.select(["dt", "close"])
     if adj_prices.filter(pl.col("close") <= 0.0).height > 0:
         return None
-
-    # Adjust each dividend by the split factor at its ex-date (the same basis
-    # as the adjusted price), then shape to the reconstruct contract. The
-    # split factor is read via a BACKWARD join_asof (nearest prior bar's sf)
-    # rather than an exact date match: sf is a step that only changes on a
-    # split ex-date (itself a trading day), so a dividend ex-date that is not
-    # a SEP bar still inherits the correct factor from the most recent prior
-    # bar, and a dividend sitting after an in-window split is not mis-scaled
-    # (post-impl reviewer High 1). fill_null(1.0) floors the degenerate case
-    # of a dividend preceding the first window bar.
-    adj_dividends = (
-        ticker_actions.filter(pl.col("action") == "dividend")
-        .select(["date", "value"])
-        .sort("date")
-        .join_asof(
-            window_adj.select(["dt", "sf"]).sort("dt"),
-            left_on="date",
-            right_on="dt",
-            strategy="backward",
-        )
-        .with_columns(pl.col("sf").fill_null(1.0))
-        .select(
-            pl.col("date").alias("ex_date"),
-            (pl.col("value") / pl.col("sf"))
-            .cast(pl.Float64)
-            .alias("amount_per_share"),
-        )
-    )
 
     tr = reconstruct_total_return(
         prices=adj_prices,
