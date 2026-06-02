@@ -169,5 +169,8 @@ Nasdaq API Docs.txt
 
 # Local agent / scratch
 .claude/local/
+.claude/settings.local.json
 scratch/
+scratch_*.py
+_scratch_*.py
 TODO.local.md
