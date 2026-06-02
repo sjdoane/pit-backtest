@@ -14,7 +14,11 @@ Methodology (locked per ADR 0002 acceptance criterion 1 + PR 5c
 Plan-reviewer Choice A ratification with caveat disclosure):
   - Buy-and-hold equal-weight (no monthly rebalance).
   - Per-ticker terminal total return via `reconstruct_total_return` on SEP
-    closeunadj + ACTIONS dividends.
+    closeunadj + ACTIONS dividends, SPLIT-ADJUSTED first (closeunadj is the
+    as-traded price; without split-adjustment a reverse split in a delisted
+    name reads as a spurious gain, e.g. CHKAQ at ~15,000x). The split
+    adjustment reuses the same `split_adjusted_prices_and_dividends` helper as
+    the momentum signal.
   - Cohort terminal TR = arithmetic mean of per-ticker terminal TRs.
   - CAGR = cohort_terminal_TR ** (1 / years) - 1; years = calendar days
     between pit_date and as_of divided by 365.25.
@@ -32,10 +36,18 @@ Caveats surfaced in the rendered Markdown report (Plan-reviewer High 4):
      annualized bias over 15 years (T-bill 2010-2025 ~2.5% nominal).
   3. Skipping current members without 2010 prices SHRINKS the delta
      because TSLA / SNOW / etc. would have boosted current cohort TR.
+  4. Corporate-action data quality for delisted/bankrupt names: per-ticker
+     TRs are SPLIT-ADJUSTED (the fix), but a few names (e.g. CHKAQ, WINMQ)
+     carry ACTIONS dividend values inconsistent with closeunadj, so their
+     reinvested TR stays inflated; they sit in the PIT cohort and therefore
+     SUPPRESS the delta. A focused dividend / corporate-action data-quality
+     fix is tracked separately.
 
-The two-panel equity-curve plot contemplated at ADR 0002 line 96 is
-DEFERRED to M5 `scripts/figures/` per Plan-reviewer High 5; an amendment
-footer at `docs/decisions/0002-roadmap-review.md` documents the deferral.
+The two-panel equity-curve plot contemplated at ADR 0002 line 96 remains
+DEFERRED (per Plan-reviewer High 5 and the M5 PR 4 deferral): the split fix
+is in place but the dividend-data residual above would still inflate the PIT
+cohort equity curve, so the figure waits on that fix. An amendment footer at
+`docs/decisions/0002-roadmap-review.md` documents the deferral.
 
 Exit codes (locked per Plan-reviewer High 3):
   0 = success
@@ -64,7 +76,10 @@ from pathlib import Path
 import attrs
 import polars as pl
 
-from pit_backtest.data.adjustments import reconstruct_total_return
+from pit_backtest.data.adjustments import (
+    reconstruct_total_return,
+    split_adjusted_prices_and_dividends,
+)
 from pit_backtest.data.contracts import DataQualityError
 from pit_backtest.data.records import AssetId
 from pit_backtest.data.sources.manifest import (
@@ -170,6 +185,15 @@ def _compute_terminal_tr(
     is structurally encoded here: the cash sits at terminal TR through
     `as_of` with zero growth.
 
+    SPLIT-ADJUSTED (the fix): the as-traded `closeunadj` jumps on a split
+    ex-date, so a delisted/bankrupt name that reverse-splits before delisting
+    would otherwise show an astronomically inflated terminal TR (e.g. CHKAQ at
+    ~15,000x), corrupting the cohort mean. The price + dividends are divided by
+    the cumulative in-window split factor via `split_adjusted_prices_and_dividends`
+    (the same single-source-of-truth helper the momentum signal uses) before
+    reconstruction; using the back-adjusted `close` instead would double-count
+    dividends (the back-adjustment already bakes them in).
+
     Returns None when SEP has fewer than 2 rows in the window (pre-IPO
     or vendor gap). `expense_ratio_annual=Decimal("0")` is passed
     explicitly so the demo's CAGR is unencumbered by the SPY expense
@@ -180,20 +204,24 @@ def _compute_terminal_tr(
     )
     if prices.height < 2:
         return None
-    # Alias closeunadj -> close per the M1 SPY TR pattern at
-    # examples/spy_buy_and_hold.py:221 and spy_reconciliation.py:611.
-    # `reconstruct_total_return` reads the `close` column and adds the
-    # explicit ACTIONS dividends; using the back-adjusted `close` would
-    # double-count dividends (the back-adjustment already bakes them in).
-    prices_for_tr = prices.select(
-        pl.col("dt"), pl.col("closeunadj").alias("close")
+    splits = source.read_actions(
+        ticker=ticker,
+        start_dt=pit_date,
+        end_dt=as_of_date,
+        action_filter=frozenset({"split"}),
+    ).select(
+        pl.col("date").alias("ex_date"),
+        pl.col("value").cast(pl.Float64).alias("ratio"),
     )
     dividends = source.read_actions_dividends(
         ticker=ticker, start_dt=pit_date, end_dt=as_of_date
     )
+    adj_prices, adj_dividends = split_adjusted_prices_and_dividends(
+        prices.select(pl.col("dt"), pl.col("closeunadj")), splits, dividends
+    )
     tr_series = reconstruct_total_return(
-        prices=prices_for_tr,
-        dividends=dividends,
+        prices=adj_prices,
+        dividends=adj_dividends,
         start_dt=pit_date,
         end_dt=as_of_date,
         expense_ratio_annual=Decimal("0"),
@@ -374,6 +402,20 @@ def render_headline_markdown(report: SurvivorshipReport) -> str:
             f"4. **Delisted PIT members**: "
             f"{len(report.delisted_pit_members)} AssetIds (the "
             f"survivorship-signal source)."
+        ),
+        (
+            "5. **Corporate-action data quality for delisted/bankrupt names** "
+            "(a remaining v1 limitation). Per-ticker total returns are now "
+            "SPLIT-ADJUSTED (the fix that flipped this delta positive), but a "
+            "handful of names that went bankrupt or did large reverse splits "
+            "(e.g. CHKAQ, WINMQ) carry ACTIONS `dividend` values that are "
+            "inconsistent with their `closeunadj` (implausible per-period "
+            "yields), so their REINVESTED total return stays inflated even "
+            "though their price collapsed to ~0. Because these names sit in the "
+            "PIT cohort, they prop up the PIT cohort mean and therefore SUPPRESS "
+            "(not inflate) the survivorship delta; the true delta is somewhat "
+            "larger than reported. A focused corporate-action / dividend "
+            "data-quality fix is tracked separately."
         ),
     ]
     return "\n".join(lines)
