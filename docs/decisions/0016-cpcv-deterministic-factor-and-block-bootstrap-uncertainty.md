@@ -197,3 +197,69 @@ precedent: ADR 0017 universe rework, M3 PR 1-3). It does NOT weaken ADR 0004
 performance hint). The byte-identical guarantee, the compute-only-on-calendar
 reduction, and the loud guard are pinned by
 `tests/engine/test_bar_loop_signal_gate.py`.
+
+## Amendment 2026-06-02 (M5 PR 3c: the cost surfaces, and a real-data correction to decision 2)
+
+Recorded when adding the M5 study's cost surfaces (the eta-sensitivity band +
+the commission-only seam decomposition) in `examples/sp500_momentum_study.py`.
+Both are appended by `compute_cost_surfaces`, kept separate from the 3b core
+(`compute_momentum_study_report`) so the headline DSR stays zero-cost; the CLI
+`--skip-sweep` flag skips them.
+
+**The cost band is a uniform-liquidity eta-SENSITIVITY surface, NOT a realized
+cost (the Plan-reviewer's C1).** It sweeps the Almgren temporary-impact eta over
+the ADR 0010 lock #10 grid with `SquareRootImpactMatchingEngine` +
+`PerShareCommission`, but a SINGLE SPY-typical `MarketStateRow` (sigma_D, V_D,
+Theta) is applied to ALL ~930 names in the survivorship union (per-name vol / ADV
+/ shares-outstanding is M3+/out of scope). The report labels it so and makes NO
+after-cost-deflated claim; the headline PSR/DSR remains zero-cost. With
+SPY-typical liquidity and the strategy's small per-name trades the eta
+sensitivity is sub-bp (measured), which the report states plainly.
+
+**Decision 2's seam-cost DIRECTION is corrected by real data (rule 6).** Decision
+2 stated that, because each per-group BarLoop re-enters from all-cash, the
+stitched CPCV path "charges a full liquidation plus full re-entry at each of the
+N-1 group seams" and is therefore biased LEVEL-DOWNWARD versus a contiguous run,
+with the bias scaling with N and the commission rate. Implementing the seam demo
+commission-only (sigma_D=0 nulls both Almgren terms, leaving only
+`PerShareCommission`) and measuring it on `sharadar_2026-05-31` (2015, N=6)
+showed TWO things decision 2 did not anticipate:
+
+1. **The naive contiguous-minus-stitched LEVEL gap is dominated by the omitted
+   inter-group gap-day market moves, NOT commission.** The per-group windows span
+   `[first rebalance, last rebalance]` of each group, so the ~21 trading days
+   between one group's last rebalance and the next group's first are in NO group
+   and are omitted from the stitch. Measured: the raw level gap was -$37,901
+   while the ZERO-COST level gap (pure omitted-bar market moves) was -$37,832
+   (99.8% of it); commission was only 0.68% of the raw gap. The raw level gap is
+   therefore not a commission measure, and it is NEGATIVE (stitched above
+   contiguous), the opposite of decision 2's expectation.
+
+2. **`_stitch_path`'s running-level carry NORMALIZES away each per-group
+   post-entry-commission baseline.** Each per-group run's first snapshot
+   (`seg.nav[0]`) is taken AFTER that bar's full-entry rebalance, so it already
+   reflects the entry commission; `_stitch_path` rescales the segment by
+   `running / seg.nav[0]`, which makes the entry commission the (normalized-away)
+   baseline rather than an in-level drag. So the stitched LEVEL carries only the
+   within-group turnover commissions, NOT the per-group re-entries; the
+   per-group all-cash re-entries do not bias the stitched level downward.
+
+The genuine N-1 re-entry commission decision 2 intended IS real and positive, but
+it must be measured BEFORE the stitch normalizes it: the seam reports
+`phantom_reentry_commission` = (sum over groups of each group's isolated
+commission drag) - (the single contiguous run's commission drag) (measured
++$502.71; the N full all-cash entries the CPCV execution pays versus one). All
+commission figures are isolated from the gap-day market-move confound by
+differencing the zero-cost leg against the commission-only leg on the SAME bars.
+
+The operational takeaway REINFORCES decision 2's conclusion even though it
+corrects its mechanism: a single CONTIGUOUS full-period backtest is the
+cost/level reference (the 3b headline already uses it), and the CPCV stitch's
+LEVEL must not be read as cost-accurate (it both omits gap-day bars and
+normalizes per-group entry commissions). The seam is computed WITHOUT `run_cpcv`
+(H3: `run_cpcv` always adapts to a registry and `BacktestResult` carries no
+`final_nav`), via `runner._stitch_path` + `validation.cv.contiguous_folds`
+directly. Pinned by `tests/integration/test_sp500_momentum_study.py::test_cost_surfaces_short_window`
+(bundle-gated). This is an additive examples-layer change; no production
+`src/pit_backtest` code is modified, so decisions 1 to 6 and the run_cpcv body
+stand unchanged.
