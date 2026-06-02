@@ -157,3 +157,43 @@ amendment records the small additions the body required.
    reference are PR 3 deliverables against the real cost-bearing bundle, per the
    decision 2 warning not to mistake (or manufacture) the CPCV-below-contiguous
    gap.
+
+## Amendment 2026-06-01 (M5 PR 3a: the signal-compute perf gate)
+
+Recorded when adding the `BarLoop.signal_calendar` performance gate, the
+prerequisite for tractably running the real S&P 500 momentum study (PR 3b).
+
+Under `use_real_pit_view=True` the BarLoop rebuilt the PitView and called
+`signal.compute` on every trading day, but the rebalance policy no-ops off its
+own monthly calendar, so ~95% of those computes (each a full-SEP-slice PitView
+rebuild plus a per-member total-return reconstruction) were wasted. On the real
+502-name 2005-2024 universe a single `signal.compute` measures ~2.8 s, so the
+un-gated run is ~3.9 hours of signal compute versus ~11 minutes gated (a ~21x
+reduction; measured on `sharadar_2026-05-31`).
+
+The gate is an additive keyword-only constructor flag
+`signal_calendar: frozenset[date] | None = None`. When `None` (the default) the
+signal fires every bar (M1/M2/PR-2c behavior, byte-identical). When set (the
+study passes the policy's rebalance calendar) the PitView rebuild and
+`signal.compute` fire ONLY on calendar bars; off-calendar bars reuse the prior
+`signal_output`.
+
+LOAD-BEARING INVARIANT (the actual contract, not merely "the policy no-ops off
+its calendar"): `signal_calendar`, when set, MUST be a SUPERSET of every bar on
+which the policy can emit non-empty targets. The gate is behavior-preserving
+precisely because, when this holds, the off-calendar `signal_output` is never
+consumed by an order (the policy returns empty targets off its trade calendar,
+so the order block is skipped regardless of `signal_output`). If a caller passes
+a calendar that omits a bar the policy trades on, the gate would skip the signal
+that should have driven that trade and silently change the equity curve;
+`BarLoop.run` therefore RAISES loudly (`RuntimeError`) the moment the policy
+emits non-empty targets on a non-signal bar. This converts the latent trap into
+a loud failure and makes the flag safe for general use.
+
+This is an additive, default-off, behavior-preserving change to the BarLoop
+public constructor, recorded as a footer rather than a standalone ADR (the
+precedent: ADR 0017 universe rework, M3 PR 1-3). It does NOT weaken ADR 0004
+(the policy still owns the rebalance calendar; the flag is a caller-supplied
+performance hint). The byte-identical guarantee, the compute-only-on-calendar
+reduction, and the loud guard are pinned by
+`tests/engine/test_bar_loop_signal_gate.py`.

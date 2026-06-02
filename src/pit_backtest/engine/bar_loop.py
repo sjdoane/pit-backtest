@@ -156,6 +156,7 @@ class BarLoop:
         enable_timing: bool = False,
         use_real_pit_view: bool = False,
         asset_id_to_ticker: Callable[[AssetId], str] | None = None,
+        signal_calendar: frozenset[date] | None = None,
     ) -> None:
         self._data_source = data_source
         self._universe = universe
@@ -188,6 +189,18 @@ class BarLoop:
         # study sets use_real_pit_view=True; run() then rebuilds a real
         # per-bar PitView before each signal.compute call (ADR 0016 PR 2b).
         self._use_real_pit_view = use_real_pit_view
+        # signal_calendar (M5 PR 3a): when set (the study passes the policy's
+        # rebalance calendar), signal.compute AND the per-bar PitView rebuild
+        # fire ONLY on calendar bars; off-calendar bars reuse the prior
+        # signal_output. This is a performance hint, NOT a behavior change: the
+        # policy emits empty targets off its own rebalance calendar, so the
+        # off-calendar signal_output is never consumed by an order. CONTRACT
+        # (load-bearing): signal_calendar MUST be a superset of every bar on
+        # which the policy can emit non-empty targets, or the gate would skip a
+        # signal that would have driven a trade and silently change the curve;
+        # run() raises loudly if the policy ever trades on a non-signal bar.
+        # Default None = compute every bar (M1/M2/PR-2c behavior, byte-identical).
+        self._signal_calendar = signal_calendar
         self._pit_view: PitView = _NoopPitView()
         self._cost_estimator: PreTradeCostEstimator
         if cost_estimator is None:
@@ -338,6 +351,12 @@ class BarLoop:
         if self._enable_timing:
             self._timing["preload"] = time.perf_counter() - _t_preload
 
+        # signal_output persists across bars so that when signal_calendar gates
+        # the signal off-calendar, the policy still receives the last computed
+        # signal (which it ignores off its rebalance calendar anyway). Empty
+        # before the first signal bar.
+        signal_output: dict[AssetId, float] = {}
+
         for bar_dt in trading_days_in_window:
             self._clock.advance_to(bar_dt)
             now = self._clock.now()
@@ -363,22 +382,34 @@ class BarLoop:
                 if key in price_at:
                     prices_today[ticker] = price_at[key]
 
-            # Rebuild the per-bar PitView for signals that consume history
-            # (ADR 0016 PR 2b). The closure captures bar_dt and slices each
-            # served table to available_dt < bar_dt (strict). The no-op
-            # stand-in is kept for the constant-weight signal that ignores
-            # pit_view, so the M1/M2 demos pay nothing.
-            if self._use_real_pit_view:
-                self._pit_view = self._build_pit_view(bar_dt)
-
-            # Step 4: signal.
-            if self._enable_timing:
-                _t_step = time.perf_counter()
-            signal_output = self._signal.compute(self._universe, now, self._pit_view)
-            if self._enable_timing:
-                self._timing["signal"] = self._timing.get("signal", 0.0) + (
-                    time.perf_counter() - _t_step
+            # Step 4: signal. Gated by signal_calendar (M5 PR 3a): when a
+            # calendar is set, the per-bar PitView rebuild AND signal.compute
+            # fire ONLY on calendar bars; off-calendar bars reuse the prior
+            # signal_output (the policy no-ops off its rebalance calendar, so
+            # that stale value is never consumed by an order). This is the
+            # tractability gate for the real S&P 500 study (compute on ~240
+            # rebalances, not ~5000 trading days). Default (None) computes every
+            # bar, byte-identical to the pre-gate behavior.
+            bar_is_signal_bar = (
+                self._signal_calendar is None or bar_dt in self._signal_calendar
+            )
+            if bar_is_signal_bar:
+                # Rebuild the per-bar PitView for history-consuming signals
+                # (ADR 0016 PR 2b): a closure capturing bar_dt, each served
+                # table sliced to available_dt < bar_dt (strict). The no-op
+                # stand-in stays for the constant-weight signal that ignores
+                # pit_view, so the M1/M2 demos pay nothing.
+                if self._use_real_pit_view:
+                    self._pit_view = self._build_pit_view(bar_dt)
+                if self._enable_timing:
+                    _t_step = time.perf_counter()
+                signal_output = self._signal.compute(
+                    self._universe, now, self._pit_view
                 )
+                if self._enable_timing:
+                    self._timing["signal"] = self._timing.get("signal", 0.0) + (
+                        time.perf_counter() - _t_step
+                    )
 
             # Step 5: policy. Per ADR 0009 lock #5 the cost_estimator is
             # the real cost model when the BarLoop was constructed with
@@ -398,6 +429,20 @@ class BarLoop:
 
             # Step 6: convert targets into orders + fills + state updates.
             if targets.targets:
+                # signal_calendar contract guard (M5 PR 3a): non-empty targets
+                # mean the policy intends to trade this bar. If this is NOT a
+                # signal bar, signal_calendar omitted a bar the policy trades
+                # on, so the gate skipped the signal that should have driven
+                # this trade and the curve would be silently wrong. Fail loudly
+                # rather than corrupt the output (the gate is behavior-preserving
+                # only when signal_calendar covers the policy's trade calendar).
+                if not bar_is_signal_bar:
+                    raise RuntimeError(
+                        f"BarLoop: policy emitted non-empty targets on {bar_dt}, "
+                        f"which is not in signal_calendar; signal_calendar must "
+                        f"be a superset of every bar on which the policy can "
+                        f"trade (else the signal gate silently changes outputs)."
+                    )
                 n_rebalances += 1
                 for ticker in sorted(targets.targets.keys()):
                     if ticker not in prices_today:

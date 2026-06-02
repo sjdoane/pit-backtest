@@ -221,12 +221,16 @@ class MomentumWindowFactory:
     timeline; __call__ filters it to the window so the per-group BarLoop only
     rebalances on the observations inside its own group. An empty
     rebalance_dates yields a no-trade (flat, all-cash) BarLoop, used by the
-    flat-path skip test.
+    flat-path skip test. When gate=True the window's rebalances are passed as
+    the BarLoop signal_calendar (the M5 PR 3a perf gate), so signal.compute
+    fires only on rebalance bars; this is behavior-preserving (the policy
+    no-ops off-calendar) and is exercised by the gate's byte-identical test.
     """
 
     snapshots_root: str
     rebalance_dates: tuple[date, ...]
     initial_capital: float = INITIAL_CAPITAL
+    gate: bool = False
 
     def __call__(self, group_start: date, group_end: date) -> BarLoop:
         source = SharadarDataSource(BUNDLE_NAME, Path(self.snapshots_root))
@@ -262,4 +266,5 @@ class MomentumWindowFactory:
             initial_capital=self.initial_capital,
             use_real_pit_view=True,
             asset_id_to_ticker=_resolve,
+            signal_calendar=(window_rebals if self.gate else None),
         )
