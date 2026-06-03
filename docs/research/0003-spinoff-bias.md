@@ -158,42 +158,53 @@ diluted across the cohort and (for the delta) largely cancel.
 
 ### Per-name (large)
 
-For a buy-and-hold holding, dropping a spin-off scales the name's terminal total
-return down multiplicatively: the reconstructed total return is a cumulative
-product of daily `(close + dividend) / prior_close` multipliers, so the ex-date
-appears as one factor of `ex_close / pre_close` instead of the wealth-preserving
-1.0. The cash-equivalent floor (treatment 2) restores that factor by crediting the
-distributed value: per event, multiply the recorded terminal by
-`(ex_close + distributed_value) / ex_close`, using the as-traded distributed value
-(section 3) and skipping any event that falls on a split ex-date (the ratio is
-split-factor invariant only across a non-split day; verified, none of GE's do).
+For a buy-and-hold holding, dropping a spin-off costs the name its distributed
+value at the ex-date. The cash-equivalent floor (treatment 2) credits that value
+back as cash at the ex-date and FREEZES it (it earns nothing afterward): per event,
+add `W_pre * (distributed_value / pre_close)` to the recorded terminal, where
+`W_pre` is the buy-and-hold total return (the holder's wealth) at the bar just
+before the ex-date and `pre_close` is the parent's as-traded price there, both on
+the as-traded basis of section 3. This is ADDITIVE: the frozen cash does not ride
+the parent's own post-ex return. A tempting shortcut, multiplying the whole
+terminal by `(ex_close + distributed_value) / ex_close`, is WRONG because it scales
+the entire post-ex path and so credits the distributed value with the parent's
+subsequent return; for GE, which rallied after its spins, that shortcut reports
+5.99x rather than the 4.24x floor below. Treatment 1 (holding the distributed
+shares, which then appreciate per section 1) is higher; this frozen-cash figure is
+the floor. Events on a split ex-date are skipped (the bases align only across a
+non-split day; verified, none of GE's land on one, though Aimco's 2020 spin sits
+two weeks after a split, which is why the rule is needed).
 
-On the real bundle this is a large per-name correction:
+On the real bundle the per-name understatement ranges from material to large:
 
 | Name | Recorded terminal TR | Cash-equivalent floor | Understatement | Driver |
 |---|---|---|---|---|
-| AIV (Aimco) | 0.61x | 4.94x | ~88% | 2020 Apartment Income REIT stub-spin |
-| NI (NiSource) | 5.19x | 13.41x | ~61% | 2015 Columbia Pipeline |
-| EBAY | 5.17x | 12.11x | ~57% | 2015 PayPal |
-| GE | 3.62x | 5.99x | ~40% | 2023 GEHC + 2024 GEV (+ 2019 WAB) |
-| RTX (UTX) | 3.69x | 6.28x | ~41% | 2020 Carrier + Otis (one ex-date) |
+| AIV (Aimco) | 0.61x | 3.22x | ~81% | 2020 Apartment Income REIT stub-spin |
+| TNL (Travel + Leisure) | 5.44x | 8.93x | ~39% | 2018 Wyndham Hotels |
+| NI (NiSource) | 5.19x | 7.32x | ~29% | 2015 Columbia Pipeline |
+| EBAY | 5.17x | 6.77x | ~24% | 2015 PayPal |
+| GE | 3.62x | 4.24x | ~15% | 2023 GEHC + 2024 GEV (+ 2019 WAB) |
+| RTX (UTX) | 3.69x | 4.31x | ~14% | 2020 Carrier + Otis (one ex-date) |
 
 AIV is the extreme: a stub-spin where the distributed entity (Apartment Income
 REIT) was worth more than the remaining parent, so dropping it turns a
-value-preserving holding into an apparent near-total loss (0.61x). GE's true
-buy-and-hold terminal is at least about 6x versus the 3.62x the study records, a
-roughly 40 percent understatement, and this floor is conservative: it credits the
-GEHC and GEV value as ex-date cash but ignores that GE HealthCare and GE Vernova
-both appreciated afterward (treatment 1 would be higher still).
+value-preserving holding into an apparent near-total loss (0.61x recorded versus a
+3.22x floor). GE is more typical and shows why the per-name number is not simply the
+headline price drop: GE was a long laggard (its buy-and-hold wealth was still only
+about 0.93x when it spun off GE HealthCare in early 2023), so the dropped value,
+though 22.5 percent of the share price, was small in WEALTH terms; its 3.62x
+recorded terminal is mostly the 2023 to 2026 rally that followed. The frozen-cash
+floor lifts GE to about 4.24x, a roughly 15 percent understatement; treatment 1
+(holding the GEHC and GE Vernova shares, which appreciated) would be higher.
 
 ### Survivorship cohort and delta (small)
 
 Summed across the 89 affected PIT-cohort parents and divided over the 500 priced
 names, the cash-equivalent floor lifts the PIT-2010 cohort mean terminal TR from
-7.16x to 7.36x, raising its equal-weight CAGR from 12.749 to 12.941 percent (+19.2
+7.16x to 7.24x, raising its equal-weight CAGR from 12.749 to 12.830 percent (+8.1
 bps). The current cohort (60 affected parents of 416 priced) lifts from 14.46x to
-14.66x, +10.0 bps. The survivorship delta (current cohort CAGR minus PIT cohort
-CAGR) therefore moves from the reported 493.6 bps to 484.5 bps, a 9.1 bps (about 2
+14.52x, +3.3 bps. The survivorship delta (current cohort CAGR minus PIT cohort
+CAGR) therefore moves from the reported 493.6 bps to 488.8 bps, a 4.8 bps (about 1
 percent) reduction.
 
 The delta shift is small and would only shrink the headline, for two reasons.
@@ -204,7 +215,7 @@ effect comes from parents in exactly one cohort, two one-sided sums that largely
 offset. Second, the PIT cohort starts from a lower mean (7.16x vs 14.46x), so the
 same absolute per-name lift moves its CAGR more, which is why the delta narrows
 rather than widens. The median terminal TR (PIT 3.70x, current 7.44x) is unchanged:
-the affected parents are not the median name. The 9.1 bps sits well inside the
+the affected parents are not the median name. The 4.8 bps sits well inside the
 study's existing inclusion-bias caveat (the survivorship study already documents
 that its buy-and-hold delta is dominated by current-cohort inclusion bias, not pure
 delisting survivorship), so the spin-off treatment does not change any conclusion
@@ -232,21 +243,25 @@ years. The headline zero-cost Deflated Sharpe (0.9552) is therefore second-order
 affected, not materially. This is the opposite direction from the ADR 0018
 dividend-basis bug, which inflated scores and pulled names INTO the book (and moved
 the DSR from a contaminated 0.9713 to 0.9552); the spin-off drop pushes names OUT,
-so its footprint is smaller and conservative.
+so its footprint is smaller and conservative. A precise figure would require
+re-running the roughly fifteen-minute worked study with a modified action filter
+that cash-credits spin-offs; given the bound above, that is not warranted for a
+second-order effect.
 
 ## 7. Conclusion
 
 The verified treatment is honest in direction (negative bias, parent total return
 understated) and worse in magnitude than ADR 0002 decision 14 anticipated (the
 studies drop spin-offs entirely rather than crediting the cash equivalent). The
-quantification is the point: per-name the understatement is large (GE about 40
-percent, Aimco about 88 percent), but in aggregate it is small (the survivorship
-delta would shrink about 9 bps, roughly 2 percent, and only the headline; the
-momentum Deflated Sharpe is second-order affected and the ranking pollution is
-conservative for a long-only book). Per-name large and aggregate small is the
-honest result, and it is small for the right reasons: dilution across the cohort,
-cancellation across the two cohorts in the delta, and the momentum signal ranking
-the affected names out rather than holding them through the drop.
+quantification is the point: per-name the understatement is material (about 15
+percent for GE, up to roughly 80 percent for stub-spins like Aimco where most of the
+value left), but in aggregate it is small (the survivorship delta would shrink about
+5 bps, roughly 1 percent, and only the headline; the momentum Deflated Sharpe is
+second-order affected and the ranking pollution is conservative for a long-only
+book). Per-name material and aggregate small is the honest result, and it is small
+for the right reasons: dilution across the cohort, cancellation across the two
+cohorts in the delta, and the momentum signal ranking the affected names out rather
+than holding them through the drop.
 
 The fix that would remove the bias, distributing the actual spun-off shares rather
 than dropping or cash-crediting the value, is tracked as a v1.1 backlog item and is
