@@ -13,41 +13,46 @@ look-back excludes the names that delisted between pit_date and as_of.
 Methodology (locked per ADR 0002 acceptance criterion 1 + PR 5c
 Plan-reviewer Choice A ratification with caveat disclosure):
   - Buy-and-hold equal-weight (no monthly rebalance).
-  - Per-ticker terminal total return via `reconstruct_total_return` on SEP
-    closeunadj + ACTIONS dividends, SPLIT-ADJUSTED first (closeunadj is the
-    as-traded price; without split-adjustment a reverse split in a delisted
-    name reads as a spurious gain, e.g. CHKAQ at ~15,000x). The split
-    adjustment reuses the same `split_adjusted_prices_and_dividends` helper as
-    the momentum signal.
-  - Cohort terminal TR = arithmetic mean of per-ticker terminal TRs.
+  - Per-ticker total-return series via `reconstruct_total_return` on SEP
+    closeunadj + ACTIONS dividends (`_member_tr_series`), SPLIT-ADJUSTED
+    (closeunadj is the as-traded price; a reverse split in a delisted name
+    would otherwise read as a spurious gain) via the shared
+    `split_adjusted_prices_and_dividends` helper. The dividend amounts are
+    AS-TRADED, decoded from Sharadar's back-adjusted ACTIONS storage by
+    `read_actions_dividends` (ADR 0018): left raw, a reverse-split name's stored
+    value mismatches the closeunadj basis by the product of later split ratios
+    and explodes the reinvestment (the prior 79x to 255x bankrupt terminals).
+  - Cohort terminal TR = arithmetic mean of per-ticker terminal TRs; the median
+    is reported alongside as the outlier-robust read.
   - CAGR = cohort_terminal_TR ** (1 / years) - 1; years = calendar days
     between pit_date and as_of divided by 365.25.
   - PIT cohort: all S&P 500 members at pit_date; a member that delists
-    mid-window has terminal TR = closeunadj-at-lastpricedate / 2010-price
-    held flat to as_of (zero T-bill accrual; v1 simplicity).
+    mid-window holds its terminal TR flat to as_of (zero T-bill accrual; v1).
   - Current cohort: members at as_of WHO HAD a SEP price at pit_date. A
-    post-pit_date IPO (no 2010 price) is SKIPPED with a logged warning;
-    the cohort CAGR is computed over the 2010-priced subset only.
+    post-pit_date IPO (no pit-date price) is SKIPPED with a logged warning.
+  - The two-panel cohort equity curve (`compute_cohort_nav_curve`) is the
+    equal-weight buy-and-hold NAV of each cohort over a month-end grid, with the
+    invariant that the curve terminal equals the headline mean terminal TR.
 
-Caveats surfaced in the rendered Markdown report (Plan-reviewer High 4):
-  1. Buy-and-hold (no rebalance) UNDERSTATES the published 1.4-1.5 pp
-     Hsu-Hutchinson / Brown-Goetzmann figure (monthly rebalance).
-  2. Zero T-bill accrual on delisting cash adds an estimated ~13 bps
-     annualized bias over 15 years (T-bill 2010-2025 ~2.5% nominal).
-  3. Skipping current members without 2010 prices SHRINKS the delta
+Caveats surfaced in the rendered Markdown report:
+  1. Buy-and-hold (no rebalance) is NOT the monthly-rebalanced 1.4-1.5 pp
+     Hsu-Hutchinson / Brown-Goetzmann figure; the delta here is dominated by
+     current-cohort inclusion bias (today's members were selected for growing
+     into the index), so it is the inclusion-plus-survivorship gap of this
+     construction, read alongside the outlier-robust median.
+  2. Zero T-bill accrual on delisting cash adds an estimated ~13 bps annualized
+     bias over the window (T-bill ~2.5% nominal).
+  3. Skipping current members without pit-date prices SHRINKS the delta
      because TSLA / SNOW / etc. would have boosted current cohort TR.
-  4. Corporate-action data quality for delisted/bankrupt names: per-ticker
-     TRs are SPLIT-ADJUSTED (the fix), but a few names (e.g. CHKAQ, WINMQ)
-     carry ACTIONS dividend values inconsistent with closeunadj, so their
-     reinvested TR stays inflated; they sit in the PIT cohort and therefore
-     SUPPRESS the delta. A focused dividend / corporate-action data-quality
-     fix is tracked separately.
+  4. Delisted PIT members are the survivorship-signal source.
+  5. Dividend / split basis is corrected (ADR 0018): no per-name dividend data
+     is dropped or capped; the bankrupt names now read near-zero terminals.
 
-The two-panel equity-curve plot contemplated at ADR 0002 line 96 remains
-DEFERRED (per Plan-reviewer High 5 and the M5 PR 4 deferral): the split fix
-is in place but the dividend-data residual above would still inflate the PIT
-cohort equity curve, so the figure waits on that fix. An amendment footer at
-`docs/decisions/0002-roadmap-review.md` documents the deferral.
+The two-panel cohort equity-curve plot contemplated at ADR 0002 line 96 SHIPS
+in M5 `scripts/figures/` (`compute_cohort_nav_curve` feeds
+`scripts/figures/build_study_artifact.py` -> `survivorship.json` ->
+`docs/figures/survivorship_two_panel.png`); the deferral footer at
+`docs/decisions/0002-roadmap-review.md` is superseded by ADR 0018.
 
 Exit codes (locked per Plan-reviewer High 3):
   0 = success
@@ -77,6 +82,7 @@ import attrs
 import polars as pl
 
 from pit_backtest.data.adjustments import (
+    SPLIT_LIKE_ACTIONS,
     reconstruct_total_return,
     split_adjusted_prices_and_dividends,
 )
@@ -88,7 +94,9 @@ from pit_backtest.data.sources.manifest import (
 )
 from pit_backtest.data.sources.sharadar import SharadarDataSource
 from pit_backtest.data.universe import UniverseValidationError
+from pit_backtest.engine.calendar import monthly_last_trading_day
 from pit_backtest.engine.spy_reconciliation import discover_latest_bundle
+from pit_backtest.execution.clock import TestClock
 from pit_backtest.utils.logging import configure_logging
 
 _LOG = logging.getLogger(__name__)
@@ -130,6 +138,8 @@ class SurvivorshipReport:
     delisted_pit_members: tuple[AssetId, ...]
     pit_cohort_mean_terminal_tr: float
     current_cohort_mean_terminal_tr: float
+    pit_cohort_median_terminal_tr: float
+    current_cohort_median_terminal_tr: float
     pit_cohort_cagr: float
     current_cohort_cagr: float
     cagr_delta_bps: float
@@ -170,34 +180,44 @@ def _resolve_ticker_at(
     return str(tickers[-1])
 
 
-def _compute_terminal_tr(
+def _member_tr_series(
     source: SharadarDataSource,
     ticker: str,
     pit_date: date,
     as_of_date: date,
-) -> float | None:
-    """Buy-and-hold terminal total return over [pit_date, as_of_date].
+) -> pl.DataFrame | None:
+    """Buy-and-hold daily total-return series (dt, tr) over [pit_date, as_of].
 
-    For a ticker that delists mid-window, `read_sep_prices` returns rows
-    only through `lastpricedate`; `reconstruct_total_return` clamps to
-    that range and the terminal TR equals the buy-and-hold value at the
-    last trading bar. The "no T-bill accrual on delisting cash" caveat
-    is structurally encoded here: the cash sits at terminal TR through
-    `as_of` with zero growth.
+    Single source of truth for both the headline terminal TR
+    (`_compute_terminal_tr` returns its last bar) and the cohort equity curve
+    (`compute_cohort_nav_curve` forward-fills it onto a month-end grid), so the
+    curve's terminal equals the headline mean by construction.
 
-    SPLIT-ADJUSTED (the fix): the as-traded `closeunadj` jumps on a split
-    ex-date, so a delisted/bankrupt name that reverse-splits before delisting
-    would otherwise show an astronomically inflated terminal TR (e.g. CHKAQ at
-    ~15,000x), corrupting the cohort mean. The price + dividends are divided by
-    the cumulative in-window split factor via `split_adjusted_prices_and_dividends`
-    (the same single-source-of-truth helper the momentum signal uses) before
-    reconstruction; using the back-adjusted `close` instead would double-count
-    dividends (the back-adjustment already bakes them in).
+    For a ticker that delists mid-window, `read_sep_prices` returns rows only
+    through `lastpricedate`; `reconstruct_total_return` clamps to that range and
+    the series ends at the last trading bar. The "no T-bill accrual on delisting
+    cash" caveat is encoded downstream: the equity curve holds the terminal TR
+    flat across the remaining grid points.
 
-    Returns None when SEP has fewer than 2 rows in the window (pre-IPO
-    or vendor gap). `expense_ratio_annual=Decimal("0")` is passed
-    explicitly so the demo's CAGR is unencumbered by the SPY expense
-    ratio step that the M1 reconciliation applies.
+    SPLIT-ADJUSTED: the as-traded `closeunadj` jumps on a split ex-date, so a
+    delisted/bankrupt name that reverse-splits before delisting would otherwise
+    show an astronomically inflated terminal TR. The price is divided by the
+    cumulative in-window split factor via `split_adjusted_prices_and_dividends`
+    (split-like actions per `SPLIT_LIKE_ACTIONS` include `adrratiosplit`).
+
+    AS-TRADED DIVIDENDS (ADR 0018): `read_actions_dividends` returns the cash
+    actually paid per share, decoded from Sharadar's back-adjusted ACTIONS
+    storage; left raw, a reverse-split name's stored dividend value mismatches
+    the `closeunadj` basis by the product of later split ratios and explodes the
+    reinvestment (this is why the bankrupt names previously read terminal TRs of
+    79x to 255x even though their price collapsed to ~0). The in-window split
+    co-adjustment then puts the as-traded dividend on the same basis as the
+    adjusted price.
+
+    Returns None when SEP has fewer than 2 rows in the window (pre-IPO or vendor
+    gap). `expense_ratio_annual=Decimal("0")` is passed explicitly so the demo's
+    CAGR is unencumbered by the SPY expense-ratio step the M1 reconciliation
+    applies.
     """
     prices = source.read_sep_prices(
         ticker=ticker, start_dt=pit_date, end_dt=as_of_date
@@ -208,7 +228,7 @@ def _compute_terminal_tr(
         ticker=ticker,
         start_dt=pit_date,
         end_dt=as_of_date,
-        action_filter=frozenset({"split"}),
+        action_filter=SPLIT_LIKE_ACTIONS,
     ).select(
         pl.col("date").alias("ex_date"),
         pl.col("value").cast(pl.Float64).alias("ratio"),
@@ -219,14 +239,27 @@ def _compute_terminal_tr(
     adj_prices, adj_dividends = split_adjusted_prices_and_dividends(
         prices.select(pl.col("dt"), pl.col("closeunadj")), splits, dividends
     )
-    tr_series = reconstruct_total_return(
+    return reconstruct_total_return(
         prices=adj_prices,
         dividends=adj_dividends,
         start_dt=pit_date,
         end_dt=as_of_date,
         expense_ratio_annual=Decimal("0"),
     )
-    return float(tr_series["tr"][-1])
+
+
+def _compute_terminal_tr(
+    source: SharadarDataSource,
+    ticker: str,
+    pit_date: date,
+    as_of_date: date,
+) -> float | None:
+    """Buy-and-hold terminal total return = the last bar of `_member_tr_series`.
+
+    Returns None when the series is None (fewer than 2 SEP rows in the window).
+    """
+    series = _member_tr_series(source, ticker, pit_date, as_of_date)
+    return None if series is None else float(series["tr"][-1])
 
 
 def _build_cohort(
@@ -280,6 +313,127 @@ def _cagr_from_terminal_tr(mean_terminal_tr: float, years: float) -> float:
     return float(mean_terminal_tr ** (1.0 / years) - 1.0)
 
 
+def _median(values: list[float]) -> float:
+    """Median of a non-empty list (mean of the two middle values for even n)."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _cohort_month_end_grid(pit_date: date, as_of_date: date) -> tuple[date, ...]:
+    """Month-end NYSE trading days strictly inside (pit_date, as_of_date),
+    bracketed by both endpoints.
+
+    The grid anchors at pit_date (cohort NAV = 1.0) and ends exactly at
+    as_of_date so each member's forward-filled terminal lands on the same bar
+    the headline terminal TR reads; the month-ends in between trace the path.
+    Mirrors `momentum_rebalance_dates`: monthly_last_trading_day returns a
+    frozenset and the TestClock pads +/-14 days, so filter to the window then
+    sort.
+    """
+    clock = TestClock(start_dt=pit_date, end_dt=as_of_date)
+    month_ends = (
+        d
+        for d in monthly_last_trading_day(clock.trading_days())
+        if pit_date < d < as_of_date
+    )
+    return tuple(sorted({pit_date, *month_ends, as_of_date}))
+
+
+def _sample_member_on_grid(
+    series: pl.DataFrame, grid: tuple[date, ...]
+) -> list[float]:
+    """Forward-fill a member's (dt, tr) series onto the grid.
+
+    A backward `join_asof` takes, at each grid date, the last tr at or before
+    it: before the member's first bar gives 1.0 (the buy-and-hold base, no
+    growth yet); after its last bar (a delisted member) gives the terminal tr
+    held flat (the zero T-bill-accrual convention).
+    """
+    grid_df = pl.DataFrame({"dt": list(grid)}).with_columns(
+        pl.col("dt").cast(pl.Date)
+    )
+    joined = grid_df.join_asof(
+        series.select("dt", "tr").sort("dt"), on="dt", strategy="backward"
+    )
+    return [1.0 if v is None else float(v) for v in joined["tr"].to_list()]
+
+
+def compute_cohort_nav_curve(
+    source: SharadarDataSource,
+    members: list[AssetId],
+    pit_date: date,
+    as_of_date: date,
+    grid: tuple[date, ...],
+) -> pl.DataFrame:
+    """Equal-weight buy-and-hold cohort NAV over `grid`.
+
+    For each cohort member resolvable + priced at pit_date (the SAME skip rules
+    as `_build_cohort`, so the member set matches the headline), reconstruct its
+    split- and as-traded-dividend-adjusted total-return series via
+    `_member_tr_series`, forward-fill it onto `grid`, and average equal-weight.
+    Because every member's series is normalized to 1.0 at pit_date,
+    `nav[0] == 1.0` and `nav[-1]` equals the headline `cohort_mean_terminal_tr`
+    (the figure pipeline asserts this invariant), so the two panels reconcile to
+    the headline CAGR delta. Iterates members in `int(asset_id)` order
+    (Determinism Requirement 3). Returns columns `dt`, `nav`.
+    """
+    grid_sorted = tuple(sorted(grid))
+    sums = [0.0] * len(grid_sorted)
+    n_members = 0
+    for asset_id in sorted(members, key=int):
+        ticker = _resolve_ticker_at(source, asset_id, pit_date)
+        if ticker is None:
+            continue
+        series = _member_tr_series(source, ticker, pit_date, as_of_date)
+        if series is None:
+            continue
+        sampled = _sample_member_on_grid(series, grid_sorted)
+        for i, value in enumerate(sampled):
+            sums[i] += value
+        n_members += 1
+    navs = (
+        [s / n_members for s in sums]
+        if n_members > 0
+        else [1.0] * len(grid_sorted)
+    )
+    return pl.DataFrame(
+        {"dt": list(grid_sorted), "nav": navs}
+    ).with_columns(pl.col("dt").cast(pl.Date), pl.col("nav").cast(pl.Float64))
+
+
+def build_survivorship_figure_data(
+    source: SharadarDataSource,
+    pit_date: date,
+    as_of_date: date,
+) -> tuple[SurvivorshipReport, pl.DataFrame, pl.DataFrame]:
+    """The report plus the PIT and current cohort NAV curves for the two-panel
+    figure (ADR 0002 line 96, ADR 0018).
+
+    Public entry point for `scripts/figures/build_study_artifact.py`. Each curve
+    is the equal-weight buy-and-hold cohort NAV over the shared month-end grid;
+    by construction `pit_curve.nav[-1] == report.pit_cohort_mean_terminal_tr`
+    and likewise for the current cohort, so the figure reconciles to the
+    headline CAGR delta (the regenerate.py validator asserts this).
+    """
+    report = compute_survivorship_report(source, pit_date, as_of_date)
+    grid = _cohort_month_end_grid(pit_date, as_of_date)
+    pit_members = source.members_at("sp500", _to_nyse_close(pit_date))
+    current_members = source.members_at("sp500", _to_nyse_close(as_of_date))
+    pit_curve = compute_cohort_nav_curve(
+        source, pit_members, pit_date, as_of_date, grid
+    )
+    current_curve = compute_cohort_nav_curve(
+        source, current_members, pit_date, as_of_date, grid
+    )
+    return report, pit_curve, current_curve
+
+
 def compute_survivorship_report(
     source: SharadarDataSource,
     pit_date: date,
@@ -324,6 +478,9 @@ def compute_survivorship_report(
         else 0.0
     )
 
+    pit_median_tr = _median(pit_cohort.terminal_trs)
+    current_median_tr = _median(current_cohort.terminal_trs)
+
     pit_cagr = _cagr_from_terminal_tr(pit_mean_tr, years)
     current_cagr = _cagr_from_terminal_tr(current_mean_tr, years)
     cagr_delta_bps = (current_cagr - pit_cagr) * 10_000.0
@@ -344,6 +501,8 @@ def compute_survivorship_report(
         delisted_pit_members=delisted_pit_members,
         pit_cohort_mean_terminal_tr=pit_mean_tr,
         current_cohort_mean_terminal_tr=current_mean_tr,
+        pit_cohort_median_terminal_tr=pit_median_tr,
+        current_cohort_median_terminal_tr=current_median_tr,
         pit_cohort_cagr=pit_cagr,
         current_cohort_cagr=current_cagr,
         cagr_delta_bps=cagr_delta_bps,
@@ -369,6 +528,8 @@ def render_headline_markdown(report: SurvivorshipReport) -> str:
         f"| Survivors (in both sets) | {report.survivor_count} |",
         f"| PIT cohort priced at pit_date | {report.pit_cohort_priced_at_pit_date} |",
         f"| Current cohort priced at pit_date | {report.current_cohort_priced_at_pit_date} |",
+        f"| PIT cohort mean / median terminal TR | {report.pit_cohort_mean_terminal_tr:.3f}x / {report.pit_cohort_median_terminal_tr:.3f}x |",
+        f"| Current cohort mean / median terminal TR | {report.current_cohort_mean_terminal_tr:.3f}x / {report.current_cohort_median_terminal_tr:.3f}x |",
         f"| PIT cohort equal-weight CAGR | {report.pit_cohort_cagr * 100:.4f}% |",
         f"| Current cohort equal-weight CAGR | {report.current_cohort_cagr * 100:.4f}% |",
         f"| CAGR delta (current minus PIT) | {report.cagr_delta_bps:+.2f} bps |",
@@ -376,27 +537,34 @@ def render_headline_markdown(report: SurvivorshipReport) -> str:
         "## Caveats",
         "",
         (
-            "1. **Buy-and-hold equal-weight** with no monthly rebalance. "
-            "The published Hsu-Hutchinson 2006 + Brown-Goetzmann 1992 "
-            "survivorship literature typically reports monthly-rebalanced "
-            "CAGR deltas of 1.4 to 1.5 percentage points; this "
-            "buy-and-hold demo will UNDERSTATE that headline because "
-            "delisted positions stop contributing to the equity book."
+            "1. **Buy-and-hold equal-weight, and what the delta measures.** This "
+            "is a buy-and-hold cohort with no monthly rebalance, so it is NOT the "
+            "monthly-rebalanced 1.4 to 1.5 percentage-point figure of "
+            "Hsu-Hutchinson 2006 / Brown-Goetzmann 1992. It is also dominated by "
+            "current-cohort INCLUSION bias: today's members were selected (by "
+            "market cap) for having grown into the index, so buying them at "
+            "pit-date prices captures that growth, which is a larger effect than "
+            "pure delisting survivorship. The mean terminal TR is pulled up by a "
+            "few hundred-x survivors (NVDA, AAPL), so the MEDIAN terminal TR is "
+            "reported alongside it as the outlier-robust read. Treat the delta as "
+            "the inclusion-plus-survivorship gap of this specific construction, "
+            "not a literature-comparable survivorship-bias point estimate."
         ),
         (
-            "2. **Zero T-bill accrual** on delisting cash. A PIT member "
-            "that delists at price P sits at terminal TR = P / "
-            "initial_price through `as_of`, with no interest. The actual "
-            "T-bill return 2010-2025 (~2.5% nominal) would add ~13 bps "
-            "annualized; v1 simplicity."
+            "2. **Zero T-bill accrual** on delisting cash. A PIT member that "
+            "delists at terminal TR sits flat through `as_of` with no interest "
+            "(the equity curve holds it flat at its terminal). The actual T-bill "
+            "return over the window (~2.5% nominal) would add ~13 bps annualized; "
+            "v1 simplicity."
         ),
         (
-            f"3. **Skipped current members without 2010 prices**: "
+            f"3. **Skipped current members without pit-date prices**: "
             f"{len(report.skipped_current_without_2010_price)} AssetIds "
-            f"(post-2010 IPOs). The current cohort CAGR is computed over "
-            f"the {report.current_cohort_priced_at_pit_date}-name subset "
-            f"that had a SEP price at pit_date; this UNDERSTATES the "
-            f"current cohort's terminal TR and SHRINKS the delta."
+            f"(post-pit-date IPOs). The current cohort is computed over the "
+            f"{report.current_cohort_priced_at_pit_date}-name subset that had a "
+            f"SEP price at pit_date; this UNDERSTATES the current cohort's "
+            f"terminal TR and SHRINKS the delta (the biggest such names, e.g. "
+            f"TSLA, would widen it)."
         ),
         (
             f"4. **Delisted PIT members**: "
@@ -404,18 +572,15 @@ def render_headline_markdown(report: SurvivorshipReport) -> str:
             f"survivorship-signal source)."
         ),
         (
-            "5. **Corporate-action data quality for delisted/bankrupt names** "
-            "(a remaining v1 limitation). Per-ticker total returns are now "
-            "SPLIT-ADJUSTED (the fix that flipped this delta positive), but a "
-            "handful of names that went bankrupt or did large reverse splits "
-            "(e.g. CHKAQ, WINMQ) carry ACTIONS `dividend` values that are "
-            "inconsistent with their `closeunadj` (implausible per-period "
-            "yields), so their REINVESTED total return stays inflated even "
-            "though their price collapsed to ~0. Because these names sit in the "
-            "PIT cohort, they prop up the PIT cohort mean and therefore SUPPRESS "
-            "(not inflate) the survivorship delta; the true delta is somewhat "
-            "larger than reported. A focused corporate-action / dividend "
-            "data-quality fix is tracked separately."
+            "5. **Dividend / split basis (corrected).** Per-ticker total returns "
+            "are split-adjusted AND use AS-TRADED dividends decoded from "
+            "Sharadar's back-adjusted ACTIONS storage (ADR 0018). Left raw, a "
+            "reverse-split name's stored dividend value mismatches the "
+            "`closeunadj` price basis by the product of later split ratios, which "
+            "previously inflated bankrupt names' REINVESTED terminal TR to 79x to "
+            "255x even though their price collapsed to ~0; those names now read "
+            "near zero, the honest buy-and-hold outcome. No per-name dividend "
+            "data is dropped or capped."
         ),
     ]
     return "\n".join(lines)

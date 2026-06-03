@@ -660,9 +660,14 @@ class BarLoop:
         sep_lf = self._data_source.get_table("sep").with_columns(
             pl.col("date").cast(pl.Date)
         )
-        actions_lf = self._data_source.get_table("actions").with_columns(
-            pl.col("date").cast(pl.Date)
-        )
+        # ADR 0018: serve the actions view with each `dividend` value decoded
+        # to the as-traded basis (consistent with closeunadj), so the momentum
+        # signal does not score on Sharadar's back-adjusted dividend storage
+        # (which silently imports a future split into a historical dividend).
+        # The decode needs the full split history, so it runs here at the data
+        # layer BEFORE the `date < bar_dt` slice below; `date` is already cast
+        # to pl.Date by the accessor.
+        actions_lf = self._data_source.actions_with_as_traded_dividends()
         tickers_lf = self._data_source.get_table("tickers").with_columns(
             pl.col("firstpricedate").cast(pl.Date),
             pl.col("lastpricedate").cast(pl.Date),

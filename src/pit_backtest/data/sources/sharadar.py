@@ -59,7 +59,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import polars as pl
 
+from pit_backtest.data.adjustments import (
+    SPLIT_LIKE_ACTIONS,
+    to_as_traded_dividends,
+)
 from pit_backtest.data.contracts import (
+    DataQualityError,
     check_snapshot_freshness,
     run_data_quality_contracts,
 )
@@ -197,6 +202,12 @@ _SHARADAR_SKIPPED_ACTIONS: frozenset[str] = frozenset(
         "acquisitionunknown",
         "bankruptcyliquidation",
         "bankruptcyreorganization",
+        # ADR ratio change (Signet 2004/2008): split-like on the price AND
+        # dividend basis, so it is decoded by `to_as_traded_dividends` and the
+        # price-side split reads (SPLIT_LIKE_ACTIONS, ADR 0018). The per-row
+        # `SplitAction` dispatch for ADR ratio changes is a v1.1 refinement; for
+        # now skip it here so it does not hit the unknown-action warning path.
+        "adrratiosplit",
     }
 )
 
@@ -384,6 +395,87 @@ class SharadarDataSource(PitDataSource):
         """
         return SharadarPermatickerResolver(self)
 
+    @cached_property
+    def _as_traded_dividend_values(self) -> pl.DataFrame:
+        """Dividends decoded from Sharadar's back-adjusted storage to as-traded.
+
+        Sharadar stores the ACTIONS `dividend value` SPLIT-ADJUSTED to the
+        data-pull date (the same basis as the adjusted `close`), NOT the cash
+        actually paid per share on the ex-date. `to_as_traded_dividends`
+        (ADR 0018) multiplies each value by the product of the SAME TICKER's
+        strictly-later split-like ratios to recover the contemporaneous amount,
+        consistent with `closeunadj`. Built once over the FULL ACTIONS table
+        (the full split history is required to decode, and is visible here at
+        the data layer, before any available_dt slice) and cached;
+        `read_actions_dividends` and the BarLoop PitView
+        (`actions_with_as_traded_dividends`) both consume it, so momentum
+        selection, the dividend cash-crediting, and the survivorship study all
+        see the same values. Lazy like `_resolver`: M1 SPY-only flows that never
+        read dividends through this pay nothing. The result is unique per
+        (ticker, ex_date) (one dividend per ex-date on the real bundle), so the
+        PitView join on (ticker, date) cannot duplicate rows.
+        """
+        actions = (
+            self.get_table("actions")
+            .with_columns(pl.col("date").cast(pl.Date))
+            .collect()
+        )
+        dividends = actions.filter(pl.col("action") == "dividend").select(
+            pl.col("ticker"),
+            pl.col("date").alias("ex_date"),
+            pl.col("value").cast(pl.Float64),
+        )
+        # The PitView join on (ticker, date) and read_actions_dividends both
+        # assume one dividend per (ticker, ex_date). Fail loudly if a future
+        # bundle violates it (a same-day regular + special), rather than silently
+        # fanning out the left join and double-counting the dividend.
+        if dividends.n_unique(subset=["ticker", "ex_date"]) != dividends.height:
+            raise DataQualityError(
+                "ACTIONS has more than one dividend row on the same "
+                "(ticker, ex_date); the as-traded dividend decode (ADR 0018) "
+                "requires one dividend per ex-date. Aggregate the duplicates "
+                "upstream before constructing the data source."
+            )
+        splits = actions.filter(
+            pl.col("action").is_in(sorted(SPLIT_LIKE_ACTIONS))
+        ).select(
+            pl.col("ticker"),
+            pl.col("date").alias("split_date"),
+            pl.col("value").cast(pl.Float64).alias("ratio"),
+        )
+        return to_as_traded_dividends(dividends, splits)
+
+    def actions_with_as_traded_dividends(self) -> pl.LazyFrame:
+        """ACTIONS with each `dividend` value decoded to the as-traded basis.
+
+        Same (date, action, ticker, value, ...) shape as `get_table('actions')`
+        but every `dividend` value is the as-traded cash per share (ADR 0018)
+        instead of Sharadar's back-adjusted storage; split / spinoff / other
+        rows are unchanged. `BarLoop._build_pit_view` serves its `actions` view
+        from this so the momentum signal scores on contemporaneous dividends
+        rather than values that silently import a future split. The join is on
+        (ticker, date), unique among dividends, so it cannot duplicate rows. The
+        `date` column is cast to `pl.Date` (the cast-before-filter contract);
+        callers re-slice by `date < bar_dt`.
+        """
+        as_traded = self._as_traded_dividend_values.lazy().select(
+            pl.col("ticker"),
+            pl.col("ex_date").alias("date"),
+            pl.col("value").alias("_as_traded_value"),
+        )
+        return (
+            self.get_table("actions")
+            .with_columns(pl.col("date").cast(pl.Date))
+            .join(as_traded, on=["ticker", "date"], how="left")
+            .with_columns(
+                pl.when(pl.col("action") == "dividend")
+                .then(pl.col("_as_traded_value"))
+                .otherwise(pl.col("value"))
+                .alias("value")
+            )
+            .drop("_as_traded_value")
+        )
+
     def get_table(self, table_name: str) -> pl.LazyFrame:
         """Return the LazyFrame for a named Sharadar table.
 
@@ -488,35 +580,34 @@ class SharadarDataSource(PitDataSource):
     ) -> pl.DataFrame:
         """M1 convenience: load dividends for a ticker over a date range.
 
-        Filters Sharadar ACTIONS to `action == "dividend"`. Returns a Polars
-        frame with columns: ex_date, amount_per_share. Sorted by ex_date.
+        Returns a Polars frame with columns: ex_date, amount_per_share. Sorted
+        by ex_date.
 
-        ACTIONS row schema (vendor): ticker, date, action, value, ...
-        For dividends, `date` is the ex-dividend date and `value` is the
-        per-share cash amount. Spin-offs (action == "spinoff" with value
-        as cash-equivalent), delisting cash, and stock-for-stock acquisitions
-        flow through M3.
+        The `amount_per_share` is the AS-TRADED cash per share, decoded from
+        Sharadar's back-adjusted ACTIONS storage via the cached
+        `_as_traded_dividend_values` (ADR 0018): the stored `value` is
+        split-adjusted to the data-pull date, so left raw it mismatches the
+        `closeunadj` (as-traded) price basis by the product of later split
+        ratios. Decoding here makes the BarLoop dividend cash-crediting and the
+        survivorship total-return reconstruction consistent with the price.
+        Spin-offs (`action == "spinoff"`), delisting cash, and stock-for-stock
+        acquisitions flow through M3 and are not in this dividend stream.
         """
-        # Same cast-before-filter contract as read_sep_prices; see comment
-        # there for the pandas-pin / Datetime-vs-Date silent-empty rationale.
-        lf = (
-            self.get_table("actions")
-            .with_columns(pl.col("date").cast(pl.Date))
-            .filter(pl.col("action") == "dividend")
-        )
+        # `_as_traded_dividend_values` already cast `ex_date` to pl.Date, so the
+        # date-range filters compare Date-to-Date (the cast-before-filter
+        # contract); see read_sep_prices for the Datetime-vs-Date rationale.
+        df = self._as_traded_dividend_values
         if ticker is not None:
-            lf = lf.filter(pl.col("ticker") == ticker)
+            df = df.filter(pl.col("ticker") == ticker)
         if start_dt is not None:
-            lf = lf.filter(pl.col("date") >= _to_date(start_dt))
+            df = df.filter(pl.col("ex_date") >= _to_date(start_dt))
         if end_dt is not None:
-            lf = lf.filter(pl.col("date") <= _to_date(end_dt))
+            df = df.filter(pl.col("ex_date") <= _to_date(end_dt))
 
-        df = lf.select(
-            pl.col("date").alias("ex_date"),
-            pl.col("value").cast(pl.Float64).alias("amount_per_share"),
-        ).sort("ex_date").collect()
-
-        return df
+        return df.select(
+            pl.col("ex_date"),
+            pl.col("value").alias("amount_per_share"),
+        ).sort("ex_date")
 
     def read_actions(
         self,

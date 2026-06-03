@@ -3,14 +3,16 @@
   "built_at": "2026-06-02T00:00:00Z",
   "bundle_name": "sharadar_2026-05-31",
   "bundle_pull_date": "2026-05-31",
-  "content_hash": "318fd29d0049c476b77e27a7cc0427e9f2153f11c2196b99af46a68d5106795a",
-  "git_sha": "a56a4c3",
+  "content_hash": "822cb116ad4fa502bede01ba4131c598e21f0b51cc7ba707e2f91d7f1966bb84",
+  "git_sha": "257e701",
   "n_bootstrap": 1000,
   "numpy_version": "1.26.4",
   "polars_version": "1.41.1",
   "python_version": "3.12.13",
   "schema_version": 1,
   "seed": 20260601,
+  "survivorship_as_of_date": "2026-05-31",
+  "survivorship_pit_date": "2010-01-04",
   "window_end": "2024-12-31",
   "window_start": "2005-01-31"
 }

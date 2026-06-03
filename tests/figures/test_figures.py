@@ -25,6 +25,7 @@ _DATA_FILES = (
     "bootstrap_fan.json",
     "by_year.json",
     "scalars.json",
+    "survivorship.json",
 )
 _HAS_MPL = importlib.util.find_spec("matplotlib") is not None
 
@@ -55,6 +56,33 @@ def _synthetic_artifact(tmp: Path) -> Path:
         )
     )
     (art / "by_year.json").write_text(json.dumps({"2005": 0.05, "2006": -0.02}))
+    (art / "survivorship.json").write_text(
+        json.dumps(
+            {
+                "pit_date": "2010-01-04",
+                "as_of_date": "2025-01-03",
+                "years": 15.0,
+                "pit_curve": {
+                    "dt": ["2010-01-04", "2017-06-30", "2025-01-03"],
+                    "nav": [1.0, 1.1, 1.25],
+                },
+                "current_curve": {
+                    "dt": ["2010-01-04", "2017-06-30", "2025-01-03"],
+                    "nav": [1.0, 1.5, 2.0],
+                },
+                "pit_cohort_mean_terminal_tr": 1.25,
+                "current_cohort_mean_terminal_tr": 2.0,
+                "pit_cohort_median_terminal_tr": 1.25,
+                "current_cohort_median_terminal_tr": 2.0,
+                "pit_cohort_cagr": 0.015,
+                "current_cohort_cagr": 0.047,
+                "cagr_delta_bps": 320.0,
+                "pit_count": 2,
+                "current_count": 2,
+                "survivor_count": 1,
+            }
+        )
+    )
     (art / "scalars.json").write_text(
         json.dumps(
             {
@@ -109,6 +137,28 @@ def test_validate_rejects_non_contiguous_years(tmp_path: Path) -> None:
         validate_artifact(load_artifact(art))
 
 
+def test_validate_rejects_survivorship_terminal_mismatch(tmp_path: Path) -> None:
+    """The figure-headline reconciliation invariant: a cohort curve whose
+    terminal NAV does not equal the cohort mean terminal TR is rejected."""
+    art = _synthetic_artifact(tmp_path)
+    bad = json.loads((art / "survivorship.json").read_text())
+    bad["pit_curve"]["nav"][-1] = 1.40  # != pit_cohort_mean_terminal_tr (1.25)
+    (art / "survivorship.json").write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match="terminal NAV"):
+        validate_artifact(load_artifact(art))
+
+
+def test_validate_rejects_survivorship_nav_not_starting_at_one(
+    tmp_path: Path,
+) -> None:
+    art = _synthetic_artifact(tmp_path)
+    bad = json.loads((art / "survivorship.json").read_text())
+    bad["current_curve"]["nav"][0] = 0.9
+    (art / "survivorship.json").write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match="start at 1.0"):
+        validate_artifact(load_artifact(art))
+
+
 def test_load_missing_artifact_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_artifact(tmp_path / "does-not-exist")
@@ -134,7 +184,8 @@ def test_render_all_produces_pngs(tmp_path: Path) -> None:
     art = _synthetic_artifact(tmp_path)
     out = tmp_path / "figs"
     written = render_all(load_artifact(art), out)
-    assert len(written) == 3
+    assert len(written) == 4
     for path in written:
         assert path.is_file() and path.stat().st_size > 0
+    assert (out / "survivorship_two_panel.png").is_file()
     assert (out / "PROVENANCE.md").is_file()

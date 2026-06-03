@@ -20,6 +20,7 @@ from pit_backtest.data.adjustments import (
     annualized_return,
     reconstruct_total_return,
     split_adjusted_prices_and_dividends,
+    to_as_traded_dividends,
 )
 
 
@@ -27,6 +28,117 @@ def _prices(dts: list[date], closes: list[float]) -> pl.DataFrame:
     return pl.DataFrame({"dt": dts, "closeunadj": closes}).with_columns(
         pl.col("dt").cast(pl.Date), pl.col("closeunadj").cast(pl.Float64)
     )
+
+
+def _div_rows(
+    rows: list[tuple[str, date, float]],
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "ticker": [r[0] for r in rows],
+            "ex_date": [r[1] for r in rows],
+            "value": [r[2] for r in rows],
+        },
+        schema={"ticker": pl.String, "ex_date": pl.Date, "value": pl.Float64},
+    )
+
+
+def _split_rows(
+    rows: list[tuple[str, date, float]],
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "ticker": [r[0] for r in rows],
+            "split_date": [r[1] for r in rows],
+            "ratio": [r[2] for r in rows],
+        },
+        schema={"ticker": pl.String, "split_date": pl.Date, "ratio": pl.Float64},
+    )
+
+
+def _as_traded_by_ex(df: pl.DataFrame) -> dict[date, float]:
+    return dict(zip(df["ex_date"].to_list(), df["value"].to_list()))
+
+
+def test_to_as_traded_no_splits_is_noop() -> None:
+    """A ticker with no split-like actions returns its dividends unchanged."""
+    divs = _div_rows([("AAA", _D[0], 0.5), ("AAA", _D[2], 0.6)])
+    splits = _split_rows([])
+    out = to_as_traded_dividends(divs, splits)
+    assert _as_traded_by_ex(out) == {_D[0]: 0.5, _D[2]: 0.6}
+
+
+def test_to_as_traded_reverse_split_decodes_back_adjusted_value() -> None:
+    """A dividend BEFORE a 1-for-200 reverse split (ratio 0.005) is stored
+    back-adjusted (as-traded / 0.005); the decode multiplies it back. This is
+    the Chesapeake case: 17.50 stored decodes to the real 0.0875 paid."""
+    divs = _div_rows([("CHK", _D[0], 17.50)])
+    splits = _split_rows([("CHK", _D[2], 0.005)])
+    out = to_as_traded_dividends(divs, splits)
+    assert out["value"].to_list() == [pytest.approx(0.0875, abs=1e-12)]
+
+
+def test_to_as_traded_forward_split_decodes() -> None:
+    """A dividend BEFORE a 2-for-1 forward split (ratio 2.0) is stored at half
+    the as-traded amount; the decode doubles it back."""
+    divs = _div_rows([("FWD", _D[0], 0.25)])
+    splits = _split_rows([("FWD", _D[2], 2.0)])
+    out = to_as_traded_dividends(divs, splits)
+    assert out["value"].to_list() == [pytest.approx(0.50, abs=1e-12)]
+
+
+def test_to_as_traded_multiple_later_splits_take_the_product() -> None:
+    """A dividend ahead of two later splits is decoded by their product (the
+    Signet 2008 split 0.5 x adrratiosplit 0.1 = 0.05 net 1-for-20 shape)."""
+    divs = _div_rows([("SIG", _D[0], 1.0)])
+    splits = _split_rows([("SIG", _D[2], 0.5), ("SIG", _D[3], 0.1)])
+    out = to_as_traded_dividends(divs, splits)
+    assert out["value"].to_list() == [pytest.approx(0.05, abs=1e-12)]
+
+
+def test_to_as_traded_same_day_split_is_excluded_strict_gt() -> None:
+    """A dividend on the SAME date as a split is NOT co-adjusted by it (strict
+    `>`), mirroring the price-side `dt < ex_date` convention so the decode and
+    the split adjustment compose. Only the strictly-later split applies."""
+    divs = _div_rows([("AAA", _D[1], 2.0)])
+    splits = _split_rows([("AAA", _D[1], 0.5), ("AAA", _D[3], 0.1)])
+    out = to_as_traded_dividends(divs, splits)
+    # same-day 0.5 excluded; only the later 0.1 applies: 2.0 * 0.1 = 0.2.
+    assert out["value"].to_list() == [pytest.approx(0.2, abs=1e-12)]
+
+
+def test_to_as_traded_only_later_splits_apply() -> None:
+    """A split BEFORE the dividend (already reflected in the stored value)
+    does not re-scale it; only strictly-later splits do."""
+    divs = _div_rows([("AAA", _D[2], 1.0)])
+    splits = _split_rows([("AAA", _D[0], 0.1), ("AAA", _D[3], 0.5)])
+    out = to_as_traded_dividends(divs, splits)
+    # the _D[0] split is before the dividend -> ignored; only _D[3] (0.5).
+    assert out["value"].to_list() == [pytest.approx(0.5, abs=1e-12)]
+
+
+def test_to_as_traded_multi_ticker_isolated() -> None:
+    """Splits only decode dividends of the SAME ticker."""
+    divs = _div_rows([("AAA", _D[0], 1.0), ("BBB", _D[0], 1.0)])
+    splits = _split_rows([("AAA", _D[2], 0.5)])
+    out = to_as_traded_dividends(divs, splits).sort("ticker")
+    by_ticker = dict(zip(out["ticker"].to_list(), out["value"].to_list()))
+    assert by_ticker["AAA"] == pytest.approx(0.5, abs=1e-12)
+    assert by_ticker["BBB"] == pytest.approx(1.0, abs=1e-12)
+
+
+def test_to_as_traded_empty_dividends_returns_empty() -> None:
+    out = to_as_traded_dividends(_div_rows([]), _split_rows([]))
+    assert out.height == 0
+    assert out.columns == ["ticker", "ex_date", "value"]
+
+
+def test_to_as_traded_missing_columns_raises() -> None:
+    bad = pl.DataFrame({"ticker": ["AAA"], "ex_date": [_D[0]]}).with_columns(
+        pl.col("ex_date").cast(pl.Date)
+    )
+    with pytest.raises(KeyError, match="dividends frame missing"):
+        to_as_traded_dividends(bad, _split_rows([]))
 
 
 _D = [date(2020, 1, d) for d in (6, 7, 8, 9)]

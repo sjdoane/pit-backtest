@@ -361,14 +361,57 @@ def test_read_sep_prices_filters_by_date_range(tmp_path: Path) -> None:
 
 
 def test_read_actions_dividends_filters_to_dividend_rows(tmp_path: Path) -> None:
-    """Splits and other non-dividend actions are filtered out."""
+    """Splits and other non-dividend actions are filtered out; the surviving
+    dividend amounts are decoded to the as-traded basis (ADR 0018)."""
     snapshots_root = _write_synthetic_bundle(tmp_path)
     adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
 
     spy_divs = adapter.read_actions_dividends(ticker="SPY")
     assert spy_divs.height == 2  # 2 dividends; the split row is excluded
     assert spy_divs["ex_date"].to_list() == [date(2023, 12, 15), date(2024, 3, 15)]
+    # The 2023-12-15 dividend (stored 1.5800) precedes the 2024-03-15 2-for-1
+    # split, so its as-traded amount is decoded 1.5800 * 2.0 = 3.16 (ADR 0018).
+    assert spy_divs["amount_per_share"][0] == pytest.approx(3.16)
+    # The 2024-03-15 dividend shares the split ex-date, so the same-day split is
+    # NOT applied (strict >); the as-traded amount stays 1.7715.
     assert spy_divs["amount_per_share"][1] == pytest.approx(1.7715)
+
+
+def test_read_actions_dividends_no_split_name_is_unchanged(tmp_path: Path) -> None:
+    """A dividend on a name with no split-like actions is returned unchanged
+    (the as-traded decode is a strict no-op). This is the byte-identical
+    property the M1 SPY/AGG/GLD reconciliation relies on: AGG never splits."""
+    snapshots_root = _write_synthetic_bundle(tmp_path)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    agg_divs = adapter.read_actions_dividends(ticker="AGG")
+    assert agg_divs.height == 1
+    assert agg_divs["amount_per_share"][0] == pytest.approx(0.2800)
+
+
+def test_actions_with_as_traded_dividends_decodes_only_dividend_rows(
+    tmp_path: Path,
+) -> None:
+    """The PitView actions accessor (ADR 0018) decodes `dividend` values to the
+    as-traded basis while leaving split / spinoff rows unchanged, so the
+    momentum signal scores on contemporaneous dividends but still reads raw
+    split ratios."""
+    snapshots_root = _write_synthetic_bundle(tmp_path)
+    adapter = SharadarDataSource("sharadar_2026-05-28", snapshots_root)
+
+    view = (
+        adapter.actions_with_as_traded_dividends()
+        .filter(pl.col("ticker") == "SPY")
+        .collect()
+    )
+    by_key = {
+        (r["date"], r["action"]): r["value"] for r in view.iter_rows(named=True)
+    }
+    # dividend before the split -> decoded; same-day dividend -> unchanged.
+    assert by_key[(date(2023, 12, 15), "dividend")] == pytest.approx(3.16)
+    assert by_key[(date(2024, 3, 15), "dividend")] == pytest.approx(1.7715)
+    # the split row keeps its raw ratio (the signal reads it as the split ratio).
+    assert by_key[(date(2024, 3, 15), "split")] == pytest.approx(2.0)
 
 
 def test_read_actions_dividends_date_range_filter(tmp_path: Path) -> None:

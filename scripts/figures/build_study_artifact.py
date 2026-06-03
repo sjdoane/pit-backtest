@@ -8,15 +8,15 @@ render every README figure in seconds WITHOUT the gitignored bundle and WITHOUT
 re-running the study. Parquet is NOT used because `.gitignore` excludes
 `*.parquet`; the JSON payloads are small (a few hundred KB) and diffable in review.
 
-The figures are sourced from a SINGLE contiguous zero-cost backtest (the same
-level/Sharpe reference the 3b report leads with) plus the monthly block bootstrap.
-The CPCV degeneracy and the cost surfaces are report tables (PR 3b/3c), not
-figures, so this build deliberately skips run_cpcv and the eta sweep to stay
+The momentum figures are sourced from a SINGLE contiguous zero-cost backtest (the
+same level/Sharpe reference the 3b report leads with) plus the monthly block
+bootstrap. The CPCV degeneracy and the cost surfaces are report tables (PR 3b/3c),
+not figures, so this build deliberately skips run_cpcv and the eta sweep to stay
 tractable; the cost band at SPY-uniform liquidity is sub-bp (visually degenerate)
 and is reported as a table, not plotted. The survivorship two-panel (ADR 0002
-line 96) is deferred: the survivorship study's total-return reconstruction does
-not split-adjust, so reverse-split jumps in delisted names inflate its cohort CAGR
-on the current bundle; the figure waits on that data-layer fix.
+line 96) is built here too (`build_survivorship_artifact` -> survivorship.json):
+the two equal-weight cohort NAV curves now read sane once the dividend basis is
+corrected (as-traded decode, ADR 0018), so the deferral is closed.
 
 Run (clean venv, from the repo root):
   python scripts/figures/build_study_artifact.py
@@ -55,6 +55,9 @@ from examples.sp500_momentum_study import (  # noqa: E402
     choose_block_length,
     momentum_rebalance_dates,
 )
+from examples.sp500_survivorship import (  # noqa: E402
+    build_survivorship_figure_data,
+)
 
 from pit_backtest.analytics.bootstrap import stationary_block_bootstrap  # noqa: E402
 from pit_backtest.analytics.result_adapter import to_backtest_result  # noqa: E402
@@ -70,6 +73,7 @@ _DATA_FILES = (
     "bootstrap_fan.json",
     "by_year.json",
     "scalars.json",
+    "survivorship.json",
 )
 
 _log = logging.getLogger("build_study_artifact")
@@ -205,6 +209,52 @@ def build_momentum_artifact(
     }
 
 
+def build_survivorship_artifact(
+    source: SharadarDataSource, pit_date: date, as_of_date: date
+) -> dict[str, object]:
+    """Run the survivorship study + cohort curves on the real bundle (ADR 0018).
+
+    Returns the survivorship.json payload: the two equal-weight cohort NAV
+    curves (PIT-pit_date vs current, over a shared month-end grid) plus the
+    headline scalars (counts, mean / median terminal TR, CAGRs, delta) for the
+    figure caption. Each curve's terminal equals its cohort mean terminal TR by
+    construction (regenerate.py's validator asserts this), so the figure
+    reconciles to the headline CAGR delta.
+    """
+    _log.info(
+        "survivorship_build_begin pit=%s as_of=%s", pit_date, as_of_date
+    )
+    report, pit_curve, current_curve = build_survivorship_figure_data(
+        source, pit_date, as_of_date
+    )
+
+    def _curve(df: pl.DataFrame) -> dict[str, object]:
+        return {
+            "dt": [d.isoformat() for d in df["dt"].to_list()],
+            "nav": [float(v) for v in df["nav"].to_list()],
+        }
+
+    return {
+        "pit_date": pit_date.isoformat(),
+        "as_of_date": as_of_date.isoformat(),
+        "years": report.years,
+        "pit_curve": _curve(pit_curve),
+        "current_curve": _curve(current_curve),
+        "pit_cohort_mean_terminal_tr": report.pit_cohort_mean_terminal_tr,
+        "current_cohort_mean_terminal_tr": report.current_cohort_mean_terminal_tr,
+        "pit_cohort_median_terminal_tr": report.pit_cohort_median_terminal_tr,
+        "current_cohort_median_terminal_tr": (
+            report.current_cohort_median_terminal_tr
+        ),
+        "pit_cohort_cagr": report.pit_cohort_cagr,
+        "current_cohort_cagr": report.current_cohort_cagr,
+        "cagr_delta_bps": report.cagr_delta_bps,
+        "pit_count": report.pit_count,
+        "current_count": report.current_count,
+        "survivor_count": report.survivor_count,
+    }
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -231,6 +281,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bundle-prefix", default="sharadar")
     parser.add_argument("--snapshots-root", type=Path, default=_REPO_ROOT / "data" / "snapshots")
     parser.add_argument("--output-dir", type=Path, default=_DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--survivorship-pit-date", type=date.fromisoformat, default=date(2010, 1, 4),
+        help="PIT cohort anchor for the survivorship two-panel; as_of = bundle pull date",
+    )
     parser.add_argument(
         "--built-at", default=None,
         help="ISO timestamp for meta provenance; default = now (UTC)",
@@ -272,12 +326,18 @@ def main(argv: list[str] | None = None) -> int:
         recipe, n_bootstrap=args.n_bootstrap, seed=args.seed
     )
 
+    survivorship_as_of = source.bundle_entry.pull_date
+    survivorship = build_survivorship_artifact(
+        source, args.survivorship_pit_date, survivorship_as_of
+    )
+
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "momentum_equity.json", momentum["momentum_equity"])
     _write_json(output_dir / "bootstrap_fan.json", momentum["bootstrap_fan"])
     _write_json(output_dir / "by_year.json", momentum["by_year"])
     _write_json(output_dir / "scalars.json", momentum["momentum_scalars"])
+    _write_json(output_dir / "survivorship.json", survivorship)
 
     built_at = args.built_at or datetime.utcnow().isoformat(timespec="seconds") + "Z"
     content_hash = _content_hash(output_dir)
@@ -293,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         "block_length": scalars["block_length"],
         "window_start": recipe.start_dt.isoformat(),
         "window_end": recipe.end_dt.isoformat(),
+        "survivorship_pit_date": args.survivorship_pit_date.isoformat(),
+        "survivorship_as_of_date": survivorship_as_of.isoformat(),
         "python_version": sys.version.split()[0],
         "polars_version": pl.__version__,
         "numpy_version": np.__version__,

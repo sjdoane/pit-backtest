@@ -37,6 +37,7 @@ _DATA_FILES = (
     "bootstrap_fan.json",
     "by_year.json",
     "scalars.json",
+    "survivorship.json",
 )
 _FAN_BANDS = ("p5", "p25", "p50", "p75", "p95")
 
@@ -107,6 +108,44 @@ def validate_artifact(payloads: dict[str, object]) -> None:
     for key in ("sharpe_per_period", "psr", "block_length", "n_rebalances"):
         if key not in scalars:
             raise ValueError(f"scalars missing required key {key!r}")
+
+    _validate_survivorship(payloads["survivorship"])
+
+
+def _validate_survivorship(survivorship: object) -> None:
+    """Assert the survivorship two-panel invariants (matplotlib-free).
+
+    The load-bearing check is the figure-headline reconciliation: each cohort
+    NAV curve starts at 1.0 and its terminal equals the cohort mean terminal TR,
+    so the two panels reconcile to the headline CAGR delta. Also pins equal
+    dt/nav lengths and strictly positive, ascending-date curves.
+    """
+    assert isinstance(survivorship, dict)
+    for side, mean_key in (
+        ("pit_curve", "pit_cohort_mean_terminal_tr"),
+        ("current_curve", "current_cohort_mean_terminal_tr"),
+    ):
+        curve = survivorship[side]
+        assert isinstance(curve, dict)
+        dts = curve["dt"]
+        navs = curve["nav"]
+        assert isinstance(dts, list) and isinstance(navs, list)
+        if len(dts) != len(navs):
+            raise ValueError(f"{side}: dt/nav length mismatch")
+        if not navs:
+            raise ValueError(f"{side}: empty curve")
+        if any(float(v) <= 0.0 for v in navs):
+            raise ValueError(f"{side}: non-positive NAV")
+        if dts != sorted(dts):
+            raise ValueError(f"{side}: dates not ascending")
+        if abs(float(navs[0]) - 1.0) > 1e-6:
+            raise ValueError(f"{side}: NAV does not start at 1.0 ({navs[0]})")
+        mean_terminal = float(survivorship[mean_key])
+        if abs(float(navs[-1]) - mean_terminal) > 1e-6:
+            raise ValueError(
+                f"{side}: terminal NAV {navs[-1]} != cohort mean terminal TR "
+                f"{mean_terminal} (the figure-headline reconciliation invariant)"
+            )
 
 
 def _opt_float(value: Any) -> float | None:
@@ -218,6 +257,41 @@ def render_all(payloads: dict[str, object], output_dir: Path) -> list[Path]:
     ax.grid(True, axis="y", alpha=0.25)
     fig.tight_layout()
     written.append(_save(fig, plt, output_dir / "by_year.png"))
+
+    # 4. Survivorship two-panel: PIT-cohort vs current-cohort equal-weight
+    #    buy-and-hold NAV (ADR 0002 line 96; ADR 0018 unblocked the figure).
+    surv = payloads["survivorship"]
+    assert isinstance(surv, dict)
+    pit_curve = surv["pit_curve"]
+    cur_curve = surv["current_curve"]
+    assert isinstance(pit_curve, dict) and isinstance(cur_curve, dict)
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+    axl.plot(
+        _dates(pit_curve["dt"]), _floats(pit_curve, "nav"), color="#1f5fa8", lw=1.3
+    )
+    axl.set_yscale("log")
+    axl.set_title(f"PIT {surv.get('pit_date')} cohort (n={surv.get('pit_count')})")
+    axl.set_xlabel("Date")
+    axl.set_ylabel("Equal-weight NAV (growth of $1, log scale)")
+    axl.grid(True, which="both", alpha=0.25)
+    axr.plot(
+        _dates(cur_curve["dt"]), _floats(cur_curve, "nav"), color="#c0392b", lw=1.3
+    )
+    axr.set_yscale("log")
+    axr.set_title(
+        f"Current {surv.get('as_of_date')} cohort (n={surv.get('current_count')})"
+    )
+    axr.set_xlabel("Date")
+    axr.grid(True, which="both", alpha=0.25)
+    fig.suptitle(
+        "S&P 500 survivorship: equal-weight buy-and-hold cohort NAV  "
+        f"(CAGR delta = {float(surv['cagr_delta_bps']):+.0f} bps; median terminal "
+        f"TR {float(surv['pit_cohort_median_terminal_tr']):.1f}x vs "
+        f"{float(surv['current_cohort_median_terminal_tr']):.1f}x)",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    written.append(_save(fig, plt, output_dir / "survivorship_two_panel.png"))
 
     _write_provenance(payloads, output_dir)
     return written
