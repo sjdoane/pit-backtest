@@ -92,11 +92,22 @@ def _phi(z: float) -> float:
     """Standard normal CDF via `math.erf`.
 
     `Phi(z) = 0.5 * (1 + erf(z / sqrt(2)))`. `math.erf` is stdlib since
-    Python 3.2 and accurate to ~1e-15 absolute. For `z > 8.3` the
-    function saturates at exactly 1.0; for `z < -8.3` it saturates at
+    Python 3.2 and accurate to ~1e-15 absolute. For `z >= 8.3` the
+    function saturates at exactly 1.0; for `z <= -8.3` it saturates at
     exactly 0.0. Both regimes are well outside the operating range of
     PSR/DSR (which expects `|z|` of single digits).
+
+    The saturation is enforced by an explicit clamp rather than left to the
+    C library's `erf` rounding: at `z = -8.3` the true tail is ~5.6e-17,
+    below float resolution, and some platforms' `erf` returns that tiny
+    positive value instead of 0.0 (CPython on Linux does; on Windows it
+    rounds to 0.0). The clamp makes the saturation exact and identical
+    across platforms, consistent with the determinism invariant.
     """
+    if z >= 8.3:
+        return 1.0
+    if z <= -8.3:
+        return 0.0
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 

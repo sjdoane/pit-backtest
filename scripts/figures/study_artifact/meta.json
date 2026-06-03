@@ -3,7 +3,7 @@
   "built_at": "2026-06-03T00:00:00Z",
   "bundle_name": "sharadar_2026-05-31",
   "bundle_pull_date": "2026-05-31",
-  "content_hash": "611d50399384a1145db26ff6c0e542cdb1a8bbe4db80d50ab120bf0d92c3b12d",
+  "content_hash": "20b1f27f1700355eac8bcdcbe874046be206d0faeb682da0e42fb9f5fd721bcc",
   "git_sha": "8a15bf8",
   "n_bootstrap": 1000,
   "numpy_version": "1.26.4",

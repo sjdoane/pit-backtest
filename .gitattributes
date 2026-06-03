@@ -1,0 +1,9 @@
+# Force LF in the working tree for the committed study-figure artifact so its
+# content hash is byte-stable across platforms. The figure test
+# (tests/figures/test_figures.py) hashes the raw JSON bytes; without this, git's
+# autocrlf checks the files out as CRLF on Windows and LF on Linux, so the hash
+# only matched on the build platform. build_study_artifact._content_hash and the
+# test also normalize CRLF -> LF before hashing (the primary, platform-agnostic
+# defense); this attribute is belt-and-suspenders so the on-disk bytes match the
+# committed (LF) bytes everywhere.
+scripts/figures/study_artifact/*.json text eol=lf

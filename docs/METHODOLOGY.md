@@ -94,9 +94,9 @@ cash-crediting, and the survivorship buy-and-hold all read only `dividend` and
 split-like actions, so a spin-off is dropped entirely and the parent's ex-date
 price drop is read as a loss, a strictly larger negative bias than the
 cash-equivalent treatment ADR 0002 decision 14 anticipated. The literature, the
-verified treatment, and an honest real-data quantification (per-name large, e.g.
-GE understated about 40 percent; aggregate small, the survivorship delta would
-shrink about 9 bps) are in
+verified treatment, and an honest real-data quantification (per-name material,
+e.g. GE understated about 15 percent; aggregate small, the survivorship delta
+would shrink about 5 bps) are in
 [`0003-spinoff-bias.md`](research/0003-spinoff-bias.md).
 
 - **Research**: [`methodology-point-in-time.md`](research/sources/methodology-point-in-time.md), [`0003-spinoff-bias.md`](research/0003-spinoff-bias.md)

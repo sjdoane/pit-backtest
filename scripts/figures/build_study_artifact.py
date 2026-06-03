@@ -263,16 +263,28 @@ def build_survivorship_artifact(
 
 
 def _write_json(path: Path, payload: object) -> None:
+    # newline="\n" forces LF on every platform; without it write_text uses the
+    # OS line separator (CRLF on Windows), which makes the committed artifact's
+    # byte content (and its content hash) platform-dependent.
     path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
 
 
 def _content_hash(output_dir: Path) -> str:
-    """SHA256 over the sorted data files (excluding meta.json) for provenance."""
+    """SHA256 over the sorted data files (excluding meta.json) for provenance.
+
+    Line endings are normalized to LF before hashing so the hash is stable
+    across platforms: git may check the JSON out as CRLF on Windows and LF on
+    Linux, and the committed-artifact test (`tests/figures/test_figures.py`)
+    recomputes this hash in CI. Without the normalization the hash would only
+    match on the platform that built the artifact.
+    """
     digest = hashlib.sha256()
     for name in _DATA_FILES:
-        digest.update((output_dir / name).read_bytes())
+        digest.update((output_dir / name).read_bytes().replace(b"\r\n", b"\n"))
     return digest.hexdigest()
 
 
