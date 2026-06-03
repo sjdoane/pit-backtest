@@ -1,12 +1,55 @@
-"""Tests for analytics.bootstrap.stationary_block_bootstrap (ADR 0016 dec 5)."""
+"""Tests for analytics.bootstrap (ADR 0016 dec 5): the stationary block
+bootstrap and the Politis-White automatic block-length selector."""
 
 from __future__ import annotations
 
+import math
 import random
 
+import numpy as np
 import pytest
 
-from pit_backtest.analytics.bootstrap import stationary_block_bootstrap
+from pit_backtest.analytics.bootstrap import (
+    politis_white_block_length,
+    stationary_block_bootstrap,
+)
+
+
+def _arch_reference_block_length(x: list[float]) -> float:
+    """numpy transcription of the canonical arch `_single_optimal_block`
+    (stationary branch), used ONLY as a port-fidelity oracle for the pure-Python
+    `politis_white_block_length`. This transcribes the same source, so it checks
+    the pure-Python translation (indexing, loop bounds), NOT the algorithm's
+    independent correctness (the limiting-behavior tests below do that)."""
+    arr = np.asarray(x, dtype=float)
+    nobs = arr.shape[0]
+    if nobs < 11:
+        return 1.0
+    eps = arr - arr.mean()
+    b_max = math.ceil(min(3 * math.sqrt(nobs), nobs / 3))
+    kn = max(5, int(math.log10(nobs)))
+    m_max = int(math.ceil(math.sqrt(nobs))) + kn
+    cv = 2 * math.sqrt(math.log10(nobs) / nobs)
+    acv = np.zeros(m_max + 1)
+    abs_acorr = np.zeros(m_max + 1)
+    opt_m: int | None = None
+    for i in range(m_max + 1):
+        v1 = eps[i + 1 :] @ eps[i + 1 :]
+        v2 = eps[: -(i + 1)] @ eps[: -(i + 1)]
+        cross = eps[i:] @ eps[: nobs - i]
+        acv[i] = cross / nobs
+        abs_acorr[i] = abs(cross) / math.sqrt(v1 * v2) if v1 * v2 > 0 else math.inf
+        if i >= kn and opt_m is None and np.all(abs_acorr[i - kn : i] < cv):
+            opt_m = i - kn
+    m = min(2 * max(opt_m, 1) if opt_m is not None else m_max, m_max)
+    g = 0.0
+    lr_acv = acv[0]
+    for k in range(1, m + 1):
+        lam = 1.0 if k / m <= 0.5 else 2 * (1 - k / m)
+        g += 2 * lam * k * acv[k]
+        lr_acv += 2 * lam * acv[k]
+    b_sb = ((2 * g**2) / (2 * lr_acv**2)) ** (1 / 3) * nobs ** (1 / 3)
+    return float(min(b_sb, b_max))
 
 
 def _lag1_autocorr(series: list[float]) -> float:
@@ -126,3 +169,86 @@ def test_bool_seed_raises() -> None:
         stationary_block_bootstrap(
             _RETURNS, 3, expected_block_length=2.0, seed=True  # type: ignore[arg-type]
         )
+
+
+# ----- Politis-White automatic block-length selector -----
+
+
+def _wn(n: int, seed: int) -> list[float]:
+    rng = random.Random(seed)
+    return [rng.gauss(0.0, 1.0) for _ in range(n)]
+
+
+def test_politis_white_matches_arch_reference_port_fidelity() -> None:
+    """The pure-Python port equals the numpy transcription of arch's canonical
+    `_single_optimal_block` to floating-point precision across diverse series.
+    This is the port-fidelity oracle (it catches indexing / loop-bound / constant
+    translation errors), not an independent-correctness check."""
+    cases = [
+        _wn(240, 1),
+        _wn(50, 7),
+        _ar1_series(300, 0.9, 3),
+        _ar1_series(200, 0.5, 11),
+        _ar1_series(500, 0.99, 13),
+        [0.1 * math.sin(t) for t in range(120)],
+    ]
+    for series in cases:
+        assert politis_white_block_length(series) == pytest.approx(
+            _arch_reference_block_length(series), abs=1e-9
+        )
+
+
+def test_politis_white_monotone_in_dependence() -> None:
+    """The selected block length increases with serial dependence: white noise <
+    AR(0.5) < AR(0.9) < near-unit-root. An independent qualitative check of the
+    algorithm (robust to the exact transcription)."""
+    wn = politis_white_block_length(_wn(400, 5))
+    ar5 = politis_white_block_length(_ar1_series(400, 0.5, 5))
+    ar9 = politis_white_block_length(_ar1_series(400, 0.9, 5))
+    ar99 = politis_white_block_length(_ar1_series(400, 0.99, 5))
+    assert wn < ar5 < ar9 < ar99
+
+
+def test_politis_white_strong_ar_is_large() -> None:
+    """A strongly autocorrelated AR(0.9) series yields a large block length
+    (tens of periods), the textbook Politis-White behavior."""
+    assert politis_white_block_length(_ar1_series(300, 0.9, 3)) > 12.0
+
+
+def test_politis_white_caps_at_b_max() -> None:
+    """A near-unit-root series would push b past the b_max = ceil(min(3*sqrt(n),
+    n/3)) cap; the result is clamped to it."""
+    n = 500
+    b_max = math.ceil(min(3 * math.sqrt(n), n / 3))
+    b = politis_white_block_length(_ar1_series(n, 0.995, 21))
+    assert b <= b_max
+    assert b > 20.0  # still large (the dependence is strong)
+
+
+def test_politis_white_near_iid_below_one() -> None:
+    """White noise is judged near-iid: the raw optimum falls below the minimal
+    serial-dependence block of 2.0 (often below 1.0), which is why the study
+    floors it. This is the honest behavior on the real momentum series."""
+    assert politis_white_block_length(_wn(500, 17)) < 2.0
+
+
+def test_politis_white_short_series_returns_one() -> None:
+    """A series too short to estimate the spectrum (n < 11, where m_max would
+    reach n-1 and the lag-window partial sums go empty) returns 1.0."""
+    assert politis_white_block_length([0.1, -0.2, 0.05, 0.0, -0.1]) == 1.0
+    assert politis_white_block_length(_RETURNS) == 1.0  # the length-10 fixture
+    assert politis_white_block_length(_wn(11, 0)) != 1.0  # 11 is computable
+
+
+def test_politis_white_pinned_value() -> None:
+    """A fixed deterministic AR(0.6) series of length 100 (well below its b_max
+    of 30, so the full flat-top arithmetic is exercised, not the cap) pins the
+    exact result as a regression guard against silent drift."""
+    series = _ar1_series(100, 0.6, 0)
+    assert politis_white_block_length(series) == pytest.approx(3.8484, abs=1e-3)
+
+
+def test_politis_white_deterministic() -> None:
+    """Pure arithmetic, no RNG: identical input gives identical output."""
+    series = _ar1_series(120, 0.7, 9)
+    assert politis_white_block_length(series) == politis_white_block_length(series)

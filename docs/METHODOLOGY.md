@@ -57,12 +57,15 @@ model-fit variance. A deterministic single factor like momentum has no fitted
 parameter, so its CPCV paths COINCIDE: the study runs CPCV and reports that
 degeneracy honestly rather than dressing a single line up as a distribution. The
 genuine path-uncertainty surface is a Politis-Romano stationary block bootstrap
-of the monthly return series, with the block length chosen from the measured
-autocorrelation.
+of the monthly return series, with the block length set by the Politis-White
+(2004) automatic data-driven selector. On the real series PW judges the monthly
+returns near-iid (b_opt 0.46), correctly overriding the isolated lag the naive
+ACF rule would treat as significant; the study reports that raw value and applies
+a conservative minimal block floor.
 
 - **Research**: [`methodology-afml-backtesting.md`](research/sources/methodology-afml-backtesting.md), [`methodology-backtest-overfitting.md`](research/sources/methodology-backtest-overfitting.md)
 - **Decision**: ADR [0001](decisions/0001-spec-critique.md) (CPCV primary), ADR [0016](decisions/0016-cpcv-deterministic-factor-and-block-bootstrap-uncertainty.md) (the degeneracy finding + the block bootstrap as the headline path surface)
-- **Implementation**: `validation/cv.py::CPCVSplitter`; `engine/runner.py::Runner.run_cpcv`; `analytics/bootstrap.py::stationary_block_bootstrap`
+- **Implementation**: `validation/cv.py::CPCVSplitter`; `engine/runner.py::Runner.run_cpcv`; `analytics/bootstrap.py::stationary_block_bootstrap` + `politis_white_block_length` (the automatic block-length selector)
 - **Figure**: [`docs/figures/bootstrap_fan.png`](figures/bootstrap_fan.png) (the equity projection of the bootstrap; the report quotes its Sharpe projection)
 
 ### 4. Deflated performance (PSR / DSR / MinTRL)
@@ -128,6 +131,6 @@ survives scrutiny, including the inconvenient ones.
 
 ## Out of scope (v1.1)
 
-Differential testing against `zipline-reloaded` (ADR 0002 line 380) and
-Politis-White automatic block-length selection (ADR 0016 decision 5) are
-deferred.
+Differential testing against `zipline-reloaded` (ADR 0002 line 380) is deferred.
+Politis-White automatic block-length selection (ADR 0016 decision 5) is now
+implemented (`analytics/bootstrap.py::politis_white_block_length`).

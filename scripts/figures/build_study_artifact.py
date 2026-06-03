@@ -52,14 +52,16 @@ from examples.sp500_momentum_study import (  # noqa: E402
     _pnl_concentration_hhi,
     _sharpe,
     build_ever_member_union,
-    choose_block_length,
     momentum_rebalance_dates,
 )
 from examples.sp500_survivorship import (  # noqa: E402
     build_survivorship_figure_data,
 )
 
-from pit_backtest.analytics.bootstrap import stationary_block_bootstrap  # noqa: E402
+from pit_backtest.analytics.bootstrap import (  # noqa: E402
+    politis_white_block_length,
+    stationary_block_bootstrap,
+)
 from pit_backtest.analytics.result_adapter import to_backtest_result  # noqa: E402
 from pit_backtest.data.sources.sharadar import SharadarDataSource  # noqa: E402
 from pit_backtest.data.universe import SharadarSP500Universe  # noqa: E402
@@ -171,7 +173,11 @@ def build_momentum_artifact(
         )
 
     monthly = _monthly_returns_from_curve(curve, recipe.rebalance_dates)
-    block_length, _acf = choose_block_length(monthly)
+    # Politis-White automatic block length (the raw optimum, reported as a
+    # diagnostic); the bootstrap applies a conservative minimal floor of 2.0
+    # since PW judges the monthly series near-iid (ADR 0016 dec 5 v1.1).
+    pw_block_length = politis_white_block_length(monthly)
+    block_length = max(2.0, pw_block_length)
     fan = _equity_fan(
         monthly,
         recipe.rebalance_dates,
@@ -190,6 +196,7 @@ def build_momentum_artifact(
         "dsr": result.dsr,  # may be None
         "realized_monthly_sharpe": _sharpe(monthly),
         "block_length": block_length,
+        "pw_block_length": pw_block_length,
         "n_rebalances": contig.n_rebalances,
         "n_monthly_returns": len(monthly),
         "union_size": len(recipe.union_tickers),
