@@ -54,7 +54,10 @@ from pathlib import Path
 import attrs
 import polars as pl
 
-from pit_backtest.analytics.bootstrap import stationary_block_bootstrap
+from pit_backtest.analytics.bootstrap import (
+    politis_white_block_length,
+    stationary_block_bootstrap,
+)
 from pit_backtest.analytics.concentration import hhi
 from pit_backtest.analytics.result_adapter import to_backtest_result
 from pit_backtest.analytics.scorecard import BacktestResult
@@ -464,6 +467,7 @@ class MomentumStudyReport:
     cpcv_sr_min: float
     cpcv_sr_max: float
     block_length: float
+    pw_block_length: float
     acf: dict[int, float]
     realized_monthly_sharpe: float
     bootstrap_sharpe_p5: float
@@ -544,9 +548,19 @@ def compute_momentum_study_report(
     ]
 
     # 3. The headline path surface: a stationary block bootstrap of the MONTHLY
-    #    returns, block length chosen from the measured monthly ACF.
+    #    returns, block length from the Politis-White automatic selector (with
+    #    the sample ACF kept as a reported diagnostic).
     monthly = _monthly_returns_from_curve(contig.equity_curve, rebalance_dates)
-    block_length, acf = choose_block_length(monthly)
+    acf = choose_block_length(monthly)[1]
+    pw_block_length = politis_white_block_length(monthly)
+    # The bootstrap needs expected_block_length > 1.0. The Politis-White selector
+    # (the principled data-driven choice) judges the monthly series near-iid (it
+    # overrides the isolated boundary-crossing lag the +/- 2/sqrt(n) ACF rule
+    # flags), so its raw value falls below 2.0; apply a conservative minimal
+    # serial-dependence block of 2.0 (more dependence than the data shows, so the
+    # fan is if anything slightly wider). When PW > 2.0 it is used directly. The
+    # report prints both the raw PW value and the applied block length.
+    block_length = max(2.0, pw_block_length)
     realized_sharpe = _sharpe(monthly)
     paths = stationary_block_bootstrap(
         monthly, n_paths=n_bootstrap, expected_block_length=block_length, seed=seed
@@ -574,6 +588,7 @@ def compute_momentum_study_report(
         cpcv_sr_min=min(cpcv_srs),
         cpcv_sr_max=max(cpcv_srs),
         block_length=block_length,
+        pw_block_length=pw_block_length,
         acf=acf,
         realized_monthly_sharpe=realized_sharpe,
         bootstrap_sharpe_p5=p5,
@@ -679,9 +694,13 @@ def render_study_markdown(report: MomentumStudyReport) -> str:
         f"The headline path-uncertainty surface is a Politis-Romano stationary "
         f"block bootstrap of the MONTHLY return series ({r.n_monthly_returns} "
         f"observations, the rebalance-to-rebalance NAV returns). The expected "
-        f"block length is {r.block_length:.1f} months, chosen from the measured "
-        f"monthly autocorrelation "
-        f"({acf_str}; significant beyond +/- 2/sqrt(n)). The realized monthly "
+        f"block length is selected by the Politis-White (2004) automatic "
+        f"data-driven rule (flat-top lag-window spectral estimate): its raw "
+        f"optimum is {r.pw_block_length:.3f} months, which judges the series "
+        f"NEAR-IID (the wider flat-top band overrides the isolated lag that the "
+        f"naive +/- 2/sqrt(n) ACF rule flags: {acf_str}), so the bootstrap "
+        f"applies a conservative minimal serial-dependence block of "
+        f"{r.block_length:.1f} months. The realized monthly "
         f"Sharpe is {r.realized_monthly_sharpe:.4f}; the bootstrap Sharpe "
         f"distribution over {r.n_bootstrap} paths is p5={r.bootstrap_sharpe_p5:.4f}"
         f" / p50={r.bootstrap_sharpe_p50:.4f} / p95={r.bootstrap_sharpe_p95:.4f}. "

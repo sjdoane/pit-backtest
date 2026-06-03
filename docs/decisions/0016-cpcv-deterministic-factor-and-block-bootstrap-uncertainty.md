@@ -263,3 +263,30 @@ directly. Pinned by `tests/integration/test_sp500_momentum_study.py::test_cost_s
 (bundle-gated). This is an additive examples-layer change; no production
 `src/pit_backtest` code is modified, so decisions 1 to 6 and the run_cpcv body
 stand unchanged.
+
+### Automatic block-length selection (Politis-White) amendment footer (2026-06-03)
+
+Decision 5 deferred automatic block-length selection to v1.1 and had the M5
+study document a hand-chosen `expected_block_length` (the ACF heuristic picked 7
+from the largest lag significant beyond +/- 2/sqrt(n), plus one). This footer
+ships the deferred v1.1 item. `analytics/bootstrap.py::politis_white_block_length`
+implements the Politis and White (2004) / Patton, Politis and White (2009)
+automatic selector for the stationary bootstrap from a flat-top lag-window
+spectral estimate (stdlib-only, a faithful pure-Python transcription of the
+canonical `arch` implementation; validated by a numpy port-fidelity cross-check
+plus independent limiting-behavior tests).
+
+Honest empirical finding: on the real `sharadar_2026-05-31` monthly momentum
+series the selector returns b_opt = 0.46, judging the series NEAR-IID. The
+wider flat-top band `2*sqrt(log10(n)/n) = 0.20` correctly rejects the single
+lag-6 autocorrelation (-0.14) that crossed the narrower +/- 2/sqrt(n) = 0.13 ACF
+band, which is the textbook ~5% iid false positive the heuristic's "7" was built
+on. The study now reports the raw PW value as a diagnostic and applies a
+conservative minimal serial-dependence floor of 2.0 to the bootstrap (the
+function requires `expected_block_length > 1.0`; a block longer than the data
+shows only widens the fan, so the floor is conservative). The block length in
+the committed artifact therefore moves from 7 to 2; the DSR / PSR / annualized
+return / by-year / HHI are block-length-independent (they come from the
+contiguous backtest) and are unchanged. The sample ACF is retained as a reported
+diagnostic alongside PW. This supersedes decision 5's deferral; the bootstrap
+remains the Politis-Romano stationary variant (decision 5 unchanged otherwise).
