@@ -1,0 +1,66 @@
+# CI: static type check + test suite on every push to main and every PR.
+#
+# Complements perf-budget.yml (which gates the synthetic SPY bench on PRs to
+# main). This workflow runs the two gates a reviewer expects to see green:
+# `mypy --strict` over src (the pyproject [tool.mypy] config; 66 source files)
+# and the full pytest suite. The snapshot-gated (Sharadar / SSGA) tests and the
+# matplotlib figure-render test skip cleanly when no data bundle or plotting
+# extra is present, so the suite is green in CI without any vendor data.
+#
+# Linux-only per ADR 0001 decision 18 (cross-platform reproducibility is
+# disavowed). ruff is configured in pyproject.toml but is NOT yet gated here:
+# the existing tree carries pre-existing lint violations, so enforcing ruff is a
+# separate follow-up cleanup rather than a silent red build. The same applies to
+# extending the mypy gate over examples/ and scripts/ (a handful of pre-existing
+# strict errors live there).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 'mypy --strict src + pytest (synthetic; snapshot tests skip)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          pip install --upgrade pip
+          pip install uv
+
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Sync dependencies
+        run: |
+          uv sync --link-mode=copy --extra dev --extra dataops
+
+      - name: Type check (mypy --strict over src/pit_backtest)
+        run: |
+          uv run --link-mode=copy --no-sync mypy
+
+      - name: Run test suite (snapshot-gated tests skip without a data bundle)
+        run: |
+          uv run --link-mode=copy --no-sync pytest -q

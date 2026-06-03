@@ -1,40 +1,64 @@
 # pit-backtest
 
-A U.S. equity daily-bar backtester built as a teaching artifact for systematic-trading research. It exists to demonstrate four properties working together: structurally enforced point-in-time discipline, a CPCV-first validation API, Almgren-calibrated cost realism with honest uncertainty bounds, and external plus differential validation against `zipline-reloaded` and a hand-computable benchmark.
+[![ci](https://github.com/sjdoane/pit-backtest/actions/workflows/ci.yml/badge.svg)](https://github.com/sjdoane/pit-backtest/actions/workflows/ci.yml)
+[![perf-budget](https://github.com/sjdoane/pit-backtest/actions/workflows/perf-budget.yml/badge.svg)](https://github.com/sjdoane/pit-backtest/actions/workflows/perf-budget.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-It is not a production trading system. The audience is a reviewer or recruiter who wants to see the design judgment behind those four properties.
+A U.S. equity daily-bar backtester built as a teaching artifact for systematic-trading research. It demonstrates four properties working together: structurally enforced point-in-time discipline, a CPCV-first validation API, Almgren-calibrated cost realism with honest uncertainty bounds, and engine self-validation against SSGA's published SPY total return plus a hand-computable benchmark.
 
-## Status
+It is not a production trading system. The audience is a reviewer or recruiter who wants to see the design judgment behind those four properties. v1 (milestones M1 through M5) is shipped; v1.1 is in progress. The blow-by-blow history lives in [`CHANGELOG.md`](CHANGELOG.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
-M1 shipped (kill gate passes on 1y/3y/5y/10y windows; SI structurally skipped per Sharadar Premium SPY data starting 1997-12-31). M2 PR A (cost-model math + Commission classes + golden fixture + ADR 0006/0007), M2 PR B (ImpactedPriceSource + SquareRootImpactMatchingEngine + BarLoop wiring + ADR 0009), M2 PR C1 (SensitivityBand + Runner.run_sweep + spy_cost_sensitivity CLI demo + ADR 0010), M2 PR C2 (tolerance contract dormancy + ADR 0011 via 4-member council + verifier pass), M2 PR D Phase 0 (perf-budget CI on synthetic data + `--impact-model=bouchaud` CLI flag + `BarLoop.timing_breakdown()` opt-in + ADR 0012 via 4-member council + verifier pass), and M2 PR D Phase 1 (perf-budget workflow flipped to gate at `max(20%, 3 * sigma)` against empirical noise floor measured 2026-05-30 on `ubuntu24-20260525.161.1`; CoV=0.52%) shipped. M2 is fully shipped.
+## Results at a glance
 
-**M3 is fully shipped.** M3 PR 1 (data layer foundation: SharadarPermatickerResolver + LookaheadLeakError + TICKERS/SF1 readers), M3 PR 2 (per-row `get_price` + `get_fundamental` with Decimal at boundary), M3 PR 3 (corporate actions + cash flows + delisting dispatch over Sharadar ACTIONS), M3 PR 4 (SharadarSP500Universe + `members_at` wiring; Protocol amended for honest open-ended intervals), M3 PR 5a (five data quality contracts + runner + snapshot freshness check at startup), M3 PR 5b (SF1-vs-SEP authoritative-source resolution via `get_marketcap` / `get_shares_outstanding` + `NoDuplicateSp500EventsContract`), and M3 PR 5c (`examples/sp500_survivorship.py` IsMemberAt(t) survivorship study + M3 SHIPPED documentation flip) all merged. PR 5c implements ADR 0002 acceptance criterion 1 with the four headline numbers (PIT 2010 count, current count, survivor count, equal-weight CAGR delta in bps). The two-panel equity-curve plot contemplated at ADR 0002 line 96 SHIPS in M5 `scripts/figures/` (`docs/figures/survivorship_two_panel.png`); it was unblocked by [ADR 0018](docs/decisions/0018-as-traded-dividend-basis.md), the as-traded dividend basis correction described under M5 below.
+The capstone worked study: JT1993 12-1 top-quintile-long momentum on the survivorship-bias-free point-in-time S&P 500, 2005 to 2024.
 
-**M4 is fully shipped.** M4 PR 1 (`analytics.sharpe`: PSR + DSR + MinTRL reproducing the Bailey-LdP 2014 worked example, DSR=0.766 within 1e-3), M4 PR 2 (`analytics.drawdown` + `concentration` + `distribution`), prep PR 3a / ADR 0015 (`BacktestPathDistribution[T]` bounded TypeVar + `BacktestResult.__lt__` + `Split.test_groups`), M4 PR 3b (the three CV splitters: PurgedKFold + WalkForward + CPCV with purge/embargo + path-stitching), M4 PR 4 (SQLite WAL `TrialRegistry` feeding DSR; concurrent-write acceptance), and M4 PR 5 (the `ConstantWeightDemoResult -> BacktestResult` adapter + `Scorecard.to_markdown()` six-section LdP ch14 render + `docs/TESTING.md`) all merged. The six ADR 0002 M4 acceptance criteria are met. `Runner.run_cpcv`'s orchestration body is deferred to M5 because a CPCV path requires the fit/predict strategy semantics the M5 momentum study introduces; the CPCV path-count acceptance is satisfied by `CPCVSplitter` + the `BacktestPathDistribution` container.
+| Metric | Value |
+|---|---|
+| Deflated Sharpe (zero-cost, full window) | **0.955** (one pre-specified strategy, so the DSR is the honest PSR-against-zero) |
+| Annualized return / total return | 5.85% / 2.10x |
+| Survivorship CAGR delta (PIT-2010 vs current cohort) | +494 bps (reframed as inclusion-bias-dominated, not oversold) |
+| Engine self-validation | buy-and-hold SPY reconciles to SSGA's published NAV total return within 5 bps annualized on every trailing window |
+| Code gates | `mypy --strict` clean (66 modules); ~790-test suite, green in CI |
 
-**M5 is shipped.** The capstone worked study (`examples/sp500_momentum_study.py`) runs JT1993 12-1 top-quintile-long momentum on the survivorship-bias-free PIT S&P 500 (2005-2024): a contiguous zero-cost backtest as the level/Sharpe reference; PSR and the Deflated Sharpe at `naive_effective_n=1` (one pre-specified strategy, so the DSR is the honest PSR-against-zero; the committed artifact reports the realized value and the milestone passes whether or not it clears 0.95); `Runner.run_cpcv` reporting the coincident paths as the deterministic-factor CPCV degeneracy (ADR 0016) rather than a fake fan; a stationary block-bootstrap fan on the monthly return series (block length from the Politis-White automatic selector, which judges the series near-iid); the year-by-year decomposition and the PnL-concentration HHI; and an honest DSR conclusion that passes whether or not the strategy clears the bar. The cost surfaces (PR 3c) add a uniform-liquidity eta-sensitivity band (labelled NOT a realized cost: one SPY-typical market-state row across all names) and a commission-only contiguous-vs-CPCV seam decomposition whose real-data measurement corrected ADR 0016 dec 2's stated direction (the naive level gap is dominated by omitted inter-group gap-day market moves, and `_stitch_path`'s running-level carry normalizes away the per-group entry commissions, so the genuine N-1 re-entry commission is measured directly and is positive). PR 4 adds `scripts/figures/` + `make figures` (regenerating every README figure from a committed artifact in seconds, no bundle needed) and `docs/METHODOLOGY.md` (mapping each research pillar to its ADR, module, and figure). Earlier M5 PRs: the momentum signal (PR 1), the snapshot-based universe rework (ADR 0017), the bootstrap + top-quintile policy + real `PitView` wiring + `run_cpcv` body (PR 2a/2b/2c), and the `signal_calendar` perf gate (PR 3a; the ~21x speedup that makes the real 502-name run tractable). The survivorship study's total-return reconstruction split-adjusts AND decodes Sharadar's back-adjusted dividend value to the as-traded basis ([ADR 0018](docs/decisions/0018-as-traded-dividend-basis.md), a shared data-layer fix that also corrected the momentum study's selection and dividend cash-crediting): the stored dividend value is split-adjusted to the data-pull date, so left raw a reverse-split delisted name's reinvested terminal exploded to hundreds of x even though its split-adjusted price collapsed to ~0. With the fix the bankrupt names read near-zero terminals and the two-panel survivorship figure (ADR 0002 line 96) SHIPS, with a +494 bps buy-and-hold delta reframed as inclusion-bias-dominated (today's members were selected for growing into the index; see [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md)).
+The honesty is the point: the Deflated Sharpe DROPPED from a contaminated 0.971 to 0.955 when a dividend-basis bug was fixed ([ADR 0018](docs/decisions/0018-as-traded-dividend-basis.md)), and the repo reports the lower, honest number. The milestone passes whether or not the strategy clears a Deflated Sharpe of 0.95.
 
-Research phases 1 and 2 are complete; phase 3 ADRs 0001 (spec critique), 0002 (M1-M5 roadmap), 0003 (architecture), 0004 (rebalance calendar), 0005 (M2 plan), 0006 (trailing-period reconciliation), 0007 (FIM ceiling), 0008 (SSGA tolerances), 0009 (ImpactedPriceSource policy + M2 PR B structure), 0010 (sensitivity-band runner), 0011 (tolerance contract dormancy at M2), 0012 (perf-budget CI Phase 0 noise-floor measurement), 0013 (PSR/DSR/MinTRL API + Bailey-LdP 2014 pin correction), 0014 (DrawdownDurationReport contract), 0015 (CV TypeVar Protocol + Split.test_groups), 0016 (run_cpcv redesign + CPCV degeneracy + block bootstrap), 0017 (snapshot-based SP500 universe) are merged. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/decisions/`](docs/decisions/) for the current plan and locked architecture.
+## What makes this different
+
+Most open-source backtesters claim "event-driven" and "no lookahead." The differentiator here is that every inconvenient result is reported plainly rather than buried:
+
+- **The deflated Sharpe is reported whether or not it clears the bar** (it is 0.955; a bug fix lowered it from 0.971 and the honest number stayed).
+- **CPCV is reported as degenerate for a deterministic factor** ([ADR 0016](docs/decisions/0016-cpcv-deterministic-factor-and-block-bootstrap-uncertainty.md)), not dressed up as a distribution; a stationary block bootstrap is the honest path-uncertainty surface, with its block length set by the Politis-White selector (which judges the series near-iid).
+- **The cost band is labelled a uniform-liquidity sensitivity surface, NOT a realized cost.**
+- **The survivorship delta is reframed as inclusion-bias-dominated**, and even the spin-off bias the v1 studies do NOT correct is quantified honestly (per-name material, aggregate small): [`docs/research/0003-spinoff-bias.md`](docs/research/0003-spinoff-bias.md).
+
+## Quickstart: reproduce the figures (no data needed)
+
+The worked-study figures regenerate from a committed JSON artifact in seconds, with no vendor data bundle:
+
+```
+pip install -e ".[figures]"
+python scripts/figures/regenerate.py     # or: make figures
+```
+
+Running the full study or the SPY reconciliation on real data needs a Sharadar subscription; see [Running on real data](#running-on-real-data).
 
 ## Worked study figures
 
-The capstone momentum study's figures. Regenerate them from the committed artifact under `scripts/figures/study_artifact/` (no data bundle needed) with `python scripts/figures/regenerate.py` (or `make figures`, after `pip install -e ".[figures]"`):
-
 ![JT1993 12-1 momentum, top-quintile long: zero-cost NAV, 2005-2024](docs/figures/momentum_equity.png)
 
-The zero-cost NAV on a log scale, annotated with the per-period Sharpe, PSR, and Deflated Sharpe (the figure prints the realized values). Because this is one pre-specified strategy, the DSR has no multiple-testing family to deflate against and equals the PSR-against-zero. The corrected full-window DSR is 0.955, still clearing 0.95; the pre-[ADR 0018](docs/decisions/0018-as-traded-dividend-basis.md) figure of 0.971 was inflated because the dividend-basis bug both selected reverse-split delisted names into the long book and credited their over-scaled dividends as cash. The milestone is structured to pass whether or not the corrected DSR clears 0.95.
+Zero-cost NAV (log scale), annotated with the realized per-period Sharpe, PSR, and Deflated Sharpe. One pre-specified strategy, so the DSR has no multiple-testing family to deflate against and equals the PSR-against-zero (the corrected full-window value is 0.955).
 
 ![Stationary block-bootstrap equity fan of the monthly return series](docs/figures/bootstrap_fan.png)
 
-The genuine path-uncertainty surface: the realized path (red) inside the stationary block-bootstrap percentile envelope. CPCV is reported as degenerate for a deterministic factor (ADR 0016), so this bootstrap is the honest replacement for a CPCV fan.
+The genuine path-uncertainty surface: the realized path (red) inside the stationary block-bootstrap percentile envelope. CPCV is reported as degenerate for a deterministic factor ([ADR 0016](docs/decisions/0016-cpcv-deterministic-factor-and-block-bootstrap-uncertainty.md)), so this bootstrap is the honest replacement for a CPCV fan.
 
 ![Year-by-year return decomposition](docs/figures/by_year.png)
 
 ![S&P 500 survivorship: PIT-2010 cohort vs current cohort equal-weight buy-and-hold NAV](docs/figures/survivorship_two_panel.png)
 
-The survivorship two-panel (ADR 0002 line 96): the equal-weight buy-and-hold NAV of the PIT-2010 S&P 500 cohort versus today's roster priced back to 2010, with the CAGR delta in the caption. The delta is dominated by current-cohort inclusion bias (today's members were selected by market cap for growing into the index), so it is the inclusion-plus-survivorship gap of this construction, not the monthly-rebalanced Hsu-Hutchinson figure; a median terminal TR is reported alongside the outlier-sensitive mean. Reading the dividend correctly was load-bearing here ([ADR 0018](docs/decisions/0018-as-traded-dividend-basis.md): Sharadar's stored dividend value is split-adjusted to the data-pull date and is decoded to the as-traded basis at the data layer, so bankrupt names read near-zero terminals instead of a hundreds-of-x reinvestment artifact).
+The PIT-2010 S&P 500 cohort versus today's roster priced back to 2010, equal-weight buy-and-hold, with the CAGR delta in the caption. The delta is dominated by current-cohort inclusion bias (today's members were selected for growing into the index), so a median terminal total return is reported alongside the outlier-sensitive mean.
 
-The full Markdown report (PSR/DSR, the cost-sensitivity band, the CPCV degeneracy, the commission seam decomposition, and the honest conclusion) comes from `examples/sp500_momentum_study.py`; [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) maps each pillar to its research note, ADR, module, and figure.
+The full Markdown report (PSR/DSR, the cost-sensitivity band, the CPCV degeneracy, the commission seam decomposition, and the honest conclusion) is produced by `examples/sp500_momentum_study.py`; [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) maps each pillar to its research note, ADR, module, and figure, and the figure provenance (bundle, git SHA, content hash) is stamped in [`docs/figures/PROVENANCE.md`](docs/figures/PROVENANCE.md).
 
 ## Why this exists
 
@@ -51,7 +75,7 @@ This repo is an opinionated response to those failure modes within a deliberatel
 - **Structural lookahead protection at the API boundary, with documented trust boundaries**. The data layer's return types and the event-loop ordering prevent the common patterns. The remaining trust boundaries (arbitrary Python in callbacks, alternative-data joins computed outside the engine, feature-store wrappers) are enumerated explicitly in [`docs/decisions/0003-architecture.md`](docs/decisions/0003-architecture.md). This is the honest version of the "structurally impossible" claim.
 - **CPCV-first validation**. Combinatorial Purged Cross-Validation is the primary validation surface. Walk-forward is exposed as a CPCV configuration with one path. Backtest results are distributions across paths; any single-Sharpe API on a CPCV result is a correctness bug.
 - **The LdP chapter 14 scorecard**. PSR, DSR, MinTRL, HHI, drawdown stats, per-year decomposition are the default analytics. Raw Sharpe shown alone is a configuration error.
-- **Cost realism with honest uncertainty bounds**. Default cost model is SquareRootImpact with Almgren 2005 calibration (eta=0.142, beta=0.6, gamma=0.314), labeled as a 1998-2000 calibration. Sensitivity bands at eta in [0.05, 0.30] are required in every backtest report. A `--impact-model=bouchaud` flag substitutes beta=0.5. At M2 the cost-tolerance enforcement contract is scaffolded but dormant by design; the Almgren-2005 cost model does not consume mid price, so the methodology doc's tolerance formula is documentation-only until distinct policy-time vs matcher-time `MarketStateLookup` snapshots land at M3 (see [ADR 0011](docs/decisions/0011-tolerance-contract-dormancy-at-m2.md)).
+- **Cost realism with honest uncertainty bounds**. Default cost model is SquareRootImpact with Almgren 2005 calibration (eta=0.142, beta=0.6, gamma=0.314), labeled as a 1998-2000 calibration. Sensitivity bands at eta in [0.05, 0.30] are required in every backtest report. A `--impact-model=bouchaud` flag substitutes beta=0.5. At M2 the cost-tolerance enforcement contract is scaffolded but dormant by design (see [ADR 0011](docs/decisions/0011-tolerance-contract-dormancy-at-m2.md)).
 - **Point-in-time data with persistent identifiers**. Dual-timestamp model (`period_end_dt`, `available_dt`) on every record. Typed `Universe` API with `is_member(asset_id, date)`. Persistent asset identifiers via Sharadar TICKERS.
 - **Engine self-validation**. M1 reconciles buy-and-hold SPY against SSGA's published SPY NAV TR for the trailing 1Y / 3Y / 5Y / 10Y / SI periods (anchored on SSGA's as-of date) within 5 bps annualized per period; a deterministic hand-computable strategy is verified to exact match. Differential testing against `zipline-reloaded` was scoped out of M5 to v1.1 (ADR 0002).
 
@@ -69,15 +93,15 @@ This repo is an opinionated response to those failure modes within a deliberatel
 - Python 3.11+
 - `uv` for environment and dependency management
 - Polars end-to-end (with `.to_pandas()` available on every public results object for users who prefer Pandas)
-- NumPy and Numba for the inner kernel hot paths
+- NumPy for the inner kernel hot paths
 - Pydantic for typed data models
 - pytest with high coverage on the engine core
-- mypy strict mode
-- Runs on Linux and WSL2
+- mypy strict mode (gated in CI)
+- Runs on Linux and WSL2; developed on Windows
 
 ## Performance budget
 
-A 20-year backtest on 500 U.S. equity names completes in under 60 seconds on a laptop. The budget is tracked in CI via [`.github/workflows/perf-budget.yml`](.github/workflows/perf-budget.yml) using the `bench/spy_20y.py` synthetic harness (real Sharadar data is unavailable in CI per `dataset_versioning.md`). Per [ADR 0012](docs/decisions/0012-perf-budget-ci-phase-0-noise-floor.md) the workflow shipped in two phases: **Phase 0** ran the harness in warning-only mode while the empirical noise floor was collected; **Phase 1** (current) fails the build on regression at `max(20%, 3 * sigma)`. The empirical baseline was collected on runner image `ubuntu24-20260525.161.1` at commit `293a2ad` via `workflow_dispatch` (7-run median = 43.0 ms, stdev = 0.22 ms, CoV = 0.52%); the 20% floor binds. The synthetic harness is a SPY-only single-ticker monthly-rebalance probe sized for per-bar dispatch overhead, not the full 500-name production budget; the 43 ms wall-clock is two orders of magnitude under the headline 60-second target so the gate is a smoke test for catastrophic regressions, not a fine-grained scaling check (M3 PIT-data work will revisit the harness shape when 500-name universes become available). Per ADR 0001 decision 18 the workflow is Linux-only; cross-platform reproducibility is disavowed. The baseline is bound to the pinned `polars==1.41.1` and `numpy==1.26.4` in `pyproject.toml`; any patch bump requires a B1 baseline-rerun PR per ADR 0012 lock #5.
+A 20-year backtest on 500 U.S. equity names completes in under 60 seconds on a laptop. The budget is tracked in CI via [`.github/workflows/perf-budget.yml`](.github/workflows/perf-budget.yml) using the `bench/spy_20y.py` synthetic harness (real Sharadar data is unavailable in CI per `dataset_versioning.md`). Per [ADR 0012](docs/decisions/0012-perf-budget-ci-phase-0-noise-floor.md) the workflow gates on a regression beyond `max(20%, 3 * sigma)` against an empirical noise floor (7-run median = 43.0 ms, CoV = 0.52%, on `ubuntu24-20260525.161.1`). The synthetic harness is a SPY-only single-ticker probe sized for per-bar dispatch overhead, so the gate is a smoke test for catastrophic regressions, not a fine-grained scaling check. Per ADR 0001 decision 18 the workflow is Linux-only; cross-platform reproducibility is disavowed.
 
 ## V1 data inventory
 
@@ -85,101 +109,63 @@ A 20-year backtest on 500 U.S. equity names completes in under 60 seconds on a l
 - [Sharadar SEP](https://data.nasdaq.com/databases/SEP): point-in-time prices and delistings with cash proceeds.
 - [Sharadar TICKERS](https://data.nasdaq.com/databases/SF1): identifier history.
 
-Documented gaps for v1: borrow rates (no v1 source; short tests are flagged as estimates), PIT S&P 500 reconstitution at effective-date resolution (the Sharadar quarterly membership snapshots are the v1 source; effective-date reconciliation against the add/drop event log is v1.1, per ADR 0017), full corporate-actions feed (rights offerings and special distributions out of v1 scope).
+Documented gaps for v1: borrow rates (no v1 source; short tests are flagged as estimates), PIT S&P 500 reconstitution at effective-date resolution (the Sharadar quarterly membership snapshots are the v1 source; effective-date reconciliation is v1.1, per ADR 0017), full corporate-actions feed (rights offerings, special distributions, and spin-offs-as-share-distributions are out of v1 scope; the spin-off treatment bias is quantified in [`docs/research/0003-spinoff-bias.md`](docs/research/0003-spinoff-bias.md)).
 
 ## Repo layout
 
 ```
 docs/
   ROADMAP.md            phased milestones
-  METHODOLOGY.md        the quant methodology, with citations (M5)
-  TESTING.md            validation strategy, known-answer tests (M4)
-  methodology/          per-topic methodology contracts (Monday pre-M1)
-    total_return_reconstruction.md
-    dataset_versioning.md
-    pydantic_polars_boundary.md
-    determinism.md
-  research/             topical research syntheses
-    sources/            per-source detailed notes
+  METHODOLOGY.md        research pillar -> ADR -> module -> figure index
+  TESTING.md            validation strategy, known-answer tests
+  methodology/          per-topic implementation contracts
+  research/             topical research syntheses (+ sources/)
   decisions/            numbered ADRs
-src/pit_backtest/       engine source (protocols stubbed; M1 fills in)
-tests/                  pytest tests (scaffold only; M1 fills in)
+  figures/              committed README figures + PROVENANCE.md
+src/pit_backtest/       engine source (M1-M5 shipped)
+tests/                  pytest suite (unit / integration / lint / bench)
+scripts/
+  figures/              reproducible figure generators (committed artifact)
+  analysis/             reproducible one-off real-data analyses (bundle-gated)
 data/snapshots/         vendor snapshots (gitignored; manifest.toml committed)
-scripts/figures/        reproducible figure generators for the README (M5)
+.github/workflows/      ci.yml (mypy + pytest) and perf-budget.yml
 pyproject.toml
 CHANGELOG.md
 LICENSE
 ```
 
-## Running locally
+## Running on real data
 
-The M1 engine path is wired. Both demos run against synthetic fixtures in CI; the real-data versions require a Sharadar snapshot under `data/snapshots/`.
-
-Setup:
+The figure quickstart above needs no data. Running the worked study, the survivorship study, or the SPY reconciliation on real data requires a Sharadar subscription and a local snapshot under `data/snapshots/`.
 
 ```
 uv sync --extra dev --extra dataops
+# set the Nasdaq Data Link API key (never paste secrets in chat):
+#   export NASDAQ_DATA_LINK_API_KEY=<your_key>   (legacy SHARADAR_API_KEY also accepted)
+uv run python scripts/pull_m1_data.py --end-date 2026-04-30
+uv run python -m examples.spy_buy_and_hold --compare-to-ssga      # exits 0 PASS / 1 FAIL / 2 NEEDS_DATA
+uv run python -m examples.sp500_momentum_study                    # the capstone study (~11-15 min)
 ```
 
-Set the Nasdaq Data Link API key (the official env var; legacy `SHARADAR_API_KEY` also accepted; never paste secrets in chat):
+See [`docs/vendor/nasdaq-data-link-pull.md`](docs/vendor/nasdaq-data-link-pull.md) for the full pull procedure (including the SSGA XLSX downloads) and the test suite invocation.
 
-```
-[Environment]::SetEnvironmentVariable("NASDAQ_DATA_LINK_API_KEY", "<your_key>", "User")
-```
+<details>
+<summary>Windows / OneDrive venv setup (the development machine)</summary>
 
-Open a new PowerShell window so the variable loads. On Windows, also point uv at a venv outside OneDrive and force copy-mode linking (the default hardlink mode fails on OneDrive reparse points):
+On Windows, point `uv` at a venv outside OneDrive and force copy-mode linking (the default hardlink mode fails on OneDrive reparse points, and a venv created inside a OneDrive-synced tree accumulates corruption from interrupted installs). Set both at User scope:
 
 ```
 [Environment]::SetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", "C:\Users\<you>\.venvs\pit-backtest", "User")
 [Environment]::SetEnvironmentVariable("UV_LINK_MODE", "copy", "User")
+[Environment]::SetEnvironmentVariable("NASDAQ_DATA_LINK_API_KEY", "<your_key>", "User")
 ```
 
-Both variables MUST be set at User scope (not just in the current shell). If `UV_PROJECT_ENVIRONMENT` is unset in a shell, uv silently writes to an in-tree `.venv` inside OneDrive which then accumulates corruption from interrupted installs. Verify with `uv pip show pandas` after `uv sync`: the `Location` field must be your `.venvs\pit-backtest\Lib\site-packages` path, not `<project>\.venv\Lib\site-packages`. If you see the wrong path, set the variables and nuke BOTH venvs:
+Open a new shell so the variables load. Verify with `uv pip show pandas`: the `Location` must be the `.venvs\pit-backtest` path, not an in-tree `.venv`. The Makefile targets are Unix-only; on Windows invoke the underlying `python scripts/...` commands directly (each `make` target documents its raw command).
 
-```
-$env:UV_PROJECT_ENVIRONMENT = "C:\Users\<you>\.venvs\pit-backtest"
-$env:UV_LINK_MODE = "copy"
-Remove-Item -Recurse -Force ".venv" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Users\<you>\.venvs\pit-backtest" -ErrorAction SilentlyContinue
-uv sync --extra dev --extra dataops
-```
+</details>
 
-Pull data and run the kill-gate. Pass `--end-date` to pull through SSGA's most recent `as_of_date` (per ADR 0006 the kill gate is anchored on the SSGA as-of date; the bundle must cover at least one trailing window for the gate to report PASS or FAIL rather than NEEDS_DATA).
+## Reading order for a reviewer
 
-```
-uv run python scripts/pull_m1_data.py --end-date 2026-04-30
-# Manually download spdr-etf-historical-distributions.xlsx and
-# spdr-product-data-us-en.xlsx from
-# https://www.ssga.com/us/en/intermediary/etfs/spdr-sp-500-etf-spy
-# into data/snapshots/spy_ssga_<YYYY-MM-DD>/  (do not rename them).
-uv run python -m pit_backtest.data.sources.sharadar_pull --bundle sharadar_<YYYY-MM-DD> --refresh-hashes
-uv run python -m pit_backtest.data.sources.sharadar_pull --bundle spy_ssga_<YYYY-MM-DD> --refresh-hashes
-uv run python -m examples.spy_buy_and_hold --compare-to-ssga
-uv run python -m examples.constant_weight_three_names --diff-against-reference
-```
-
-`examples.spy_buy_and_hold --compare-to-ssga` exits 0 on PASS, 1 on FAIL, 2 on NEEDS_DATA (the bundle covers no trailing window) or any missing-bundle condition.
-
-See [`docs/vendor/nasdaq-data-link-pull.md`](docs/vendor/nasdaq-data-link-pull.md) for the full pull procedure and troubleshooting.
-
-Or just the test suite:
-
-```
-$env:PYTHONHASHSEED="0"; uv run pytest tests/
-```
-
-CI runs the synthetic-fixture tests on every push; the snapshot-gated real-data tests skip cleanly when no snapshot is present.
-
-## Suggested reading order for a reviewer
-
-1. [`docs/ROADMAP.md`](docs/ROADMAP.md): the M1 through M5 plan with the kill-early gate.
-2. [`docs/research/0001-existing-backtesters.md`](docs/research/0001-existing-backtesters.md): what the existing field gets wrong.
-3. [`docs/research/0002-methodology.md`](docs/research/0002-methodology.md): what the canonical literature says.
-4. [`docs/decisions/0001-spec-critique.md`](docs/decisions/0001-spec-critique.md): the critique of the original spec, the skeptical-reviewer pass, the locked decisions on scope and stack.
-5. [`docs/decisions/0002-roadmap-review.md`](docs/decisions/0002-roadmap-review.md): the M1 through M5 acceptance criteria, with the ten-week timeline and kill gate.
-6. [`docs/decisions/0003-architecture.md`](docs/decisions/0003-architecture.md): the protocol hierarchy, the trust boundary list, the data model.
-7. [`docs/decisions/0004-rebalance-calendar-independence.md`](docs/decisions/0004-rebalance-calendar-independence.md): rebalance calendars are fund-policy-determined, independent of backtest window. Captured during M1 day 3 implementation.
-8. [`docs/decisions/0005-m2-cost-realism-plan.md`](docs/decisions/0005-m2-cost-realism-plan.md): M2 cost-realism implementation plan; 18 locked decisions including the Almgren formula form, VWAP refusal, the four-PR split, and the queued ADRs 0006 and 0007.
-9. [`docs/decisions/0006-trailing-period-spy-reconciliation.md`](docs/decisions/0006-trailing-period-spy-reconciliation.md): SPY reconciliation reframed from a single 2005-2024 window to SSGA's published trailing 1Y / 3Y / 5Y / 10Y / SI periods anchored on SSGA's as-of date; snap-backward anchor convention; `ExpenseRatioSchedule` for the 2003-11-01 step.
-10. [`docs/decisions/0007-fim-2018-demoted-to-upper-ceiling.md`](docs/decisions/0007-fim-2018-demoted-to-upper-ceiling.md): M2 cost-realism acceptance criterion revised; formula-derived `[eta=0.05, eta=0.30]` band is the gate; FIM 2018 preserved as a 50-bp upper-ceiling sanity check.
-11. [`docs/methodology/`](docs/methodology/): the four pre-M1 contracts (total-return reconstruction, dataset versioning, Pydantic/Polars/attrs boundary, determinism invariant). Read after the ADRs; these are the implementation contracts the engine code in M1 onward is held to.
+- **Start here**: [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md). It maps each research pillar to its governing ADR, the module that implements it, and the figure that illustrates it, so it is the fastest path from "what the literature says" to "what the code does."
+- **Then the worked study**: [`examples/sp500_momentum_study.py`](examples/sp500_momentum_study.py) and its figures above, the artifact that exercises every pillar.
+- **Deep dive (the design judgment)**: the ADRs in [`docs/decisions/`](docs/decisions/), especially [`0001`](docs/decisions/0001-spec-critique.md) (the spec critique and skeptical-reviewer pass), [`0016`](docs/decisions/0016-cpcv-deterministic-factor-and-block-bootstrap-uncertainty.md) (the CPCV-degeneracy finding), and [`0018`](docs/decisions/0018-as-traded-dividend-basis.md) (the dividend-basis correction that lowered the headline Sharpe). [`docs/ROADMAP.md`](docs/ROADMAP.md) is the milestone-by-milestone plan with the kill-early gate.

@@ -146,15 +146,12 @@ A reviewer running on a different platform may see a different delta in the lowe
 
 ## CI enforcement
 
-The following tests run on every push to a branch with an open PR:
+Two GitHub Actions workflows run on every pull request (`ci.yml` also runs on every push to `main`):
 
-- `tests/lint/test_pydantic_boundary.py`: enforces the Pydantic-only-at-three-surfaces rule from [`pydantic_polars_boundary.md`](pydantic_polars_boundary.md).
-- `tests/lint/test_determinism_invariants.py`: enforces the five requirements above (Polars pin, no module-level RNG, no `set` iteration in signal/policy, sorted-frame helper usage, Polars thread pool environment).
-- `tests/data/test_tr_reconstruction.py`: the toy three-day fixture (no snapshot needed).
-- `tests/integration/test_spy_one_quarter_preflight.py` and `tests/integration/test_spy_reconciliation.py`: gated on snapshot availability; skipped in CI with a clear "skipped: snapshot not available in CI" message until the v1.1 Git LFS work lands.
-- `tests/integration/test_runner_determinism.py`: runs a small (3-name, 1-year) Runner-orchestrated CPCV with N=4, k=2 twice in succession, asserts the two runs produce identical `BacktestResult.model_dump_json()` strings.
+- [`ci.yml`](../../.github/workflows/ci.yml) runs `mypy --strict` over `src/pit_backtest` and the full `pytest` suite. The determinism guards are part of that suite: `tests/lint/test_determinism_invariants.py` (the Polars pin, no module-level RNG, no `set` iteration in signal/policy), `tests/lint/test_runner_worker_polars_threads_first.py` (the `POLARS_MAX_THREADS=1`-first worker bootstrap), and `tests/lint/test_market_state_keyword_only.py`. The snapshot-gated (Sharadar / SSGA) integration tests, e.g. `tests/integration/test_spy_reconciliation.py`, skip cleanly with a "snapshot not available" message, so the suite is green in CI without any vendor data; the toy three-day fixture in `tests/data/test_tr_reconstruction.py` needs no snapshot and runs.
+- [`perf-budget.yml`](../../.github/workflows/perf-budget.yml) runs the synthetic SPY 20-year bench on every PR to `main` and fails on a regression beyond `max(20%, 3 * sigma)` (ADR 0012).
 
-The full M1 reconciliation gate runs locally and the PR description carries the evidence line above. Reviewers can re-run locally to verify.
+Linux-only per ADR 0001 decision 18. Two gates are configured but not yet enforced in CI, tracked as follow-ups: `ruff` (the tree carries pre-existing lint violations) and extending the `mypy` gate over `examples/` and `scripts/` (a few pre-existing strict errors live there). The full M1 SPY reconciliation gate runs locally against a Sharadar snapshot (unavailable in CI); the PR description carries the evidence line above and reviewers can re-run locally to verify.
 
 ## What this invariant catches
 
@@ -162,7 +159,7 @@ Concrete failures that the invariant catches early, before they reach the M5 wor
 
 1. **A Polars upgrade subtly reorders a `group_by` reduction.** The bit-identical test fails; the upgrade is gated behind a re-run of the SPY reconciliation and an explicit human decision.
 2. **A new signal added in M5 silently uses `np.random.normal()` without injecting a Generator.** The lint test catches at PR time; the M5 momentum study cannot be merged until the violation is fixed.
-3. **A Runner refactor accidentally enables Polars multi-threading inside worker processes.** The `test_runner_determinism.py` test detects the resulting non-determinism; the PR is rejected.
+3. **A Runner refactor accidentally enables Polars multi-threading inside worker processes.** The worker-bootstrap lint (`tests/lint/test_runner_worker_polars_threads_first.py`) and the multi-worker spawn test (`tests/integration/test_spy_cost_sensitivity.py::test_run_sweep_multi_worker_spawn_enforces_polars_threads_1`) catch the regression; the PR is rejected.
 4. **A user passes a non-PIT alternative-data frame to a backtest.** The `additional_data` contract check fails at backtest construction; the user sees a diagnostic pointing at the boundary they violated.
 5. **A drive-by `from itertools import product` import is replaced with a hash-randomized `set` comprehension.** The signal layer lint catches the `set` iteration.
 
