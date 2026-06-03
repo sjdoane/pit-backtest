@@ -78,10 +78,11 @@ def test_phi_inv_rejects_p_at_or_outside_zero_one() -> None:
 
 
 def test_phi_saturates_at_z_above_eight_point_three() -> None:
-    """Per post-impl Medium 2: `_phi` docstring promises saturation via
-    `math.erf` at `z > 8.3` (returns 1.0 exactly) and `z < -8.3`
-    (returns 0.0 exactly). Pin both so a future swap to an Acklam-style
-    polynomial that does NOT saturate would be caught.
+    """Per post-impl Medium 2: `_phi` saturates at `z >= 8.3` (returns 1.0
+    exactly) and `z <= -8.3` (returns 0.0 exactly), enforced by an explicit
+    clamp rather than the C library's `math.erf` rounding (glibc returns
+    ~5.6e-17 at z=-8.3, below float resolution). Pin both so dropping the clamp
+    or swapping in a non-saturating approximation would be caught.
     """
     assert _phi(8.3) == 1.0
     assert _phi(-8.3) == 0.0
