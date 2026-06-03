@@ -44,6 +44,9 @@ import pytest
 
 from examples.sp500_survivorship import (
     SurvivorshipReport,
+    _cohort_month_end_grid,
+    _to_nyse_close,
+    compute_cohort_nav_curve,
     compute_survivorship_report,
     main,
     render_headline_markdown,
@@ -275,6 +278,36 @@ def test_survivorship_report_cagr_delta_matches_hand_computation(
     assert report.pit_cohort_cagr == pytest.approx(0.014991, abs=1e-5)
     assert report.current_cohort_cagr == pytest.approx(0.047310, abs=1e-5)
     assert report.cagr_delta_bps == pytest.approx(323.2, abs=0.5)
+
+
+def test_cohort_nav_curve_terminal_equals_headline_mean(
+    tmp_path: Path,
+) -> None:
+    """The figure invariant: the equal-weight cohort NAV curve starts at 1.0 and
+    its terminal equals the headline mean terminal TR, so the two-panel figure
+    reconciles to the headline CAGR delta. PIT cohort mean = mean(SURV 2.0,
+    DEAD 0.5) = 1.25; DEAD (delisted 2017) is held flat at its terminal."""
+    snapshots_root = _build_survivorship_bundle(tmp_path)
+    source = SharadarDataSource(_BUNDLE_NAME, snapshots_root)
+    report = compute_survivorship_report(source, _PIT_DATE, _AS_OF_DATE)
+    pit_members = source.members_at("sp500", _to_nyse_close(_PIT_DATE))
+
+    grid = _cohort_month_end_grid(_PIT_DATE, _AS_OF_DATE)
+    curve = compute_cohort_nav_curve(
+        source, pit_members, _PIT_DATE, _AS_OF_DATE, grid
+    )
+    navs = curve["nav"].to_list()
+    assert navs[0] == pytest.approx(1.0, abs=1e-9)
+    assert navs[-1] == pytest.approx(
+        report.pit_cohort_mean_terminal_tr, abs=1e-9
+    )
+    assert navs[-1] == pytest.approx(1.25, abs=1e-9)
+    # The grid is bracketed by pit_date and as_of_date, monotone ascending.
+    assert curve["dt"][0] == _PIT_DATE
+    assert curve["dt"][-1] == _AS_OF_DATE
+    assert curve["dt"].to_list() == sorted(curve["dt"].to_list())
+    # NAV is strictly positive everywhere.
+    assert all(v > 0.0 for v in navs)
 
 
 def test_survivorship_report_years_matches_calendar_day_convention(

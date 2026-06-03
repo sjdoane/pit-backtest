@@ -31,6 +31,17 @@ import polars as pl
 TRADING_DAYS_PER_YEAR = 252
 
 
+# Sharadar ACTIONS codes that change the as-traded share basis (and therefore
+# the basis of the back-adjusted dividend `value`). `split` is the common case;
+# `adrratiosplit` is an ADR ratio change that behaves identically on the price
+# and dividend basis (e.g. Signet's 2008 1-for-10 ADR ratio change alongside a
+# 1-for-2 split nets to a 1-for-20). Both must be co-adjusted with the price, so
+# the survivorship study and the momentum signal read split-like actions with
+# this set and the as-traded dividend conversion divides them out by the same
+# set. See ADR 0018.
+SPLIT_LIKE_ACTIONS: frozenset[str] = frozenset({"split", "adrratiosplit"})
+
+
 @attrs.frozen(slots=True)
 class ExpenseRatioStep:
     """One step of a stepwise time-varying expense-ratio schedule.
@@ -126,6 +137,98 @@ def adjusted_close(
 def unadjusted_close(prices: pl.DataFrame, dt: datetime) -> Decimal:
     """Return the raw close price at dt with no adjustments applied."""
     raise NotImplementedError("M1 day 3 deliverable (used by SEP adapter point lookup)")
+
+
+def to_as_traded_dividends(
+    dividends: pl.DataFrame,
+    splits: pl.DataFrame,
+) -> pl.DataFrame:
+    """Convert Sharadar back-adjusted dividend values to the as-traded basis.
+
+    Sharadar's ACTIONS `dividend value` is SPLIT-ADJUSTED to the data-pull date
+    (the same cumulative-split basis as the adjusted `close`), NOT the cash
+    actually paid per share on the ex-date. For a name that splits AFTER a
+    dividend, the stored value is the as-traded amount divided by the product of
+    those later split ratios: e.g. Chesapeake's real 0.0875 dividend, ahead of a
+    later 1-for-200 reverse split (Sharadar ratio 0.005), is stored as
+    0.0875 / 0.005 = 17.50. Reconstructing total return on `closeunadj` (the
+    as-traded price) with the stored value mismatches the share basis by that
+    factor, which explodes the reinvestment for reverse-split names (e.g. a
+    bankrupt name whose price collapsed to ~0 reads a terminal total return of
+    hundreds of x) and silently imports a future split into a historical
+    dividend (a point-in-time leak in any signal that reads the value).
+
+    This restores the as-traded amount: for each dividend it multiplies the
+    stored value by the product of the SAME TICKER's split-like ratios whose
+    ex-date is STRICTLY AFTER the dividend ex-date (the inverse of the vendor's
+    back-adjustment). The future split is used only to DECODE a contemporaneous
+    fact (the cash actually paid that day), which is fixed regardless of the
+    later split, so the output is point-in-time safe; it MUST run at the data
+    layer before any available_dt slice, where the full split history is
+    visible (a slice that hides the later split would leave the value
+    un-decoded). A dividend on the same date as a split is NOT co-adjusted by
+    that split (strict `>`), mirroring the `dt < ex_date` price-side convention
+    in `split_adjusted_prices_and_dividends` so the decode and the price
+    adjustment compose consistently. See ADR 0018 for the empirical basis
+    (Chesapeake 17.50, Windstream 0.75, Frontier 1.575, Nabors 3.00 all decode
+    to their real dividends; no-split names are returned unchanged).
+
+    Parameters
+    ----------
+    dividends
+        Frame with `ticker` (str), `ex_date` (pl.Date), `value` (numeric, the
+        back-adjusted stored amount). May be empty (then the result is empty).
+    splits
+        Split-like actions with `ticker` (str), `split_date` (pl.Date), `ratio`
+        (float, the Sharadar split value: 2.0 for a 2-for-1, 0.005 for a
+        1-for-200 reverse, etc.). May be empty (then the conversion is a no-op
+        and every dividend is returned unchanged).
+
+    Returns
+    -------
+    pl.DataFrame
+        `ticker`, `ex_date`, `value` (as-traded = stored value times the product
+        of strictly-later split-like ratios), sorted by (ticker, ex_date).
+    """
+    _validate_as_traded_columns(
+        dividends, {"ticker", "ex_date", "value"}, "dividends"
+    )
+    if dividends.is_empty():
+        return dividends.select(
+            "ticker", "ex_date", pl.col("value").cast(pl.Float64)
+        )
+    _validate_as_traded_columns(
+        splits, {"ticker", "split_date", "ratio"}, "splits"
+    )
+
+    factor = (
+        dividends.select("ticker", "ex_date")
+        .join(splits, on="ticker", how="left")
+        # Sort before the grouped product so the float reduction order is
+        # deterministic (Determinism Requirement: bit-identical outputs).
+        .sort(["ticker", "ex_date", "split_date"])
+        .with_columns(
+            pl.when(
+                pl.col("split_date").is_not_null()
+                & (pl.col("split_date") > pl.col("ex_date"))
+            )
+            .then(pl.col("ratio"))
+            .otherwise(1.0)
+            .alias("_eff_ratio")
+        )
+        .group_by(["ticker", "ex_date"], maintain_order=True)
+        .agg(pl.col("_eff_ratio").product().alias("_split_factor"))
+    )
+    return (
+        dividends.join(factor, on=["ticker", "ex_date"], how="left")
+        .with_columns(
+            (pl.col("value") * pl.col("_split_factor").fill_null(1.0))
+            .cast(pl.Float64)
+            .alias("value")
+        )
+        .select("ticker", "ex_date", "value")
+        .sort(["ticker", "ex_date"])
+    )
 
 
 def split_adjusted_prices_and_dividends(
@@ -369,6 +472,14 @@ def annualized_return(tr_series: pl.DataFrame) -> float:
     tr_last = float(tr_series["tr"][-1])
     annualized = (tr_last / tr_first) ** (TRADING_DAYS_PER_YEAR / (n - 1)) - 1.0
     return float(annualized)
+
+
+def _validate_as_traded_columns(
+    frame: pl.DataFrame, required: set[str], name: str
+) -> None:
+    missing = required - set(frame.columns)
+    if missing:
+        raise KeyError(f"{name} frame missing columns: {sorted(missing)}")
 
 
 def _validate_price_columns(prices: pl.DataFrame) -> None:

@@ -40,6 +40,7 @@ import polars as pl
 from dateutil.relativedelta import relativedelta  # type: ignore[import-untyped]
 
 from pit_backtest.data.adjustments import (
+    SPLIT_LIKE_ACTIONS,
     reconstruct_total_return,
     split_adjusted_prices_and_dividends,
 )
@@ -161,10 +162,17 @@ def _momentum_score_for_ticker(
         & (pl.col("date") > t_start)
         & (pl.col("date") <= t_skip)
     )
-    splits = ticker_actions.filter(pl.col("action") == "split").select(
+    splits = ticker_actions.filter(
+        pl.col("action").is_in(sorted(SPLIT_LIKE_ACTIONS))
+    ).select(
         pl.col("date").alias("ex_date"),
         pl.col("value").cast(pl.Float64).alias("ratio"),
     )
+    # The dividend value here is already on the AS-TRADED basis: the engine
+    # serves this signal's `actions` PitView via
+    # SharadarDataSource.actions_with_as_traded_dividends (ADR 0018), so the
+    # split co-adjustment below divides an as-traded amount by the in-window
+    # split factor, consistent with the as-traded `closeunadj` price.
     dividends = ticker_actions.filter(pl.col("action") == "dividend").select(
         pl.col("date").alias("ex_date"),
         pl.col("value").cast(pl.Float64).alias("amount_per_share"),
