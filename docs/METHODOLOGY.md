@@ -88,11 +88,18 @@ contributions (temporal concentration) is reported alongside.
 Using the current index roster for a historical window excludes the names that
 delisted, inflating returns. The engine's PIT universe avoids this; the
 survivorship study quantifies the bias as the equal-weight CAGR delta between the
-PIT-2010 cohort and the current cohort. The v1 cash-equivalent treatment of
-spin-offs introduces a documented, measurable negative bias (spin-offs
-systematically outperform their parents).
+PIT-2010 cohort and the current cohort. The v1 worked studies do not consume the
+engine's spin-off cash-equivalent path at all: the momentum signal, the dividend
+cash-crediting, and the survivorship buy-and-hold all read only `dividend` and
+split-like actions, so a spin-off is dropped entirely and the parent's ex-date
+price drop is read as a loss, a strictly larger negative bias than the
+cash-equivalent treatment ADR 0002 decision 14 anticipated. The literature, the
+verified treatment, and an honest real-data quantification (per-name large, e.g.
+GE understated about 40 percent; aggregate small, the survivorship delta would
+shrink about 9 bps) are in
+[`0003-spinoff-bias.md`](research/0003-spinoff-bias.md).
 
-- **Research**: [`methodology-point-in-time.md`](research/sources/methodology-point-in-time.md)
+- **Research**: [`methodology-point-in-time.md`](research/sources/methodology-point-in-time.md), [`0003-spinoff-bias.md`](research/0003-spinoff-bias.md)
 - **Decision**: ADR [0017](decisions/0017-sp500-snapshot-universe-model.md); ADR [0018](decisions/0018-as-traded-dividend-basis.md) (as-traded dividend basis); ADR [0002](decisions/0002-roadmap-review.md) decision 14 (spin-off bias, citing Cusatis-Miles-Woolridge 1993 and McConnell-Ovtchinnikov 2004)
 - **Implementation**: `data/universe.py::SharadarSP500Universe`; `examples/sp500_survivorship.py::compute_survivorship_report` + `compute_cohort_nav_curve`; `data/adjustments.py::split_adjusted_prices_and_dividends` (the shared split adjustment) + `to_as_traded_dividends` (the dividend basis decode)
 - **Figure**: [`docs/figures/survivorship_two_panel.png`](figures/survivorship_two_panel.png) (the PIT-cohort vs current-cohort equal-weight buy-and-hold NAV; the CAGR delta is the caption). The figure was deferred twice pending a survivorship total-return data-layer defect: Sharadar's ACTIONS `dividend value` is split-adjusted to the data-pull date, so left raw a reverse-split delisted name's reinvested terminal exploded to hundreds of x even though its split-adjusted price collapsed to ~0. ADR 0018 decodes the dividend to the as-traded basis at the data layer, the bankrupt names now read near-zero terminals, and the cohort curves render cleanly (the curve terminal equals the headline cohort mean terminal TR by construction). The figure carries the study's caveats: buy-and-hold is NOT the monthly-rebalanced 1.4-1.5pp Hsu-Hutchinson figure, the delta is dominated by current-cohort inclusion bias (today's members were selected for growing into the index), a median terminal TR is reported alongside the outlier-sensitive mean, and delisting cash earns zero T-bill.
