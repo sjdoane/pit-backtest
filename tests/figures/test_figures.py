@@ -175,7 +175,10 @@ def test_committed_artifact_loads_and_validates() -> None:
     assert isinstance(meta, dict)
     digest = hashlib.sha256()
     for name in _DATA_FILES:
-        digest.update((_COMMITTED_ARTIFACT / name).read_bytes())
+        # Normalize CRLF -> LF before hashing so the check is stable across
+        # platforms (git checks the JSON out CRLF on Windows, LF on Linux CI);
+        # build_study_artifact._content_hash normalizes identically.
+        digest.update((_COMMITTED_ARTIFACT / name).read_bytes().replace(b"\r\n", b"\n"))
     assert digest.hexdigest() == meta["content_hash"]
 
 

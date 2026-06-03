@@ -26,13 +26,22 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import statistics
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 _BUSY_TIMEOUT_MS = 5000
+_WAL_SWITCH_RETRIES = 12
+# WAL cold-start backoff (see _connect): a linear base delay plus a per-process
+# offset (pid % modulus) so two cold-starting workers desynchronize instead of
+# colliding on the same retry phase.
+_WAL_BACKOFF_BASE_S = 0.02
+_WAL_BACKOFF_PID_MODULUS = 17
+_WAL_BACKOFF_PID_STEP_S = 0.003
 
 
 class InsufficientTrialsForPCAError(ValueError):
@@ -120,9 +129,8 @@ class TrialRegistry:
         to share across processes, and the concurrency model is
         multi-process (parallel pytest workers + notebooks). Re-asserting
         `journal_mode=WAL` on every connection is idempotent (a no-op once
-        the database header records WAL) and sidesteps any first-connection
-        ordering concern. `busy_timeout` and `synchronous` are per-connection
-        and must be set each time.
+        the database header records WAL). `busy_timeout` and `synchronous`
+        are per-connection and must be set each time.
 
         `synchronous=NORMAL` is the WAL-recommended setting and is chosen
         deliberately: under WAL it never corrupts the database, but a
@@ -130,12 +138,45 @@ class TrialRegistry:
         before the next checkpoint. For a research trial registry that
         power-loss window is an acceptable durability tradeoff for the
         per-commit fsync it saves over `FULL`.
+
+        Cold-start WAL race: switching a FRESH database into WAL needs a
+        moment with no other connection mid-switch, and SQLite's busy
+        handler does NOT cover the journal-mode switch itself, so two
+        processes cold-starting the registry at once can each raise
+        `OperationalError: database is locked` (observed on Linux CI; masked
+        on the single-process dev path). The switch is idempotent once any
+        process has set WAL, so on a locked switch this closes the connection
+        (releasing it so a peer can complete its own switch), backs off by a
+        linear delay plus a pid-derived ASYMMETRIC offset (to break the
+        symmetric two-process deadlock without a non-deterministic RNG), and
+        retries; one process wins the switch and the rest no-op. The
+        `timeout=` argument installs the C-level busy handler at connect time
+        so ordinary write contention after the switch waits rather than
+        erroring.
         """
-        conn = sqlite3.connect(self._db_path)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        last_exc: sqlite3.OperationalError | None = None
+        for attempt in range(_WAL_SWITCH_RETRIES):
+            conn = sqlite3.connect(
+                self._db_path, timeout=_BUSY_TIMEOUT_MS / 1000.0
+            )
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError as exc:
+                conn.close()
+                last_exc = exc
+                time.sleep(
+                    _WAL_BACKOFF_BASE_S * (attempt + 1)
+                    + (os.getpid() % _WAL_BACKOFF_PID_MODULUS)
+                    * _WAL_BACKOFF_PID_STEP_S
+                )
+                continue
+            conn.execute("PRAGMA synchronous=NORMAL")
+            return conn
+        raise sqlite3.OperationalError(
+            f"could not switch {self._db_path} into WAL mode after "
+            f"{_WAL_SWITCH_RETRIES} attempts"
+        ) from last_exc
 
     def record(
         self,
