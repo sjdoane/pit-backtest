@@ -4,12 +4,14 @@ Per the M2 PR A reviewer pass:
 - Critical finding C2: np.convolve alignment is locked at "output[i] is
   the stat over input[i:i+window]." A lookahead-safe ADV at bar t uses
   output[t-window] on volume[:t].
-- Critical finding C3: compute_rolling_daily_vol returns sqrt(var) where
-  var = mean(r^2) - mean(r)^2; NOT sqrt(mean(r^2)) (which would be RMS
-  biased upward by mean(r)^2).
+- Critical finding C3: compute_rolling_daily_vol returns population standard
+  deviation, NOT sqrt(mean(r^2)) (which would be RMS biased upward by mean(r)^2).
+- ADR 0019: center before squaring to retain constant/tiny-variance accuracy.
 """
 
 from __future__ import annotations
+
+from statistics import pstdev
 
 import numpy as np
 import pytest
@@ -110,6 +112,57 @@ def test_compute_rolling_daily_vol_nonzero_mean_subtracts_correctly() -> None:
     sigma_zero_mean = compute_rolling_daily_vol(raw, window=4)
     sigma_shifted = compute_rolling_daily_vol(raw + 0.005, window=4)
     np.testing.assert_allclose(sigma_zero_mean, sigma_shifted, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("value", [0.005, -0.005, 1.0])
+@pytest.mark.parametrize("window", [3, 7, 20])
+def test_rolling_daily_vol_constant_precision(value: float, window: int) -> None:
+    returns = np.full(40, value, dtype=np.float64)
+    sigma = compute_rolling_daily_vol(returns, window)
+    np.testing.assert_allclose(sigma, np.zeros(41 - window), rtol=0, atol=1e-15)
+
+
+@pytest.mark.parametrize("mean,spread", [(0.005, 1e-12), (0.1, 1e-9), (1.0, 1e-8)])
+def test_rolling_daily_vol_preserves_tiny_dispersion(mean: float, spread: float) -> None:
+    returns = np.array([mean - spread, mean + spread] * 20, dtype=np.float64)
+    # Every even-length window has equal counts of these two float values.
+    expected = (returns[1] - returns[0]) / 2
+    assert expected > 0
+    np.testing.assert_allclose(
+        compute_rolling_daily_vol(returns, 20), expected, rtol=1e-10, atol=0
+    )
+
+
+@pytest.mark.parametrize("window", [1, 2, 7, 20, 40])
+def test_rolling_daily_vol_matches_population_reference(window: int) -> None:
+    # A non-contiguous input and changing means exercise alignment and ddof=0.
+    returns = np.random.default_rng(42).normal(0.005, 0.01, 80)[::2]
+    original = returns.copy()
+    expected = [pstdev(returns[i : i + window]) for i in range(41 - window)]
+    np.testing.assert_allclose(
+        compute_rolling_daily_vol(returns, window), expected, rtol=1e-12, atol=0
+    )
+    np.testing.assert_array_equal(returns, original)
+
+
+def test_rolling_daily_vol_large_windows() -> None:
+    returns = np.random.default_rng(42).normal(0.005, 1e-10, 5000)
+    original = returns.copy()
+    sigma = compute_rolling_daily_vol(returns, window=1000)
+    assert sigma.shape == (4001,)
+    assert sigma.dtype == np.float64
+    for start in range(0, 4001, 1000):
+        assert sigma[start] == pytest.approx(
+            pstdev(returns[start : start + 1000]), rel=1e-10, abs=0
+        )
+    np.testing.assert_array_equal(returns, original)
+
+
+def test_rolling_daily_vol_window_larger_than_batch_budget() -> None:
+    returns = np.full(1_048_577, 0.005, dtype=np.float64)
+    sigma = compute_rolling_daily_vol(returns, window=len(returns))
+    np.testing.assert_allclose(sigma, [0.0], rtol=0, atol=1e-15)
+    np.testing.assert_array_equal(returns, np.full_like(returns, 0.005))
 
 
 def test_compute_rolling_adv_rejects_negative_volume() -> None:
