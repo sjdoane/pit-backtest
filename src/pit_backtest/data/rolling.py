@@ -2,10 +2,9 @@
 
 Per ADR 0005 step 8: cost-model arithmetic uses pre-computed Polars frames
 for sigma_D / V_D / Theta computed at Backtest.__init__. The rolling-window
-computations use pure NumPy (np.convolve + variance via second-moment minus
-first-moment-squared) to insulate the cost model's numeric outputs from
-Polars version bumps; np.convolve with mode="valid" is byte-deterministic
-under the pinned NumPy 1.26.4.
+computations use pure NumPy (convolution for ADV, centered standard deviation
+for volatility per ADR 0019) to insulate the cost model's numeric outputs
+from Polars version bumps under the pinned NumPy 1.26.4.
 
 Alignment contract (locked per M2 PR A reviewer pass):
 - Input series indexed by bar position 0..T-1 (whatever the caller's
@@ -26,7 +25,6 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-
 
 DEFAULT_WINDOW: int = 20  # one trading month per Almgren 2005 Section 3.
 
@@ -82,11 +80,10 @@ def compute_rolling_adv(
 def compute_rolling_daily_vol(
     returns: NDArray[np.float64], window: int = DEFAULT_WINDOW
 ) -> NDArray[np.float64]:
-    """Rolling daily standard deviation of returns via convolution.
+    """Rolling population standard deviation of returns (ddof=0).
 
-    Uses the second-moment-minus-first-moment-squared identity:
-        var(window) = mean(r^2) - mean(r)^2
-        sigma_D    = sqrt(var)
+    NumPy centers each window before squaring, avoiding cancellation in
+    mean(r^2) - mean(r)^2 for constant or nearly constant returns.
 
     This is the true standard deviation (corrected for the rolling mean),
     not the RMS. For daily equity returns with mean ~5 bps/day, the RMS
@@ -102,12 +99,12 @@ def compute_rolling_daily_vol(
     Negative returns are allowed (they are common for any asset).
     """
     coerced = _validate(returns, window, allow_negative=True)
-    weights = np.ones(window, dtype=np.float64) / float(window)
-    mean_r = np.convolve(coerced, weights, mode="valid")
-    mean_r_squared = np.convolve(coerced * coerced, weights, mode="valid")
-    var: NDArray[np.float64] = mean_r_squared - mean_r * mean_r
-    # Floating-point arithmetic can produce tiny negative variances on
-    # constant-return windows; clamp at zero before sqrt.
-    var = np.maximum(var, 0.0)
-    sigma: NDArray[np.float64] = np.sqrt(var)
+    windows = np.lib.stride_tricks.sliding_window_view(coerced, window)
+    sigma = np.empty(windows.shape[0], dtype=np.float64)
+    # The view is zero-copy, but std allocates centered values. Bound that
+    # scratch to about 8 MiB (or one window when the window itself is larger).
+    batch_size = max(1, 1_048_576 // window)
+    for start in range(0, len(sigma), batch_size):
+        stop = start + batch_size
+        sigma[start:stop] = np.std(windows[start:stop], axis=-1, ddof=0)
     return sigma
