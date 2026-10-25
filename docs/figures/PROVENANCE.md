@@ -5,7 +5,7 @@ committed study artifact under `scripts/figures/study_artifact/`.
 
 - bundle: sharadar_2026-05-31 (pull 2026-05-31)
 - artifact git SHA: 8a15bf8
-- artifact content hash: 611d50399384a1145db26ff6c0e542cdb1a8bbe4db80d50ab120bf0d92c3b12d
+- artifact content hash: 20b1f27f1700355eac8bcdcbe874046be206d0faeb682da0e42fb9f5fd721bcc
 - built at: 2026-06-03T00:00:00Z
 - bootstrap: 1000 paths, seed 20260601, block length 2.0
 

@@ -15,8 +15,12 @@ import json
 from pathlib import Path
 
 import pytest
-
-from scripts.figures.regenerate import load_artifact, render_all, validate_artifact
+from scripts.figures.regenerate import (
+    _write_provenance,
+    load_artifact,
+    render_all,
+    validate_artifact,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _COMMITTED_ARTIFACT = _REPO_ROOT / "scripts" / "figures" / "study_artifact"
@@ -180,6 +184,17 @@ def test_committed_artifact_loads_and_validates() -> None:
         # build_study_artifact._content_hash normalizes identically.
         digest.update((_COMMITTED_ARTIFACT / name).read_bytes().replace(b"\r\n", b"\n"))
     assert digest.hexdigest() == meta["content_hash"]
+
+
+def test_committed_provenance_matches_artifact(tmp_path: Path) -> None:
+    """Catch metadata updates that leave the published provenance stale."""
+    payloads = load_artifact(_COMMITTED_ARTIFACT)
+    validate_artifact(payloads)
+    _write_provenance(payloads, tmp_path)
+    committed = _REPO_ROOT / "docs" / "figures" / "PROVENANCE.md"
+    assert committed.read_text(encoding="utf-8") == (tmp_path / "PROVENANCE.md").read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.skipif(not _HAS_MPL, reason="matplotlib (the figures extra) not installed")
