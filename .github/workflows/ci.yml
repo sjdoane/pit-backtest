@@ -55,7 +55,7 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          uv sync --link-mode=copy --extra dev --extra dataops
+          uv sync --locked --link-mode=copy --extra dev --extra dataops
 
       - name: Type check (mypy --strict over src/pit_backtest)
         run: |

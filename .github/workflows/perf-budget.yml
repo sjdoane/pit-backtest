@@ -67,7 +67,7 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          uv sync --link-mode=copy --extra dev --extra dataops
+          uv sync --locked --link-mode=copy --extra dev --extra dataops
 
       - name: Record runner image
         # Per post-impl reviewer Finding 5: use GitHub Actions runner-image
